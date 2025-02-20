@@ -1,0 +1,30 @@
+# .gitignore
+.vscode
+
+#datasets
+dataset
+
+# build
+virne.egg-info
+dist
+
+# save
+save
+running_log
+old_save
+pretrained
+exp_flag_vne_data
+exp_srl_vne_data
+
+# docs
+docs/build/
+docs/source/_autosummary/
+docs/source/generated/
+
+# cache
+*.log
+*.py[cod]
+**/__pycache__/
+**/.DS_Store
+**/.ipynb_checkpoints
+
