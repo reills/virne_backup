@@ -65,9 +65,9 @@ class Config(ClassDict):
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = False
+    distributed_training: bool = True
     num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 10 #changed by me was 10
+    num_workers: int = 4 #changed by me was 10
     batch_size: int = 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10

@@ -1,7 +1,7 @@
 num_nodes: 100
 save_dir: dataset/p_net
 topology:
-  file_path: 'dataset/topology/p_nut.gml'
+  file_path: 'dataset/topology/p_net.gml'
   type: waxman
   wm_alpha: 0.5
   wm_beta: 0.2
