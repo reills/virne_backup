@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# physical_network
 # ==============================================================================
 
 
@@ -178,9 +178,14 @@ class PhysicalNetwork(Network):
         Args:
             dataset_dir (str): The path to the directory where the physical network dataset is stored.
         """
+        if os.path.isdir(dataset_dir):
+            file_path = os.path.join(dataset_dir, 'p_net.gml')
+        else:
+            # Assume dataset_dir is already the full file path
+            file_path = dataset_dir
+
         if not os.path.exists(dataset_dir):
-            raise ValueError(f'Find no dataset in {dataset_dir}.\nPlease firstly generating it.')
-        file_path = os.path.join(dataset_dir, 'p_net.gml')
+            raise ValueError(f'Find no dataset in {dataset_dir}.\nPlease firstly generating it.') 
         p_net = PhysicalNetwork.from_gml(file_path)
         # get benchmark for normalization
         p_net.degree_benchmark = p_net.get_degree_benchmark()

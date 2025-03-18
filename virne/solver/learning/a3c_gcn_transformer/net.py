@@ -7,6 +7,37 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv
 from ..neural_network import GATConvNet, GCNConvNet, ResNetBlock, MLPNet
 
+# 1) Multi-head GAT layer with skip connection
+class MultiHeadGATSkipLayer(nn.Module):
+    """
+    A single multi-head GAT layer with a residual/skip connection.
+    """
+    def __init__(self, in_dim, out_dim, heads=4, dropout=0.6):
+        super().__init__()
+        # GATConv: if concat=True, the output dimension = out_dim * heads
+        self.gat = GATConv(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            heads=heads,
+            dropout=dropout,
+            concat=True
+        )
+        self.skip = nn.Linear(in_dim, out_dim * heads, bias=False)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        """
+        x: [num_nodes, in_dim]
+        edge_index: [2, num_edges]
+        returns: [num_nodes, out_dim * heads]
+        """
+        out = self.gat(x, edge_index)  # shape = [num_nodes, out_dim * heads]
+        # Skip connection
+        out = out + self.skip(x)
+        out = F.elu(out)
+        out = F.dropout(out, p=self.dropout, training=self.training)
+        return out
+
 
 class ActorCritic(nn.Module):
     """
@@ -147,14 +178,10 @@ class AutoregressiveDecoder(nn.Module):
         self.vocab_size = p_net_num_nodes + 1  # +1 if we used <start_token> or <pad_token>
         self.emb = nn.Embedding(self.vocab_size, embedding_dim)
 
-        # GCN to embed the physical nodes
-        self.gcn = GCNConvNet(
-            input_dim=p_net_feature_dim,
-            hidden_dim=embedding_dim,
-            embedding_dim=embedding_dim,
-            dropout_prob=0.,
-            return_batch=True
-        )
+        # 2) Multi-head GAT aggregator w/ skip
+        self.gat_layer = MultiHeadGATSkipLayer(in_dim=p_net_feature_dim, out_dim=embedding_dim, heads=4, dropout=0.6)
+        self.proj = nn.Linear(embedding_dim * 4, embedding_dim)  # reduce dimension back
+
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embedding_dim,
@@ -185,54 +212,31 @@ class AutoregressiveDecoder(nn.Module):
         """
         # 1) Get the physical node embeddings from GCN
         batch_p_net = obs['p_net']
-        p_node_embeddings = self.gcn(batch_p_net) 
-        # reshape => (batch_size, num_p_nodes, emb)
-        p_node_embeddings = p_node_embeddings.reshape(
-            batch_p_net.num_graphs, -1, p_node_embeddings.shape[-1]
-        )  # (B, N, emb)
+        # multi-head GAT aggregator
+        x, edge_index = batch_p_net.x, batch_p_net.edge_index
+        out = self.gat_layer(x, edge_index)
+        out = self.proj(out)
+        out = out.reshape(batch_p_net.num_graphs, -1, out.shape[-1])  # (B, N, emb)
 
-        # 2) Prepare the entire target sequence for the Transformer decoder
-        #    shape => (batch_size, t)
-        tgt_seq = obs['history_actions']  # (B, t)
+        # partial action sequence
+        tgt_seq = obs['history_actions']  # shape (B, t)
+        tgt_emb = self.emb(tgt_seq)       # => (B, t, emb)
 
-        # 3) Embed the target sequence => (B, t, emb)
-        tgt_emb = self.emb(tgt_seq)
-
-        # 4) Build a causal mask so token i sees only [0..i-1]
         B, T, E = tgt_emb.shape
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=tgt_emb.device, dtype=torch.bool),
-            diagonal=1
-        )
-        # True means "BLOCK" in PyTorch's attn mask. So this ensures no future info.
+        causal_mask = torch.triu(torch.ones(T, T, device=tgt_emb.device, dtype=torch.bool), diagonal=1)
 
-        # 5) (Optional) memory_key_padding_mask for padded encoder tokens
-        memory = obs['encoder_outputs']  # (B, seq_len, emb)
-        # We might need obs['mask'] to identify valid tokens in memory. 
-        # For illustration, we skip that or assume everything is valid:
-        memory_key_padding_mask = None
-
-        # 6) Pass through the Transformer Decoder => (B, T, emb)
+        memory = obs['encoder_outputs']  # shape (B, seq_len, emb)
         dec_out_seq = self.transformer_decoder(
-            tgt=tgt_emb,
-            memory=memory,
-            tgt_mask=causal_mask,
-            memory_key_padding_mask=memory_key_padding_mask
+            tgt=tgt_emb, memory=memory,
+            tgt_mask=causal_mask
         )
 
-        # The last token's embedding => shape (B, 1, emb)
         last_dec_out = dec_out_seq[:, -1:, :]  # (B, 1, E)
-
         if return_last_embed:
-            # This is used by the Critic to produce a single scalar.
-            return last_dec_out.squeeze(1)  # => (B, E)
+            return last_dec_out.squeeze(1)
 
-        # 7) For the Actor: We combine the last decoder output with each node embedding
-        #    so we get a distribution over nodes.
-        #    shape => (B, N, 2*E)
-        expanded_dec_out = last_dec_out.expand(-1, p_node_embeddings.size(1), -1)
-        combined = torch.cat([p_node_embeddings, expanded_dec_out], dim=-1)
-
-        # 8) Project to (B, N) => the unnormalized logits for each node
+        # for the actor
+        expanded_dec_out = last_dec_out.expand(-1, out.size(1), -1)
+        combined = torch.cat([out, expanded_dec_out], dim=-1)
         logits = self.mlp(combined)
         return logits

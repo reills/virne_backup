@@ -52,16 +52,17 @@ class Generator:
         random.seed(config['seed'])
         np.random.seed(config['seed'])
         
-        p_net_dataset_dir = get_p_net_dataset_dir_from_setting(p_net_setting) #moved to top
+        #p_net_dataset_dir = get_p_net_dataset_dir_from_setting(p_net_setting) #moved to top
+        p_net_dataset_dir = p_net_setting.get('save_dir')
         if reuse_existing and os.path.exists(p_net_dataset_dir):
             p_net = PhysicalNetwork.load_dataset(p_net_dataset_dir)
             if config.get('verbose', 1):
-                print(f'Loaded physical network dataset from {p_net_dataset_dir}')
+                print(f'GENERATOR Loaded physical network dataset from {p_net_dataset_dir}')
         else:
            p_net = PhysicalNetwork.from_setting(p_net_setting)
 
         if save:
-            p_net_dataset_dir = get_p_net_dataset_dir_from_setting(p_net_setting)
+            #p_net_dataset_dir = get_p_net_dataset_dir_from_setting(p_net_setting)
             p_net.save_dataset(p_net_dataset_dir)
             if config.get('verbose', 1):
                 print(f'save p_net dataset in {p_net_dataset_dir}')
@@ -88,7 +89,8 @@ class Generator:
         v_net_simulator = VirtualNetworkRequestSimulator.from_setting(v_sim_setting)
         v_net_simulator.renew()
 
-        v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(v_sim_setting) #moved to top
+        #v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(v_sim_setting) #moved to top
+        v_nets_dataset_dir = v_sim_setting.get('save_dir')
         if reuse_existing and os.path.exists(v_nets_dataset_dir):
             v_net_simulator = VirtualNetworkRequestSimulator.load_dataset(v_nets_dataset_dir)
             if config.get('verbose', 1):

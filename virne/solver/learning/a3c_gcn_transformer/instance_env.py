@@ -25,23 +25,29 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         
     def compute_reward(self, solution):
         """Calculate deserved reward according to the result of taking action."""
-        if solution['result'] :
-            reward = solution['v_net_r2c_ratio']
+        if solution['result']:
+            # Big success bonus, plus partial R2C ratio ( WAS reward = solution['v_net_r2c_ratio'] )
+            reward = 5.0 + 0.2 * solution['v_net_r2c_ratio']  
         elif solution['place_result'] and solution['route_result']:
-            reward = 1 / self.v_net.num_nodes
+            # Slight partial reward (NO CHANGE)
+            reward = 1.0 / self.v_net.num_nodes
         else:
-            reward = - 1 / self.v_net.num_nodes
+            # Larger penalty for failing ( was reward = - 1 / self.v_net.num_nodes)
+            reward = -2.0 
         self.solution['v_net_reward'] += reward
-        return reward
+        return reward 
+
 
     def get_observation(self):
         p_net_obs = self._get_p_net_obs()
         v_net_obs = self._get_v_net_obs()
+        history_actions = self.get_history_actions() 
         return {
             'p_net_x': p_net_obs['x'],
             'p_net_edge_index': p_net_obs['edge_index'],
             'v_net_x': v_net_obs['x'],
             'action_mask': self.generate_action_mask(),
+            'history_actions': history_actions,
         }
 
     def _get_p_net_obs(self):
@@ -70,3 +76,10 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         edge_aggr_data = self.obs_handler.get_link_aggr_attrs_obs(self.v_net, link_attr_types=['resource'], aggr='sum', link_sum_attr_benchmarks=self.link_sum_attr_benchmarks)
         node_data = np.concatenate((node_data, edge_aggr_data), axis=-1)
         return {'x': node_data}
+
+    def get_history_actions(self):
+        """
+        Return the sequence of previously placed physical node IDs as int64 array.
+        This is used by the transformer decoder.
+        """
+        return np.array(self.selected_p_net_nodes, dtype=np.int64)

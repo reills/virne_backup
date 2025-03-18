@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# recorder.py
 # ==============================================================================
 
 
@@ -64,7 +64,8 @@ class Recorder:
         self.save_dir = save_dir
         self.if_temp_save_records = if_temp_save_records
 
-        self.record_dir = os.path.join(self.save_dir, kwargs.get('solver_name'), kwargs.get('run_id'), 'records')
+        #self.record_dir = os.path.join(self.save_dir, kwargs.get('solver_name'), kwargs.get('run_id'), 'records')
+        self.record_dir = kwargs.get('run_id')  
         if not os.path.exists(self.record_dir):
             try:
                 os.makedirs(self.record_dir)
@@ -99,6 +100,8 @@ class Recorder:
                 if not os.path.exists(temp_save_path):
                     available_fname = True
             self.temp_save_path = temp_save_path
+            
+            print(f"Saving temp records to: {temp_save_path}")  # Debug print
             self.written_temp_header = False
 
     def count_init_p_net_info(self, p_net: PhysicalNetwork) -> None:
@@ -148,6 +151,13 @@ class Recorder:
         self.curr_record.update(record)
         self.curr_record.update(extra_info)
         self.curr_record.update(kwargs)
+
+        # Add the file path info from the recorder.
+        # These attributes should have been set in BasicScenario.from_config.
+        self.curr_record["p_net_file"] = getattr(self, "p_net_file_path", "not_set")
+        self.curr_record["v_net_dataset"] = getattr(self, "v_net_dataset_dir", "not_set")
+        
+        
         self.memory.append(copy.deepcopy(self.curr_record))
         if self.if_temp_save_records: self.temp_save_record(self.curr_record)
         return self.curr_record
@@ -257,7 +267,11 @@ class Recorder:
         
     def save_records(self, fname):
         """Save the records to a csv file."""
+        print(f"save folder: {self.record_dir}")  # Debug print
+        print(f"fname: {fname}")  # Debug print
         save_path = os.path.join(self.record_dir, fname)
+        
+        print(f"Saving records to: {save_path}")  # Debug print
         pd_records = pd.DataFrame(self.memory)
         pd_records.to_csv(save_path, index=False)
         try:

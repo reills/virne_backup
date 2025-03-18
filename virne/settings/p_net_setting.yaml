@@ -38,18 +38,6 @@ node_attrs_setting:
     originator: cpu
     owner: node
     type: extrema
-  # - name: gpu
-  #   distribution: uniform
-  #   dtype: int
-  #   generative: true
-  #   high: 100
-  #   low: 50
-  #   owner: node
-  #   type: resource
-  # - name: max_gpu
-  #   originator: gpu
-  #   owner: node
-  #   type: extrema
   # - name: ram
   #   distribution: uniform
   #   dtype: int
@@ -60,6 +48,18 @@ node_attrs_setting:
   #   type: resource
   # - name: max_ram
   #   originator: ram
+  #   owner: node
+  #   type: extrema
+  # - name: gpu
+  #   distribution: uniform
+  #   dtype: int
+  #   generative: true
+  #   high: 100
+  #   low: 50
+  #   owner: node
+  #   type: resource
+  # - name: max_gpu
+  #   originator: gpu
   #   owner: node
   #   type: extrema
 file_name: p_net.gml

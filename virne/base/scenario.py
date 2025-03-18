@@ -36,16 +36,40 @@ class Scenario:
         recorder = Recorder(counter, **vars(config))
 
         # Create p_net and v_net simulator
-        config.p_net_dataset_dir = get_p_net_dataset_dir_from_setting(config.p_net_setting)
-        print(config.p_net_dataset_dir)
-        if os.path.exists(config.p_net_dataset_dir):
-            p_net = PhysicalNetwork.load_dataset(config.p_net_dataset_dir)
-            print(f'Load Physical Network from {config.p_net_dataset_dir}') if config.verbose >= 1 else None
+        config.p_net_dataset_path = config.p_net_setting.get('save_dir')
+        print(f"Physical network path: {config.p_net_dataset_path}")
+
+        if os.path.exists(config.p_net_dataset_path):
+            # If it's a directory, append the file name.
+            if os.path.isdir(config.p_net_dataset_path):
+                p_net_file_path = os.path.join(config.p_net_dataset_path, 'p_net.gml')
+            else:
+                p_net_file_path = config.p_net_dataset_path
+
+            p_net = PhysicalNetwork.load_dataset(p_net_file_path)
+
+            if config.verbose >= 1:
+                print(f'Loaded Physical Network from {p_net_file_path}')
         else:
             p_net = PhysicalNetwork.from_setting(config.p_net_setting)
-            print(f'*** Generate Physical Network from setting')
-        v_net_simulator = VirtualNetworkRequestSimulator.from_setting(config.v_sim_setting)
-        print(f'Create VNR Simulator from setting') if config.verbose >= 1 else None
+            p_net_file_path = "generated"
+            print('*** Generate Physical Network from setting')
+
+        # Load virtual network dataset if it exists, otherwise generate new one.
+        v_nets_dataset_dir = config.v_sim_setting.get('save_dir')
+        print(f"Virtual network dataset directory: {v_nets_dataset_dir}")
+        if os.path.exists(v_nets_dataset_dir) and os.path.isdir(v_nets_dataset_dir):
+            v_net_simulator = VirtualNetworkRequestSimulator.load_dataset(v_nets_dataset_dir)
+            print(f'Loaded virtual network dataset from {v_nets_dataset_dir}')
+        else:
+            v_net_simulator = VirtualNetworkRequestSimulator.from_setting(config.v_sim_setting)
+            v_net_simulator.renew()  # generate new data.
+            v_nets_dataset_dir = "generated"
+            print('Generated new virtual network dataset from setting')
+
+        # *** Pass the file paths to the recorder for debugging ***
+        recorder.p_net_file_path = p_net_file_path
+        recorder.v_net_dataset_dir = v_nets_dataset_dir
 
         # create env and solver
         env = Env(p_net, v_net_simulator, controller, recorder, counter, **vars(config))

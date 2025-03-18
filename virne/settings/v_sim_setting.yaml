@@ -1,16 +1,16 @@
-num_v_nets: 10
+num_v_nets: 1000
 topology:
   random_prob: 0.5
   type: random
 v_net_size:
   distribution: uniform
   dtype: int
-  low: 8
-  high: 8
+  low: 8   # WAS 8
+  high: 8   # WAS 8 
 arrival_rate:
   distribution: possion
   dtype: float
-  lam: 0.04
+  lam: 0.0488 # WAS .04 MAKING THEM COME MORE FREQUENTLY 
   reciprocal: true
 lifetime:
   distribution: exponential
@@ -32,10 +32,10 @@ node_attrs_setting:
     dtype: int
     generative: true
     low: 0
-    high: 50
+    high: 50 # WAS 50 
     owner: node
-    type: resource
-  # - name: gpu
+    type: resource 
+  # - name: ram
   #   distribution: uniform
   #   dtype: int
   #   generative: true
@@ -43,14 +43,6 @@ node_attrs_setting:
   #   high: 50
   #   owner: node
   #   type: resource
-  # - name: ram
-    # distribution: uniform
-    # dtype: int
-    # generative: true
-    # low: 0
-    # high: 50
-    # owner: node
-    # type: resource
 link_attrs_setting:
   - name: bw
     distribution: uniform

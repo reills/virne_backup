@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# config.py
 # ==============================================================================
 
 
@@ -42,6 +42,7 @@ class Config(ClassDict):
     summary_dir: str = 'save/'
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
+    sim_id: int = 0
 
     ### solver  ###
     solver_name: str = 'random_rank'
@@ -65,14 +66,14 @@ class Config(ClassDict):
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = True
+    distributed_training: bool = False
     num_train_epochs: int = 100 #changed by me was 100
     num_workers: int = 4 #changed by me was 10
-    batch_size: int = 128
+    batch_size: int = 64 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
-    eval_interval: int = 10
+    eval_interval: int = 50 #changed was 10
 
     ### Neural Network ###
     embedding_dim: int = 128   # Embedding dimension
@@ -84,13 +85,18 @@ class Config(ClassDict):
     l2reg_rate: float = 2.5e-4    # L2 regularization rate
     lr: float = 0.001          # Learning rate
     # lr_decay: float = 0.5      # Learning rate decay
+    pretrained_bc_path: str = "/home/stephen-reilly/development/virne/pretrained_transformer_final.pth"
+    pretrained_loaded: bool = False
+    p_dimension_features: int = 6
+    v_dimension_features: int = 6
+
 
     ### Reinforcement Learning ###
     rl_gamma: float = 0.99
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
     lr_actor: float = 1e-3
-    lr_critic: float = 1e-3
+    lr_critic: float = 1e-5
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 
@@ -126,11 +132,28 @@ class Config(ClassDict):
         self.create_dirs()
         self.get_run_id()
         check_config(self)
+    
+    def get_next_results_dir(self, base_dir="dataset"):
+        """Return a new folder in base_dir with the next available name results-<n>."""
+        i = 1
+        while True:
+            self.sim_id = f"results-{i}"
+            results_dir = os.path.join(base_dir, f"results-{i}")
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
+                return results_dir 
+            i += 1
 
     def get_run_id(self):
         self.run_time = time.strftime('%Y%m%dT%H%M%S')
         self.host_name = socket.gethostname()
-        self.run_id = f'{self.host_name}-{self.run_time}'
+        results_dir = self.get_next_results_dir()
+
+        #self.run_id = f'{results_dir}-{self.run_time}'
+        self.run_id = f'{results_dir}'
+        self.v_sim_setting['save_dir'] = self.run_id 
+        self.p_net_setting['save_dir'] = self.run_id 
+        self.save_dir = self.run_id 
 
     def update(self, update_args):
         if not isinstance(update_args, dict):

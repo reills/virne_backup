@@ -9,6 +9,7 @@ import copy
 import time
 import tqdm
 import pprint
+import warnings
 import torch
 import numpy as np
 import torch.nn as nn
@@ -92,6 +93,8 @@ class RLSolver(Solver):
         self.clip_reward = kwargs.get('max_reward', 1.0)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.)
         self.softmax_temp = 1.
+
+        print(f'save_dir: {self.save_dir}')
         # log
         self.open_tb = kwargs.get('open_tb', True)
         self.log_dir = os.path.join(self.save_dir, 'log')
@@ -325,7 +328,9 @@ class RLSolver(Solver):
     def load_model(self, checkpoint_path):
         print('Attempting to load the pretrained model')
         try:
-            checkpoint = torch.load(checkpoint_path)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
+                checkpoint = torch.load(checkpoint_path)
             if 'policy' not in checkpoint:
                 self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
             else:
@@ -333,8 +338,10 @@ class RLSolver(Solver):
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
             print(f'Loaded pretrained model from {checkpoint_path}') if self.verbose >= 0 else None
         except Exception as e:
+            prin(f'error {e}')
             print(f'Load failed from {checkpoint_path}\nInitilized with random parameters') if self.verbose >= 0 else None
 
+ 
     def train(self):
         """Set the mode to train"""
         self.policy.train()
@@ -458,6 +465,7 @@ class A2CSolver(RLSolver):
         self.repeat_times = 1
 
     def update(self, ):
+        print('called a2csolver')
         observations = self.preprocess_obs(self.buffer.observations, self.device)
         actions = torch.LongTensor(np.array(self.buffer.actions)).to(self.device)
         returns = torch.FloatTensor(self.buffer.returns).to(self.device)
