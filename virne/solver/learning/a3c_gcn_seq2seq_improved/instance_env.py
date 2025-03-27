@@ -23,31 +23,42 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         #     'v_node': spaces.Box(low=0, high=100, shape=(int(num_p_net_node_attrs/2) + int(num_p_net_link_attrs/2) + 2, ), dtype=np.float32)
         # })
         
-    def compute_reward(self, solution):
-        """Calculate deserved reward according to the result of taking action."""
+    def compute_reward(self, solution, revoke=False):
+        """Reward for maximizing acceptance, with mild penalty for using revoke (based on revoke_times)."""
+        
+        # Base reward based on result quality 
         if solution['result']:
-            # Big success bonus, plus partial R2C ratio ( WAS reward = solution['v_net_r2c_ratio'] )
-            reward = 5.0 + 0.2 * solution['v_net_r2c_ratio']  
-        elif solution['place_result'] and solution['route_result']:
-            # Slight partial reward (NO CHANGE)
-            reward = 1.0 / self.v_net.num_nodes
+            reward = 1.0  # Full reward for complete acceptance
+        elif solution['route_result']:
+            routed_fraction = solution['num_placed_nodes'] / self.v_net.num_nodes
+            reward = 0.2 * routed_fraction  # Partial reward for partially routed requests
+        elif solution['place_result']:
+            reward = -0.1  # Mild penalty for placed but failed to route
         else:
-            # Larger penalty for failing ( was reward = - 1 / self.v_net.num_nodes)
-            reward = -2.0 
-        self.solution['v_net_reward'] += reward
-        return reward 
+            reward = -1.0  # Full penalty for complete failure
 
+        # Optional: penalize early rejection to avoid giving up too fast
+        if solution['early_rejection']:
+            reward -= 0.2
+            
+        # Penalize revoke, based on how many times it was called during this request
+        if revoke and solution['revoke_times']  > 0:
+            penalty_scale = min(0.5, 0.05 * solution['revoke_times'])  # Cap the penalty
+            reward -= penalty_scale 
+            
+        # Accumulate reward into the environment's running total
+        self.solution['v_net_reward'] += reward
+
+        return reward
 
     def get_observation(self):
         p_net_obs = self._get_p_net_obs()
         v_net_obs = self._get_v_net_obs()
-        history_actions = self.get_history_actions() 
         return {
             'p_net_x': p_net_obs['x'],
             'p_net_edge_index': p_net_obs['edge_index'],
             'v_net_x': v_net_obs['x'],
             'action_mask': self.generate_action_mask(),
-            'history_actions': history_actions,
         }
 
     def _get_p_net_obs(self):
@@ -76,10 +87,3 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         edge_aggr_data = self.obs_handler.get_link_aggr_attrs_obs(self.v_net, link_attr_types=['resource'], aggr='sum', link_sum_attr_benchmarks=self.link_sum_attr_benchmarks)
         node_data = np.concatenate((node_data, edge_aggr_data), axis=-1)
         return {'x': node_data}
-
-    def get_history_actions(self):
-        """
-        Return the sequence of previously placed physical node IDs as int64 array.
-        This is used by the transformer decoder.
-        """
-        return np.array(self.selected_p_net_nodes, dtype=np.int64)

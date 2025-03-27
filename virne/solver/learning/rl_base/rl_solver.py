@@ -338,7 +338,7 @@ class RLSolver(Solver):
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
             print(f'Loaded pretrained model from {checkpoint_path}') if self.verbose >= 0 else None
         except Exception as e:
-            prin(f'error {e}')
+            print(f'error {e}')
             print(f'Load failed from {checkpoint_path}\nInitilized with random parameters') if self.verbose >= 0 else None
 
  

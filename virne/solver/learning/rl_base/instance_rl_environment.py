@@ -6,6 +6,7 @@
 import copy
 import numpy as np
 import networkx as nx
+import torch
 
 from virne.base import Solution
 from .rl_enviroment_base import RLBaseEnv
@@ -40,6 +41,13 @@ class InstanceRLEnv(RLBaseEnv):
         self.ranked_v_net_nodes = rank_nodes(self.v_net, self.node_ranking_method)
         self.solution['v_net_reward'] = 0
         self.solution['num_interactions'] = 0
+        self.prev_obs = None  # Initialize to None
+        self.prev_tensor_obs = None  # Initialize to None
+        self.preprocess_obs_fn = kwargs.pop("preprocess_obs_fn", None)
+        if self.preprocess_obs_fn is None:
+            raise ValueError("Missing required 'preprocess_obs_fn'")
+        self.device = kwargs.get("device", torch.device("cpu"))
+
         # set_sim_info_to_object(kwargs, self)
 
     def reset(self):
@@ -47,8 +55,8 @@ class InstanceRLEnv(RLBaseEnv):
         self.p_net = copy.deepcopy(self.p_net_backup)
         return super().reset()
 
-    def reject(self):
-        self.solution['early_rejection'] = True
+    def reject(self, is_early=True):
+        self.solution['early_rejection'] = is_early
         solution_info = self.solution.to_dict()
         done = True
         return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
@@ -63,9 +71,19 @@ class InstanceRLEnv(RLBaseEnv):
         self.controller.undo_place_and_route(self.v_net, self.p_net, last_v_node_id, paired_p_node_id, self.solution)
         solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
         self.revoked_actions_dict[str(self.solution.node_slots), last_v_node_id].append(paired_p_node_id)
-        return self.get_observation(), self.compute_reward(self.solution), False, self.get_info(solution_info)
+        
+        # Update the cached observation's action mask
+        if self.prev_obs is not None:
+            self.prev_obs['action_mask'] = np.expand_dims(self.generate_action_mask(), axis=0)
+        else:
+            self.prev_obs = self.get_observation()
 
+        # Also update the tensor version
+        self.prev_tensor_obs = self.preprocess_obs_fn(self.prev_obs, device=self.device)
 
+        return self.prev_obs, self.compute_reward(self.solution, revoke=True), False, self.get_info(solution_info)
+
+ 
 class SolutionStepInstanceRLEnv(InstanceRLEnv):
     
     def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
@@ -111,6 +129,7 @@ class PlaceStepInstanceRLEnv(InstanceRLEnv):
             return self.reject()
         # Case: Revoke
         if self.if_revocable(action):
+            print('revoke')
             return self.revoke()
         # Case: Place in one same node
         elif not self.reusable and p_node_id in self.selected_p_net_nodes:
@@ -173,17 +192,26 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         self.solution['num_interactions'] += 1
         p_node_id = int(action)
         self.solution.selected_actions.append(p_node_id)
+
         if self.solution['num_interactions'] > 10 * self.v_net.num_nodes:
+            #print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
+            #print("[REJECT] Too many interactions, rejecting request.")
             # self.solution['description'] += 'Too Many Revokable Actions'
-            return self.reject()
+            return self.reject(is_early=False)
         # Case: Reject
         if self.if_rejection(action):
-            return self.reject()
+            print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
+            print("[REJECT] Action resulted in rejection.")
+            return self.reject(is_early=True)
         # Case: Revoke
         if self.if_revocable(action):
+            #print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
+            #print(f"[REVOKE] Reverting action on pNode{p_node_id}")
             return self.revoke()
         # Case: reusable = False and place in one same node
         elif not self.reusable and (p_node_id in self.selected_p_net_nodes):
+            print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
+            print(f"[FAIL] Cannot reuse pNode{p_node_id}, marking placement as failed.")
             self.solution['place_result'] = False
             solution_info = self.counter.count_solution(self.v_net, self.solution)
             done = True
@@ -191,6 +219,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         # Case: Try to Place and Route
         else:
             assert p_node_id in list(self.p_net.nodes)
+             
             place_and_route_result, place_and_route_info = self.controller.place_and_route(
                                                                                 self.v_net, 
                                                                                 self.p_net, 
@@ -202,17 +231,24 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                                 check_feasibility=self.check_feasibility)
             # Step Failure
             if not place_and_route_result:
+                #print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id} and route links...") 
+                #print(f"[FAIL] Routing for vNode{self.curr_v_node_id} → pNode{p_node_id} failed!")
+                #print(f"   - Reason: {place_and_route_info.get('failure_reason', 'Unknown')}")
+                #print(f"   - Path attempted: {place_and_route_info.get('attempted_path', 'N/A')}")
+                
                 if self.allow_revocable and self.solution['num_interactions'] <= self.v_net.num_nodes * 10:
                     self.solution['selected_actions'].append(self.revocable_action)
+                    #print("[REVOCABLE] Retrying with a revocable action...")
                     return self.revoke()
                 else:
                     solution_info = self.counter.count_solution(self.v_net, self.solution)
                     done = True
     
                 # solution_info = self.solution.to_dict()
-            else:
+            else:  
                 # VN Success ?
-                if self.num_placed_v_net_nodes == self.v_net.num_nodes:
+                if self.num_placed_v_net_nodes == self.v_net.num_nodes: 
+
                     self.solution['result'] = True
                     solution_info = self.counter.count_solution(self.v_net, self.solution)
                     done = True

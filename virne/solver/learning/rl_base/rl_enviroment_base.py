@@ -88,7 +88,12 @@ class RLBaseEnv(gym.Env):
             if self.num_placed_v_net_nodes != 0:
                 candidate_nodes.append(self.revocable_action)
             revoked_actions = self.revoked_actions_dict[(str(self.solution.node_slots), self.curr_v_node_id)]
-            [candidate_nodes.remove(a_id) for a_id in revoked_actions if a_id in revoked_actions]
+            # Wrong: always True condition
+            #[candidate_nodes.remove(a_id) for a_id in revoked_actions if a_id in revoked_actions]
+
+            # Correct: only remove if actually present in the list
+            [candidate_nodes.remove(a_id) for a_id in revoked_actions if a_id in candidate_nodes]
+
         mask[candidate_nodes] = True
         # if mask.sum() == 0: 
             # mask[0] = True

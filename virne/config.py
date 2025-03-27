@@ -43,6 +43,7 @@ class Config(ClassDict):
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
+    use_fixed_dataset: bool = True
 
     ### solver  ###
     solver_name: str = 'random_rank'
@@ -58,7 +59,7 @@ class Config(ClassDict):
     matching_mathod: str = 'greedy'       # Method of node matching: 'greedy' or 'l2s2'
     shortest_method: str = 'k_shortest'   # Method of path finding: 'bfs_shortest' or 'k_shortest'
     k_shortest: int = 10                  # Number of shortest paths to be found
-    allow_revocable: bool = False          # Whether or not to allow to revoke a virtual node
+    allow_revocable: bool = True           # Whether or not to allow to revoke a virtual node
     allow_rejection: bool = False          # Whether or not to allow to reject a virtual node
 
     ### Training ###
@@ -73,21 +74,21 @@ class Config(ClassDict):
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
-    eval_interval: int = 50 #changed was 10
+    eval_interval: int = 120 #changed was 10
 
     ### Neural Network ###
     embedding_dim: int = 128   # Embedding dimension
     hidden_dim: int = 128      # Hidden dimension
     num_layers: int = 1        # Number of GRU stacks' layers
     num_gnn_layers: int = 5    # Number of GNN layers
-    dropout_prob: float = 0.0    # Droput rate
+    dropout_prob: float = 0.1    # Droput rate
     batch_norm: bool = False    # Batch normalization
     l2reg_rate: float = 2.5e-4    # L2 regularization rate
     lr: float = 0.001          # Learning rate
     # lr_decay: float = 0.5      # Learning rate decay
-    pretrained_bc_path: str = "/home/stephen-reilly/development/virne/pretrained_transformer_final.pth"
+    pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final.pth"
     pretrained_loaded: bool = False
-    p_dimension_features: int = 6
+    p_dimension_features: int = 10
     v_dimension_features: int = 6
 
 
@@ -95,16 +96,16 @@ class Config(ClassDict):
     rl_gamma: float = 0.99
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
-    lr_actor: float = 1e-3
-    lr_critic: float = 1e-5
+    lr_actor: float = 5e-4
+    lr_critic: float = 1e-4
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 
     ### Loss ###
     coef_critic_loss: float = 0.5
-    coef_entropy_loss: float = 0.01
+    coef_entropy_loss: float = 0.1
     coef_mask_loss: float = 0.01
-    reward_weight: float = 0.1
+    reward_weight: float = 0.5
 
     lr_penalty_params: float = 1e-3
     lr_cost_critic: float = 1e-3
@@ -145,15 +146,19 @@ class Config(ClassDict):
             i += 1
 
     def get_run_id(self):
-        self.run_time = time.strftime('%Y%m%dT%H%M%S')
-        self.host_name = socket.gethostname()
-        results_dir = self.get_next_results_dir()
+        use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
 
-        #self.run_id = f'{results_dir}-{self.run_time}'
-        self.run_id = f'{results_dir}'
+        if use_fixed:
+            fixed_dir = "dataset/results-fixed"
+            os.makedirs(fixed_dir, exist_ok=True)
+            self.run_id = fixed_dir
+        else:
+            self.run_id = self.get_next_results_dir(base_dir="dataset")
+
         self.v_sim_setting['save_dir'] = self.run_id 
         self.p_net_setting['save_dir'] = self.run_id 
         self.save_dir = self.run_id 
+
 
     def update(self, update_args):
         if not isinstance(update_args, dict):

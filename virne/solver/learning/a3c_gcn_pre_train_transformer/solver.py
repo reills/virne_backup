@@ -10,6 +10,7 @@ from torch.distributions import Categorical
 from torch_geometric.data import Data, Batch
 from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence
 import warnings
+import copy
 
 from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
@@ -29,38 +30,54 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
     with a Transformer-based architecture.
     """
     def __init__(self, controller, recorder, counter, **kwargs):
+        print(f"allow_revocable: {kwargs.get('allow_revocable')}")
+       
+        # Initialize parent classes
+        policy_builder = (
+            lambda slf,
+                p_dim=kwargs.get("p_dimension_features"),
+                v_dim=kwargs.get("v_dimension_features"),
+                rev=kwargs.get("allow_revocable"),
+                rej=kwargs.get("allow_rejection"): make_policy(
+                slf,
+                p_dimension_features=p_dim,
+                v_dimension_features=v_dim,
+                is_revocable=rev,
+                is_rejection=rej
+            )
+        )
 
         # Initialize parent classes
-        A2CSolver.__init__(self, controller, recorder, counter,
-                           lambda slf: make_policy(slf,
-                                                   p_dimension_features=kwargs.get("p_dimension_features", None),
-                                                   v_dimension_features=kwargs.get("v_dimension_features", None)),
-                           obs_as_tensor, **kwargs) 
+        A2CSolver.__init__(  self,  controller,   recorder, counter, policy_builder,   obs_as_tensor,  **kwargs )
+        
+        self.preprocess_encoder_obs = encoder_obs_to_tensor
+
         InstanceAgent.__init__(self, InstanceEnv)
-
-        # Retrieve pretrained model path from kwargs
-        self.pretrained_path = kwargs.get("pretrained_bc_path", None)  
-        self.pretrained_loaded = False  # flag to track loading
-
+        
         # New hyperparameters
         self.entropy_coef = kwargs.get("entropy_coef", 0.01)
         self.normalize_advantage = kwargs.get("normalize_advantage", True)
  
         # Special start token (we use p_net.num_nodes as start token)
         self.start_token_offset = 0
-
         self.preprocess_encoder_obs = encoder_obs_to_tensor
+        
+        # Retrieve pretrained RL model path (if any)
+        self.rl_pretrained_path = kwargs.get("pretrained_model_path", None)
 
-        # Load the pretrained checkpoint if a valid path is provided 
-        if self.pretrained_path and os.path.exists(self.pretrained_path):
+        # Retrieve pretrained model path from kwargs
+        self.behavioral_cloning_path = kwargs.get("pretrained_bc_path", None)   
+
+        # Load the behavioral cloning if it exisys and there is no RL pretraining 
+        if (not self.rl_pretrained_path or not os.path.exists(self.rl_pretrained_path)) and os.path.exists(self.behavioral_cloning_path):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-                checkpoint = torch.load(self.pretrained_path, map_location=self.device)
+                checkpoint = torch.load(self.behavioral_cloning_path, map_location=self.device)
+
                 self.policy.load_state_dict(checkpoint['model_state_dict'])
-                print(f"Loaded pretrained model from {self.pretrained_path}")
+                #print(f"Loaded pretrained model from {checkpoint}")
                 pretrained_loaded = True
-    
-    
+                 
     def update(self):
         """
         Updates both actor and critic using a single forward pass.
@@ -134,11 +151,24 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             return values, action_logprobs, dist_entropy, {}
         else:
             return values, action_logprobs, dist_entropy
+        
+        
+    def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env):
+        return {
+            'p_net_x'         : encoder_obs['p_net_x'],
+            'p_net_edge_index': encoder_obs['p_net_edge_index'],
+            'edge_attr'       : encoder_obs['edge_attr'],
+            'history_actions' : np.array(history_actions, dtype=np.int64),
+            'encoder_outputs' : encoder_outputs,  # you can pass it as detached CPU numpy here if you prefer
+            'action_mask'     : np.expand_dims(sub_env.generate_action_mask(), axis=0)
+        }
+
 
     def solve(self, instance):
         """Inference-only solve using a greedy or sampling approach."""
         v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
+                                preprocess_obs_fn=self.preprocess_obs, **self.basic_config)
 
         # Encode once
         encoder_obs = sub_env.get_observation()
@@ -146,75 +176,73 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         # Start partial action sequence with <start_token>
         history_actions = [p_net.num_nodes + self.start_token_offset]
-
         instance_done = False
+        
         while not instance_done:
-            instance_obs = {
-                'p_net_x'           : encoder_obs['p_net_x'],
-                'p_net_edge_index'  : encoder_obs['p_net_edge_index'],
-                'edge_attr'        : encoder_obs['edge_attr'],  # Add this line!
-                'history_actions'   : np.array(history_actions, dtype=np.int64),
-                'encoder_outputs'   : encoder_outputs,
-                'action_mask'       : np.expand_dims(sub_env.generate_action_mask(), axis=0)
-            }
+            instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
+            
+            sub_env.prev_obs = {
+                **instance_obs,
+                'encoder_outputs': encoder_outputs.detach().cpu().numpy()
+            }
+            sub_env.prev_tensor_obs = tensor_instance_obs
+            
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
             next_obs, reward, instance_done, info = sub_env.step(action)
             history_actions.append(action)
             if instance_done:
                 break
+            
             encoder_obs = next_obs  # Re-encode if needed
+            
         return sub_env.solution
 
     def learn_with_instance(self, instance):
         """Collect one trajectory and store it in the buffer."""
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
+                                preprocess_obs_fn=self.preprocess_obs, **self.basic_config)
 
         encoder_obs = sub_env.get_observation()
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
         history_actions = [p_net.num_nodes + self.start_token_offset]
-
         instance_done = False
+        
         while not instance_done:
-            instance_obs = {
-                'p_net_x'           : encoder_obs['p_net_x'],
-                'p_net_edge_index'  : encoder_obs['p_net_edge_index'],
-                'edge_attr'        : encoder_obs['edge_attr'],  # Add this line!
-                'history_actions'   : np.array(history_actions, dtype=np.int64),
-                'encoder_outputs'   : encoder_outputs,
-                'action_mask'       : np.expand_dims(sub_env.generate_action_mask(), axis=0)
-            }
+            instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
+
+            sub_env.prev_obs = {
+                **instance_obs,
+                'encoder_outputs': encoder_outputs.detach().cpu().numpy()
+            }
+              
+            # Accessing InstanceRLEnv attribute -- save for when revoke -- less recalculating..
+            sub_env.prev_tensor_obs = tensor_instance_obs  # Accessing InstanceRLEnv attribute
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
             value = self.estimate_value(tensor_instance_obs) if hasattr(self.policy, 'evaluate') else None
+            
             next_obs, reward, instance_done, info = sub_env.step(action)
             sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value)
             history_actions.append(action)
+            
             if not instance_done:
                 encoder_obs = next_obs
 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            next_tensor_obs = self.preprocess_obs(
-                {
-                    'p_net_x'          : encoder_obs['p_net_x'],
-                    'p_net_edge_index' : encoder_obs['p_net_edge_index'],
-                    'edge_attr'        : encoder_obs['edge_attr'],  # Add this line!
-                    'history_actions'  : np.array(history_actions, dtype=np.int64),
-                    'encoder_outputs'  : encoder_outputs,
-                    'action_mask'      : np.expand_dims(sub_env.generate_action_mask(), axis=0)
-                },
-                device=self.device
-            )
-            last_value = self.estimate_value(next_tensor_obs)
-            #print(f"Last Value: {last_value}")
-            #print(f"Rewards: {sub_buffer.rewards}")
-            #print(f"Values: {sub_buffer.values}")
-        return sub_env.solution, sub_buffer, last_value
+            final_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
+            final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
+            last_value = self.estimate_value(final_tensor_obs)
 
-def make_policy(agent, p_dimension_features, v_dimension_features, **kwargs):
+        return sub_env.solution, sub_buffer, last_value
+        #print(f"Last Value: {last_value}")
+        #print(f"Rewards: {sub_buffer.rewards}")
+        #print(f"Values: {sub_buffer.values}")
+
+def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,is_rejection,  **kwargs):
     """
     Create the ActorCritic policy with the same hyperparameters as used in pretraining.
     """
@@ -226,7 +254,9 @@ def make_policy(agent, p_dimension_features, v_dimension_features, **kwargs):
         embedding_dim=128,      # Must match the pretrainer
         n_heads=8,
         n_layers=6,
-        dropout=0.2
+        dropout=0.2, 
+        allow_revocable=is_revocable,
+        allow_rejection=is_rejection
     ).to(agent.device)
   
     optimizer = torch.optim.Adam([

@@ -135,6 +135,7 @@ class Controller:
         for attr in attrs_list:
             result, value = attr.check(v, p)
             if not result:
+                #print(f"Attribute '{attr.name}' failed: Required {v[attr.name]}, Available {p[attr.name]} (Violation: {value})")
                 final_result = False
             # record the resource violations
             if attr.type == 'resource':
@@ -271,6 +272,7 @@ class Controller:
         for p_link in p_links:
             result, info = self.check_link_constraints(v_net, p_net, v_link, p_link)
             if not result:
+                #print(f"Path {p_path} rejected: Physical link {p_link} fails constraints for v_link {v_link}. Details: {info}")
                 final_result = False
             path_satisfiability_info[p_link] = info
         # TODO: Add path constraint
@@ -487,6 +489,7 @@ class Controller:
                 raise NotImplementedError
 
         shortest_paths = self.find_shortest_paths(v_net, p_net, v_link, pl_pair, method=shortest_method, k=k)
+        #print(f"Found {len(shortest_paths)} shortest paths for v_link {v_link} between physical nodes {pl_pair}")
         shortest_paths = rank_path_func(v_net, p_net, v_link, pl_pair, shortest_paths) if rank_path_func is not None else shortest_paths
         check_info_list = []
         for p_path in shortest_paths:
@@ -496,9 +499,11 @@ class Controller:
                 solution['link_paths'][v_link] = p_links
                 for p_link in p_links:
                     used_link_resources = {l_attr.name: v_net.links[v_link][l_attr.name] for l_attr in self.link_resource_attrs}
+                    #print(f"Routing v_link {v_link} on p_link {p_link}. Subtracting resources: {used_link_resources}")
                     self.update_link_resources(p_net, p_link, used_link_resources, operator='-', safe=True)
                     solution['link_paths_info'][(v_link, p_link)] = used_link_resources
                 return True, check_info
+        #print(f"Routing failed for v_link {v_link} between {pl_pair}. No feasible path found.")
         return False, check_info
 
     def unsafely_route(
@@ -648,6 +653,8 @@ class Controller:
             solution['result'] = False
             solution['place_result'] = False
             return False, place_info
+        else:
+            solution['place_result'] = True
         # Route
         route_info = {l_attr.name: 0. for l_attr in v_net.get_link_attrs()}
         to_route_v_links = []
@@ -673,6 +680,8 @@ class Controller:
                     solution['result'] = False
                     solution['route_result'] = False
                     return False, route_info
+        # Add this line explicitly if successful
+        solution['route_result'] = True  
         return True, route_info
 
     def unsafely_place_and_route(

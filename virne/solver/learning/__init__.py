@@ -31,8 +31,8 @@ from .pg_cnn import PgCnnSolver
 from .pg_cnn2 import PgCnn2Solver
 from .ddpg_attention import DdpgAttentionSolver
 from .pg_seq2seq import PgSeq2SeqSolver
+from .a3c_gcn_seq2seq_improved import A3CGcnSeq2SeqImprovedSolver
 from .a3c_gcn_seq2seq import A3CGcnSeq2SeqSolver
-from .a3c_gcn_transformer import A3CGcnTransformerSolver
 from .a3c_gcn_pre_train_transformer import A3CGcnPreTrainTransformerSolver
 
 
@@ -47,7 +47,7 @@ __all__ = [
     'PgCnn2Solver',
     'PgSeq2SeqSolver',
     'A3CGcnSeq2SeqSolver',
-    'A3CGcnTransformerSolver',
+    'A3CGcnSeq2SeqImprovedSolver', 
     'A3CGcnPreTrainTransformerSolver',
     'DdpgAttentionSolver'
 ]

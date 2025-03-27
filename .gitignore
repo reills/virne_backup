@@ -3,6 +3,8 @@
 
 #datasets
 dataset
+*.pth
+analysis.py
 
 # build
 virne.egg-info

@@ -47,19 +47,23 @@ class Counter(object):
         for v_link, p_links in solution['link_paths'].items():
             one_revenue = sum([v_net.links[v_link][l_attr.name] for l_attr in self.link_resource_attrs])
             v_net_link_revenue += one_revenue
-            for p_link in p_links:
-                one_cost = sum([solution['link_paths_info'][(v_link, p_link)][l_attr.name] for l_attr in self.link_resource_attrs])
-            v_net_link_cost += one_cost
+            if len(p_links) == 0:
+                continue
+            else:
+                for p_link in p_links:
+                    one_cost = sum([solution['link_paths_info'][(v_link, p_link)][l_attr.name] for l_attr in self.link_resource_attrs])
+                    v_net_link_cost += one_cost
 
+        solution['early_rejection'] = False
         solution['v_net_node_revenue'] = v_net_node_revenue / self.num_node_resource_attrs  # normalize
         solution['v_net_link_revenue'] = v_net_link_revenue
 
         solution['v_net_revenue'] = v_net_node_revenue + v_net_link_revenue
-        solution['v_net_link_cost'] = v_net_link_cost
-        solution['v_net_path_cost'] = v_net_link_cost - v_net_link_revenue
+        solution['v_net_link_cost'] = v_net_link_cost 
         solution['v_net_node_cost'] = v_net_node_revenue / self.num_node_resource_attrs  # normalize
         solution['v_net_cost'] = solution['v_net_node_cost'] + solution['v_net_link_cost']
         solution['v_net_r2c_ratio'] = solution['v_net_revenue'] / solution['v_net_cost'] if solution['v_net_cost'] != 0 else 0
+        solution['num_placed_nodes'] = len(solution.node_slots)
         return solution.to_dict()
 
     def count_solution(self, v_net: VirtualNetwork, solution: Solution) -> dict:
@@ -77,7 +81,7 @@ class Counter(object):
         solution['num_routed_links'] = len(solution.link_paths) 
         solution['v_net_node_demand'] = self.calculate_sum_node_resource(v_net) / self.num_node_resource_attrs  # normalize
         solution['v_net_link_demand'] = self.calculate_sum_link_resource(v_net)
-        solution['v_net_demand'] = solution['v_net_node_demand'] + solution['v_net_demand']
+        solution['v_net_demand'] = solution['v_net_node_demand'] + solution['v_net_link_demand']
         # Success
         if solution['result']:
             solution['place_result'] = True
@@ -106,12 +110,12 @@ class Counter(object):
         solution['v_net_time_rc_ratio'] = solution['v_net_r2c_ratio'] * v_net.lifetime
         return solution.to_dict()
 
-    def calculate_sum_network_resource(self, network: Network, node: bool = True, link: bool = True):
+    def calculate_sum_network_resource(self, network: VirtualNetwork, node: bool = True, link: bool = True):
         """
         Calculate the sum of network resource.
 
         Args:
-            network (Network): Network
+            network (BaseNetwork): BaseNetwork
             node (bool, optional): Whether to calculate the sum of node resource. Defaults to True.
             link (bool, optional): Whether to calculate the sum of link resource. Defaults to True.
 
@@ -122,14 +126,14 @@ class Counter(object):
         e = np.array(network.get_link_attrs_data(self.link_resource_attrs)).sum() if link else 0
         return n + e
 
-    def calculate_sum_node_resource(self, network: Network):
+    def calculate_sum_node_resource(self, network: VirtualNetwork):
         """
         Calculate the sum of node resource.
         """
         n = np.array(network.get_node_attrs_data(self.node_resource_attrs)).sum()
         return n
 
-    def calculate_sum_link_resource(self, network: Network):
+    def calculate_sum_link_resource(self, network: VirtualNetwork):
         """
         Calculate the sum of link resource.
         """
@@ -203,6 +207,8 @@ class Counter(object):
         summary_info['min_p_net_node_available_resource'] = records.loc[:, 'p_net_node_available_resource'].min()
         summary_info['min_p_net_link_available_resource'] = records.loc[:, 'p_net_link_available_resource'].min()
         summary_info['max_inservice_count'] = records.loc[:, 'inservice_count'].max()
+        #summary_info['total_violation'] = records.loc[:, 'v_net_total_hard_constraint_violation'].sum()
+        #summary_info['total_max_single_step_violation'] = records.loc[:, 'v_net_max_single_step_hard_constraint_violation'].sum()
         # rl reward
         if 'v_net_reward' in records.columns:
             summary_info['avg_reward'] = records.loc[records['event_type']==1, 'v_net_reward'].mean()

@@ -10,7 +10,7 @@ v_net_size:
 arrival_rate:
   distribution: possion
   dtype: float
-  lam: 0.0488 # WAS .04 MAKING THEM COME MORE FREQUENTLY 
+  lam: 0.04 # WAS .04 MAKING THEM COME MORE FREQUENTLY 
   reciprocal: true
 lifetime:
   distribution: exponential

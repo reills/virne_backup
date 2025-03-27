@@ -35,7 +35,7 @@ class BehaviorCloningDataset(Dataset):
         return self.samples[idx]
 
 # --- Data Collation ---
-def collate_fn(batch):
+def collate_fn(batch, allow_revocable=False, allow_rejection=False):
     p_net_data = [
         get_pyg_data(s['p_net_x'], s['p_net_edge_index'], s['edge_attr'])
         for s in batch
@@ -45,8 +45,20 @@ def collate_fn(batch):
     history_actions = pad_sequence([s['history_actions'].long() for s in batch],
                                    batch_first=True, padding_value=0)
     action_mask = torch.stack([s['action_mask'] for s in batch])
+    
+    if allow_revocable:
+        # Append a 0 for the revocable action (not available in expert data)
+        action_mask = torch.cat([action_mask, torch.zeros(action_mask.size(0), 1, dtype=action_mask.dtype, device=action_mask.device)], dim=1)
+    
+    if allow_rejection:
+        # Append a 0 for the rejection action (not available in expert data)
+        action_mask = torch.cat([action_mask, torch.zeros(action_mask.size(0), 1, dtype=action_mask.dtype, device=action_mask.device)], dim=1)
+    
     actions = torch.stack([s['action'] for s in batch])
     target_value = torch.stack([s['target_value'] for s in batch])
+    
+    
+    
     return {
         'p_net': p_net_batch,
         'p_net_x': p_net_batch.x,
@@ -119,9 +131,9 @@ def evaluate(model, dataloader, device):
 
 # --- Training Function ---
 def train_transformer(
-    data_file, checkpoint_file="pretrained_transformer.pth", epochs=1000, batch_size=128, 
+    data_file, allow_rejection=False, allow_revocable=False, checkpoint_file="pretrained_transformer.pth", epochs=1000, batch_size=128, 
     lr_actor=1e-4, device='cuda', p_net_feature_dim=3, v_net_feature_dim=3, p_net_num_nodes=100,
-    start_epoch=0, checkpoint=None, val_split=0.1, test_split=0.1, entropy_coef=0.01
+    start_epoch=0, checkpoint=None, val_split=0.1, test_split=0.1, entropy_coef=0.01,
 ):
     dataset = BehaviorCloningDataset(data_file)
     total_samples = len(dataset)
@@ -130,14 +142,19 @@ def train_transformer(
     test_size = total_samples - train_size - val_size
 
     train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                              collate_fn=collate_fn, drop_last=True)
+                              collate_fn=lambda batch: collate_fn(batch, allow_revocable=allow_revocable, allow_rejection=allow_rejection), drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
-                            collate_fn=collate_fn, drop_last=False)
+                            collate_fn=lambda batch: collate_fn(batch, allow_revocable=allow_revocable, allow_rejection=allow_rejection), drop_last=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
-                             collate_fn=collate_fn, drop_last=False)
+                             collate_fn=lambda batch: collate_fn(batch, allow_revocable=allow_revocable, allow_rejection=allow_rejection), drop_last=False)
 
-    model = ActorCritic(p_net_num_nodes, p_net_feature_dim, v_net_feature_dim).to(device)
+    kwargs = {
+        "allow_revocable": allow_revocable,
+        "allow_rejection": allow_rejection, 
+    } 
+    model = ActorCritic(p_net_num_nodes, p_net_feature_dim, v_net_feature_dim, **kwargs).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr_actor, weight_decay=1e-5)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15, verbose=True)
 
@@ -148,7 +165,7 @@ def train_transformer(
         print(f"Resumed training from checkpoint at epoch {start_epoch}...")
 
     best_val_loss = float('inf')
-    patience = 35
+    patience = 15
     epochs_no_improve = 0
     min_delta = 0.001
 
@@ -280,7 +297,7 @@ def encoder_obs_to_tensor(obs, device):
 
 # --- Training Execution ---
 if __name__ == "__main__":
-    dataset_path = "/home/stephen-reilly/development/virne/dataset/training-data/merged_training_data.pt"
+    dataset_path = "/home/stephen-reilly/dev/virne/dataset/training-data/merged_training_data.pt"
     checkpoint_path = "behavioral_cloning_checkpoint.pth"
 
     if not os.path.exists(dataset_path):
@@ -322,7 +339,9 @@ if __name__ == "__main__":
         start_epoch=start_epoch,
         checkpoint=checkpoint,
         val_split=0.1,
-        test_split=0.1
+        test_split=0.1,
+        allow_revocable=True,
+        allow_rejection=False
     )
  
  

@@ -18,6 +18,7 @@ def run(config):
 if __name__ == '__main__':
     config = Config(
         #solver_name='sa',
+        #solver_name='a3c_gcn_seq2seq'
         solver_name='a3c_gcn_pre_train_transformer'
         # p_net_setting_path='customized_p_net_setting_file_path',
         # v_sim_setting_path='customized_v_sim_setting_file_path',

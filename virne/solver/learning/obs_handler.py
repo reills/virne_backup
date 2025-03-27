@@ -57,6 +57,59 @@ class ObservationHandler:
             for attr, attr_data in zip(attrs_list, attr_data):
                 attr_benchmarks[attr.name] = attr_data.max()
         return attr_benchmarks
+    
+    def get_node_utilization_obs(self, network: Network) -> np.ndarray:
+        """Compute average % of used resources per node using 'attr' and 'max_attr'."""
+        node_utils = []
+        for node in network.nodes:
+            utils = []
+            for attr in network.get_node_attrs(['resource']):
+                attr_name = attr.name
+                available = network.nodes[node].get(attr_name, 0.0)
+                maximum = network.nodes[node].get(f"max_{attr_name}", 0.0)
+                if maximum > 0:
+                    used = maximum - available
+                    util = (used / maximum) * 100
+                    utils.append(util)
+                else:
+                    utils.append(0.0)
+            avg_util = np.mean(utils) if utils else 0.0
+            node_utils.append(avg_util)
+        return np.array(node_utils, dtype=np.float32).reshape((-1, 1))
+
+    def get_avg_link_utilization_obs(self, network):
+        """Compute average link utilization (%) for each node based on adjacent edges."""
+        # Get the bandwidth benchmark (assumed to be stored under key 'bw')
+        link_attr_benchmarks = self.get_link_attr_benchmarks(network)
+        max_bw = link_attr_benchmarks.get('bw', 1.0)
+        avg_link_utils = []
+        for node in range(network.num_nodes):
+            neighbors = list(network.adj[node])
+            if neighbors:
+                utils = []
+                for nb in neighbors:
+                    # Ensure consistent edge ordering
+                    edge = (node, nb) if (node, nb) in network.links else (nb, node)
+                    available_bw = network.links[edge]['bw']
+                    util = (1 - available_bw / max_bw) * 100
+                    utils.append(util)
+                avg_link_utils.append(np.mean(utils))
+            else:
+                avg_link_utils.append(0.0)
+        return np.array(avg_link_utils, dtype=np.float32).reshape((-1, 1))
+
+    def get_link_utilization_global_obs(self, network):
+        """Compute global link utilization variance and count of critical links (>80% utilization)."""
+        link_attr_benchmarks = self.get_link_attr_benchmarks(network)
+        max_bw = link_attr_benchmarks.get('bw', 1.0)
+        link_utils = []
+        for edge in network.links:
+            available_bw = network.links[edge]['bw']
+            util = (1 - available_bw / max_bw) * 100
+            link_utils.append(util)
+        link_variance = np.std(link_utils) if link_utils else 0.0
+        critical_links = sum(1 for util in link_utils if util > 80)
+        return link_variance, critical_links
 
     def get_degree_benchmark(self, network):
         return max(list(dict(network.degree).values()))

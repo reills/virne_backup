@@ -27,7 +27,9 @@ class MultiHeadGATSkipLayer(nn.Module):
 
     def forward(self, x, edge_index):
         x = x.to(edge_index.device)
-
+        #print(f"MultiHeadGATSkipLayer - Input x shape: {x.shape}, dtype: {x.dtype}")  # Add this
+        #print(f"MultiHeadGATSkipLayer - edge_index shape: {edge_index.shape}, dtype: {edge_index.dtype}")  # Add this
+        
         gat_out = self.gat(x, edge_index)
         skip_out = self.skip(x)
         out = self.norm(gat_out + 0.1 * skip_out)  # Scale skip connection
@@ -39,7 +41,7 @@ class MultiHeadGATSkipLayer(nn.Module):
 # --- ActorCritic Model ---
 class ActorCritic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, v_net_feature_dim,
-                 embedding_dim=128, n_heads=8, n_layers=6, dropout=0.2):
+                 embedding_dim=128, n_heads=8, n_layers=6, dropout=0.2, **kwargs):
         super().__init__()
         self.encoder = Encoder(
             v_net_feature_dim,
@@ -54,7 +56,8 @@ class ActorCritic(nn.Module):
             embedding_dim=embedding_dim,
             n_heads=n_heads,
             n_layers=n_layers,
-            dropout=dropout
+            dropout=dropout,
+            **kwargs
         )
         self.critic = Critic(
             p_net_num_nodes,
@@ -109,8 +112,11 @@ class Encoder(nn.Module):
 # --- Actor Module ---
 class Actor(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=6, dropout=0.2):
+                 n_heads=8, n_layers=6, dropout=0.2, **kwargs):
         super().__init__()
+        # Retrieve special action flags from kwargs
+        allow_revocable = kwargs.get("allow_revocable", False)
+        allow_rejection = kwargs.get("allow_rejection", False)
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -118,7 +124,9 @@ class Actor(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            is_actor=True
+            is_actor=True, 
+            allow_revocable=allow_revocable,
+            allow_rejection=allow_rejection
         )
 
     def forward(self, obs):
@@ -151,10 +159,13 @@ class Critic(nn.Module):
 # --- Autoregressive Decoder ---
 class AutoregressiveDecoder(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=6, dropout=0.2, is_actor=True):
+                 n_heads=8, n_layers=6, dropout=0.2, is_actor=True,
+                 allow_revocable=False, allow_rejection=False):
         super().__init__()
         self.embedding_dim = embedding_dim  # Save for later use in reshape
-        self.vocab_size = p_net_num_nodes + 1
+        # Calculate total number of actions
+        self.num_actions = p_net_num_nodes + int(allow_rejection) + int(allow_revocable)
+        self.vocab_size = self.num_actions + 1
         self.emb = nn.Embedding(self.vocab_size, embedding_dim)
         
         # Deeper GAT stack for better graph feature extraction
@@ -182,7 +193,7 @@ class AutoregressiveDecoder(nn.Module):
             self.output_head = nn.Sequential(
                 nn.Linear(2 * embedding_dim, embedding_dim),
                 nn.GELU(),
-                nn.Linear(embedding_dim, p_net_num_nodes)
+                nn.Linear(embedding_dim, self.num_actions)
             )
         else:
             self.output_head = nn.Identity()  # Critic uses value_head in Critic class
