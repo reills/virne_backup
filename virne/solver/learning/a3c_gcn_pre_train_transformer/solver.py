@@ -59,7 +59,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         self.normalize_advantage = kwargs.get("normalize_advantage", True)
  
         # Special start token (we use p_net.num_nodes as start token)
-        self.start_token_offset = 0
+        self.start_token = self.policy.actor.decoder.num_actions  # safe! 
         self.preprocess_encoder_obs = encoder_obs_to_tensor
         
         # # Retrieve pretrained RL model path (if any)
@@ -175,7 +175,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
 
         # Start partial action sequence with <start_token>
-        history_actions = [p_net.num_nodes + self.start_token_offset]
+        history_actions = [self.start_token]
         instance_done = False
         
         while not instance_done:
@@ -207,7 +207,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         encoder_obs = sub_env.get_observation()
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
-        history_actions = [p_net.num_nodes + self.start_token_offset]
+        history_actions = [self.start_token]
         instance_done = False
         
         while not instance_done:

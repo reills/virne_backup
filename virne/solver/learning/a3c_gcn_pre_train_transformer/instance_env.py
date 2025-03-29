@@ -75,7 +75,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             reward = placements + bonus
         # Case 5: All nodes placed, but routing failed entirely
         elif solution['place_result']:
-            reward = -vnodes * 0.75  # Scaled: -0.75 # Mild penalty; worse than partial route, better than total failure
+            reward = -vnodes  # Scaled: -0.75 # Mild penalty; worse than partial route, better than total failure
         # Case 6: Total failure (e.g., placement failed)
         else:
             reward = -vnodes  # Large negative signal

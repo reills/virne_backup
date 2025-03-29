@@ -43,30 +43,20 @@ class ActorCritic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, v_net_feature_dim,
                  embedding_dim=128, n_heads=8, n_layers=6, dropout=0.2, **kwargs):
         super().__init__()
-        self.encoder = Encoder(
-            v_net_feature_dim,
-            embedding_dim=embedding_dim,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            dropout=dropout
-        )
-        self.actor = Actor(
-            p_net_num_nodes,
-            p_net_feature_dim,
+        
+        common_kwargs = dict(
+            p_net_num_nodes=p_net_num_nodes,
+            p_net_feature_dim=p_net_feature_dim,
             embedding_dim=embedding_dim,
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            **kwargs
+            **kwargs  # include allow_rejection, allow_revocable, etc.
         )
-        self.critic = Critic(
-            p_net_num_nodes,
-            p_net_feature_dim,
-            embedding_dim=embedding_dim,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            dropout=dropout
-        )
+        
+        self.encoder = Encoder(v_net_feature_dim, embedding_dim, n_heads, n_layers, dropout)
+        self.actor = Actor(**common_kwargs)
+        self.critic = Critic(**common_kwargs)
 
     def encode(self, obs):
         return self.encoder(obs['v_net_x'])
@@ -135,8 +125,11 @@ class Actor(nn.Module):
 # --- Critic Module ---
 class Critic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=6, dropout=0.2):
+                 n_heads=8, n_layers=6, dropout=0.2, **kwargs):
         super().__init__()
+        # Retrieve special action flags from kwargs
+        allow_revocable = kwargs.get("allow_revocable", False)
+        allow_rejection = kwargs.get("allow_rejection", False)
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -144,7 +137,9 @@ class Critic(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            is_actor=False
+            is_actor=False,
+            allow_revocable=allow_revocable,      # ← pass these through
+            allow_rejection=allow_rejection
         )
         self.value_head = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim // 2),
@@ -208,8 +203,10 @@ class AutoregressiveDecoder(nn.Module):
         graph_emb = graph_emb.reshape(batch_p_net.num_graphs, -1, self.embedding_dim)
 
         # Embed history actions
-        tgt_seq = obs['history_actions']
-        tgt_emb = self.emb(tgt_seq)
+        tgt_seq = obs['history_actions'] 
+        assert tgt_seq.max().item() < self.emb.num_embeddings, f"Invalid index! Got {tgt_seq.max().item()}, but embedding size is {self.emb.num_embeddings}"
+        tgt_emb = self.emb(tgt_seq) 
+
         B, T, E = tgt_emb.shape
         causal_mask = torch.triu(torch.ones(T, T, device=tgt_emb.device), diagonal=1).bool()
 
