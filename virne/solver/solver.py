@@ -65,7 +65,7 @@ class Solver:
             'matching_mathod': self.matching_mathod,
             'shortest_method': self.shortest_method,
             'k_shortest': self.k_shortest,
-            'allow_revocable': self.allow_revocable,
+            'allow_rejection': self.allow_rejection,
             'allow_revocable': self.allow_revocable
         }
         set_sim_info_to_object(kwargs, self)
