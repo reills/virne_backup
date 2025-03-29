@@ -5,6 +5,8 @@
 dataset
 *.pth
 analysis.py
+pre-train
+temp_data
 
 # build
 virne.egg-info
