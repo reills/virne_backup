@@ -103,7 +103,7 @@ class Config(ClassDict):
 
     ### Loss ###
     coef_critic_loss: float = 0.5
-    coef_entropy_loss: float = 0.1
+    coef_entropy_loss: float = 0.01
     coef_mask_loss: float = 0.01
     reward_weight: float = 0.5
 
@@ -149,7 +149,7 @@ class Config(ClassDict):
         use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
 
         if use_fixed:
-            fixed_dir = "dataset/results-fixed"
+            fixed_dir = "dataset/results-no-bc"
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
         else:

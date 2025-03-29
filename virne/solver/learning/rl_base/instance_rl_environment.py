@@ -84,6 +84,84 @@ class InstanceRLEnv(RLBaseEnv):
         return self.prev_obs, self.compute_reward(self.solution, revoke=True), False, self.get_info(solution_info)
 
  
+
+class JointPRStepInstanceRLEnv(InstanceRLEnv):
+    
+    def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
+        super(JointPRStepInstanceRLEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
+
+    def step(self, action):
+        """
+        Joint Place and Route with action p_net node.
+
+        All possible case
+            Uncompleted Success: (Node place and Link route successfully)
+            Completed Success: (Node Mapping & Link Mapping)
+            Falilure: (Node place failed or Link route failed)
+        """
+        self.solution['num_interactions'] += 1
+        p_node_id = int(action)
+        self.solution.selected_actions.append(p_node_id)
+
+        if self.solution['num_interactions'] > 5 * self.v_net.num_nodes: 
+            self.solution['description'] = 'Too Many Revokable Actions'
+            self.solution['place_result'] = False
+            self.solution['route_result'] = False
+            return self.reject(is_early=False)
+        # Case: Reject
+        if self.if_rejection(action): 
+            return self.reject(is_early=True)
+        # Case: Revoke
+        if self.if_revocable(action): 
+            return self.revoke()
+        # Case: reusable = False and place in one same node
+        elif not self.reusable and (p_node_id in self.selected_p_net_nodes): 
+            self.solution['place_result'] = False
+            solution_info = self.counter.count_solution(self.v_net, self.solution)
+            done = True 
+        # Case: Try to Place and Route
+        else:
+            assert p_node_id in list(self.p_net.nodes)
+             
+            place_and_route_result, place_and_route_info = self.controller.place_and_route(
+                                                                                self.v_net, 
+                                                                                self.p_net, 
+                                                                                self.curr_v_node_id, 
+                                                                                p_node_id,
+                                                                                self.solution, 
+                                                                                shortest_method=self.shortest_method, 
+                                                                                k=self.k_shortest,
+                                                                                check_feasibility=self.check_feasibility)
+            # Step Failure
+            if not place_and_route_result: 
+                
+                if self.allow_revocable and self.solution['num_interactions'] <= self.v_net.num_nodes * 5:
+                    self.solution['selected_actions'].append(self.revocable_action)
+                    #print("[REVOCABLE] Retrying with a revocable action...")
+                    return self.revoke()
+                else:
+                    self.solution['description'] = 'Too Many Revokable Actions' 
+                    solution_info = self.counter.count_solution(self.v_net, self.solution)
+                    done = True
+    
+                # solution_info = self.solution.to_dict()
+            else:  
+                # VN Success ?
+                if self.num_placed_v_net_nodes == self.v_net.num_nodes: 
+
+                    self.solution['result'] = True
+                    solution_info = self.counter.count_solution(self.v_net, self.solution)
+                    done = True
+                # Step Success
+                else:
+                    done = False
+                    solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
+                    
+        if done:
+            pass
+         
+        return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
+
 class SolutionStepInstanceRLEnv(InstanceRLEnv):
     
     def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
@@ -173,95 +251,6 @@ class PlaceStepInstanceRLEnv(InstanceRLEnv):
         if done:
             pass
         return self.get_observation(), self.compute_reward(solution_info), done, self.get_info(solution_info)
-
-
-class JointPRStepInstanceRLEnv(InstanceRLEnv):
-    
-    def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
-        super(JointPRStepInstanceRLEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
-
-    def step(self, action):
-        """
-        Joint Place and Route with action p_net node.
-
-        All possible case
-            Uncompleted Success: (Node place and Link route successfully)
-            Completed Success: (Node Mapping & Link Mapping)
-            Falilure: (Node place failed or Link route failed)
-        """
-        self.solution['num_interactions'] += 1
-        p_node_id = int(action)
-        self.solution.selected_actions.append(p_node_id)
-
-        if self.solution['num_interactions'] > 10 * self.v_net.num_nodes:
-            #print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
-            #print("[REJECT] Too many interactions, rejecting request.")
-            # self.solution['description'] += 'Too Many Revokable Actions'
-            return self.reject(is_early=False)
-        # Case: Reject
-        if self.if_rejection(action):
-            print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
-            print("[REJECT] Action resulted in rejection.")
-            return self.reject(is_early=True)
-        # Case: Revoke
-        if self.if_revocable(action):
-            #print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
-            #print(f"[REVOKE] Reverting action on pNode{p_node_id}")
-            return self.revoke()
-        # Case: reusable = False and place in one same node
-        elif not self.reusable and (p_node_id in self.selected_p_net_nodes):
-            print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id}")
-            print(f"[FAIL] Cannot reuse pNode{p_node_id}, marking placement as failed.")
-            self.solution['place_result'] = False
-            solution_info = self.counter.count_solution(self.v_net, self.solution)
-            done = True
-            # solution_info = self.solution.to_dict()
-        # Case: Try to Place and Route
-        else:
-            assert p_node_id in list(self.p_net.nodes)
-             
-            place_and_route_result, place_and_route_info = self.controller.place_and_route(
-                                                                                self.v_net, 
-                                                                                self.p_net, 
-                                                                                self.curr_v_node_id, 
-                                                                                p_node_id,
-                                                                                self.solution, 
-                                                                                shortest_method=self.shortest_method, 
-                                                                                k=self.k_shortest,
-                                                                                check_feasibility=self.check_feasibility)
-            # Step Failure
-            if not place_and_route_result:
-                #print(f"\n[STEP] Attempting to place vNode{self.curr_v_node_id} on pNode{p_node_id} and route links...") 
-                #print(f"[FAIL] Routing for vNode{self.curr_v_node_id} → pNode{p_node_id} failed!")
-                #print(f"   - Reason: {place_and_route_info.get('failure_reason', 'Unknown')}")
-                #print(f"   - Path attempted: {place_and_route_info.get('attempted_path', 'N/A')}")
-                
-                if self.allow_revocable and self.solution['num_interactions'] <= self.v_net.num_nodes * 10:
-                    self.solution['selected_actions'].append(self.revocable_action)
-                    #print("[REVOCABLE] Retrying with a revocable action...")
-                    return self.revoke()
-                else:
-                    solution_info = self.counter.count_solution(self.v_net, self.solution)
-                    done = True
-    
-                # solution_info = self.solution.to_dict()
-            else:  
-                # VN Success ?
-                if self.num_placed_v_net_nodes == self.v_net.num_nodes: 
-
-                    self.solution['result'] = True
-                    solution_info = self.counter.count_solution(self.v_net, self.solution)
-                    done = True
-                # Step Success
-                else:
-                    done = False
-                    solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-                    
-        if done:
-            pass
-        
-        # print(f'{t2-t1:.6f}={t3-t1:.6f}+{t2-t3:.6f}')
-        return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
 
     def compute_reward(self, solution):
         """Calculate deserved reward according to the result of taking action."""

@@ -464,8 +464,7 @@ class A2CSolver(RLSolver):
         super(A2CSolver, self).__init__(controller, recorder, counter, make_policy, obs_as_tensor, **kwargs)
         self.repeat_times = 1
 
-    def update(self, ):
-        print('called a2csolver')
+    def update(self, ): 
         observations = self.preprocess_obs(self.buffer.observations, self.device)
         actions = torch.LongTensor(np.array(self.buffer.actions)).to(self.device)
         returns = torch.FloatTensor(self.buffer.returns).to(self.device)

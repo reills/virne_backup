@@ -42,7 +42,9 @@ class A3CGcnSeq2SeqSolver(InstanceAgent, A2CSolver):
 
     def solve(self, instance):
         v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
+                           preprocess_obs_fn=self.preprocess_obs, **self.basic_config)
+
         encoder_obs = sub_env.get_observation()
         instance_done = False
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
@@ -75,7 +77,9 @@ class A3CGcnSeq2SeqSolver(InstanceAgent, A2CSolver):
         # sub env for sub agent
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
+                           preprocess_obs_fn=self.preprocess_obs, **self.basic_config)
+
         encoder_obs = sub_env.get_observation()
         instance_done = False
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))

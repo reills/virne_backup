@@ -45,34 +45,41 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         self.norm_vector_p = _norm_vector_p
         self.norm_vector_v = _norm_vector_v
+        self.max_revokes=40 
 
     def compute_reward(self, solution, revoke=False):
         """Reward for maximizing acceptance, with mild penalty for using revoke (based on revoke_times)."""
+        vnodes = self.v_net.num_nodes # currently 8
+        placements = solution['num_placed_nodes']  # total placements so far
+        revokes = solution['revoke_times'] # of revokes
+        revoke_percentage = (revokes/self.max_revokes)
         
         # Base reward based on result quality 
-        if solution['result']:
-            reward = 1.0  # Full reward for complete acceptance
-        elif solution['route_result']:
-            routed_fraction = solution['num_placed_nodes'] / self.v_net.num_nodes
-            reward = 0.2 * routed_fraction  # Partial reward for partially routed requests
-        elif solution['place_result']:
-            reward = -0.1  # Mild penalty for placed but failed to route
+        if revoke:
+            reward = -(1 + 0.1 * revokes)  # Progressive penalty 
+        elif solution['result']:
+            penalty = revoke_percentage * vnodes
+            bonus =  vnodes - penalty 
+            reward = vnodes + bonus 
+        elif not revoke and solution['route_result']:
+            penalty = placements * revoke_percentage
+            bonus = placements - penalty   
+            reward = placements  + bonus  # Partial reward for partially routed requests
+        elif not revoke and solution['place_result']:
+            reward = -2  # Mild penalty for placed but failed to route
         else:
-            reward = -1.0  # Full penalty for complete failure
+            reward = -vnodes  # Full penalty for complete failure
+             
+        # Scale the reward
+        scaled_reward = reward / self.v_net.num_nodes # Or divide by a constant like 5 or 10
+        
+        self.solution['v_net_reward'] += scaled_reward # Accumulate the original reward if needed for logging
+        
+        return scaled_reward
 
-        # Optional: penalize early rejection to avoid giving up too fast
-        if solution['early_rejection']:
-            reward -= 0.2
-            
-        # Penalize revoke, based on how many times it was called during this request
-        if revoke and solution['revoke_times']  > 0:
-            penalty_scale = min(0.5, 0.05 * solution['revoke_times'])  # Cap the penalty
-            reward -= penalty_scale 
-            
-        # Accumulate reward into the environment's running total
-        self.solution['v_net_reward'] += reward
 
         return reward
+    
     def get_observation(self):
         """
         Returns the observation as a dictionary containing:

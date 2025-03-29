@@ -62,21 +62,21 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         self.start_token_offset = 0
         self.preprocess_encoder_obs = encoder_obs_to_tensor
         
-        # Retrieve pretrained RL model path (if any)
-        self.rl_pretrained_path = kwargs.get("pretrained_model_path", None)
+        # # Retrieve pretrained RL model path (if any)
+        # self.rl_pretrained_path = kwargs.get("pretrained_model_path", None)
 
-        # Retrieve pretrained model path from kwargs
-        self.behavioral_cloning_path = kwargs.get("pretrained_bc_path", None)   
+        # # Retrieve pretrained model path from kwargs
+        # self.behavioral_cloning_path = kwargs.get("pretrained_bc_path", None)   
 
-        # Load the behavioral cloning if it exisys and there is no RL pretraining 
-        if (not self.rl_pretrained_path or not os.path.exists(self.rl_pretrained_path)) and os.path.exists(self.behavioral_cloning_path):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-                checkpoint = torch.load(self.behavioral_cloning_path, map_location=self.device)
+        # # Load the behavioral cloning if it exisys and there is no RL pretraining 
+        # if (not self.rl_pretrained_path or not os.path.exists(self.rl_pretrained_path)) and os.path.exists(self.behavioral_cloning_path):
+        #     with warnings.catch_warnings():
+        #         warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
+        #         checkpoint = torch.load(self.behavioral_cloning_path, map_location=self.device)
 
-                self.policy.load_state_dict(checkpoint['model_state_dict'])
-                #print(f"Loaded pretrained model from {checkpoint}")
-                pretrained_loaded = True
+        #         self.policy.load_state_dict(checkpoint['model_state_dict'])
+        #         #print(f"Loaded pretrained model from {checkpoint}")
+        #         pretrained_loaded = True
                  
     def update(self):
         """
