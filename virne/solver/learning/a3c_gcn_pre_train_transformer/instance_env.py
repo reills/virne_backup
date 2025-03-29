@@ -48,37 +48,43 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.max_revokes=40 
 
     def compute_reward(self, solution, revoke=False):
-        """Reward for maximizing acceptance, with mild penalty for using revoke (based on revoke_times)."""
-        vnodes = self.v_net.num_nodes # currently 8
-        placements = solution['num_placed_nodes']  # total placements so far
-        revokes = solution['revoke_times'] # of revokes
-        revoke_percentage = (revokes/self.max_revokes)
-        
-        # Base reward based on result quality 
-        if revoke:
-            reward = -(1 + 0.1 * revokes)  # Progressive penalty 
+        """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
+
+        vnodes = self.v_net.num_nodes            # Typically 8
+        placements = solution['num_placed_nodes']
+        revokes = solution['revoke_times']
+        revoke_pct = revokes / max(1, self.max_revokes)
+
+        # Case 1: Early rejection — should almost never happen, very bad
+        if solution['early_rejection']:
+            reward = -vnodes * 1.5  # Scaled: -1.5   Penalty applied at the step where early reject happens
+        # Case 2: Revoke was taken — penalize each time it happens
+        elif revoke:
+            reward = -(1 + 0.1 * revokes)  # Increasing penalty per revoke step
+        # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
-            penalty = revoke_percentage * vnodes
-            bonus =  vnodes - penalty 
-            reward = vnodes + bonus 
-        elif not revoke and solution['route_result']:
-            penalty = placements * revoke_percentage
-            bonus = placements - penalty   
-            reward = placements  + bonus  # Partial reward for partially routed requests
-        elif not revoke and solution['place_result']:
-            reward = -2  # Mild penalty for placed but failed to route
+            # This will be called once at the last vnode placement step
+            penalty = revoke_pct * vnodes
+            bonus = vnodes - penalty
+            reward = vnodes + bonus  # e.g., 8 + bonus
+        # Case 4: Routing partially succeeded — some virtual nodes got routed
+        elif solution['route_result']:
+            # Encourage partial progress in routing
+            penalty = placements * revoke_pct
+            bonus = placements - penalty
+            reward = placements + bonus
+        # Case 5: All nodes placed, but routing failed entirely
+        elif solution['place_result']:
+            reward = -vnodes * 0.75  # Scaled: -0.75 # Mild penalty; worse than partial route, better than total failure
+        # Case 6: Total failure (e.g., placement failed)
         else:
-            reward = -vnodes  # Full penalty for complete failure
-             
-        # Scale the reward
-        scaled_reward = reward / self.v_net.num_nodes # Or divide by a constant like 5 or 10
-        
-        self.solution['v_net_reward'] += scaled_reward # Accumulate the original reward if needed for logging
-        
+            reward = -vnodes  # Large negative signal
+        # Normalize by number of vnodes to make reward scale consistent across different topologies
+        scaled_reward = reward / vnodes
+
+        self.solution['v_net_reward'] += scaled_reward
         return scaled_reward
 
-
-        return reward
     
     def get_observation(self):
         """

@@ -182,6 +182,8 @@ class Environment:
         Returns:
             reason (str): the reason of failure.
         """
+        if solution['description'] == 'Too Many Revokable Actions':
+            return 'revoke'
         if solution['early_rejection']:
             return 'reject'
         if not solution['place_result']:
@@ -200,9 +202,11 @@ class Environment:
         """
         # self.solution.reset()
         self.p_net = copy.deepcopy(self.p_net_backup)
-        if reason in ['unknown', -1]:
+        if reason in ['revoke', -2]:
+            self.solution['description'] = 'Too Many Revokable Actions'
+        elif reason in ['unknown', -1]:
             self.solution['description'] = 'Unknown Reason'
-        if reason in ['reject', 0]:
+        elif reason in ['reject', 0]:
             self.solution['description'] = 'Early Rejection'
             self.solution['early_rejection'] = True
         elif reason in ['place', 1]:

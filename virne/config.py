@@ -60,7 +60,7 @@ class Config(ClassDict):
     shortest_method: str = 'k_shortest'   # Method of path finding: 'bfs_shortest' or 'k_shortest'
     k_shortest: int = 10                  # Number of shortest paths to be found
     allow_revocable: bool = True           # Whether or not to allow to revoke a virtual node
-    allow_rejection: bool = False          # Whether or not to allow to reject a virtual node
+    allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
 
     ### Training ###
     num_epochs: int = 1
