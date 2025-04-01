@@ -21,6 +21,27 @@ class RolloutBuffer:
 
         for item in self.all_items:
             setattr(self, item, [])
+            
+    def clone_detached(self):
+        import copy
+        new_buffer = RolloutBuffer()
+
+        def detach_tensor(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu()
+            elif isinstance(obj, dict):
+                return {k: detach_tensor(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [detach_tensor(v) for v in obj]
+            else:
+                return copy.deepcopy(obj)
+
+        for attr in self.all_items:
+            data = getattr(self, attr)
+            setattr(new_buffer, attr, detach_tensor(data))
+
+        return new_buffer
+
 
     def reset(self):
         self.curr_idx = 0

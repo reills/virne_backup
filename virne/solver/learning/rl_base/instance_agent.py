@@ -122,39 +122,59 @@ class InstanceAgent(object):
         return self.buffer
 
     def learn_singly(self, env, num_epochs=1, **kwargs):
-        # main env
+        best_success_count = -1
+
         for epoch_id in range(num_epochs):
             print(f'Training Epoch: {epoch_id}') if self.verbose > 0 else None
             self.training_epoch_id = epoch_id
+
+            # Save model + optimizer + experience buffer
+            start_model_state = copy.deepcopy(self.policy.state_dict())
+            start_optim_state = copy.deepcopy(self.optimizer.state_dict())
+            start_buffer = self.buffer.clone_detached()
 
             instance = env.reset()
             success_count = 0
             epoch_logprobs = []
             revenue2cost_list = []
+
             while True:
-                ### --- instance-level --- ###
                 solution, instance_buffer, last_value = self.learn_with_instance(instance)
                 epoch_logprobs += instance_buffer.logprobs
+
+                # Merge experience as normal
                 self.merge_instance_experience(instance, solution, instance_buffer, last_value)
 
+                # Count successes
                 if solution.is_feasible():
                     success_count += 1
                     revenue2cost_list.append(solution['v_net_r2c_ratio'])
-                # update parameters
+
+                # Do update as soon as buffer fills
                 if self.buffer.size() >= self.target_steps:
-                    loss = self.update()
+                    self.update()
 
                 instance, reward, done, info = env.step(solution)
-
                 if done:
                     break
-                
+
+            # Epoch summary
             epoch_logprobs_tensor = np.concatenate(epoch_logprobs, axis=0)
             print(f'\nepoch {epoch_id:4d}, success_count {success_count:5d}, r2c {info["long_term_r2c_ratio"]:1.4f}, mean logprob {epoch_logprobs_tensor.mean():2.4f}') if self.verbose > 0 else None
+
             if self.rank == 0:
-                # save
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0:
                     self.save_model(f'model-{epoch_id}.pkl')
-                # validate
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)
+
+            # Final check: keep or revert
+            if success_count > best_success_count:
+                best_success_count = success_count
+                print(f"[KEEP] Epoch {epoch_id}: success improved to {success_count}")
+                self.save_model("model-best.pkl")
+            else:
+                print(f"[ROLLBACK] Epoch {epoch_id}: success={success_count} did not improve. Reverting.")
+                self.policy.load_state_dict(start_model_state)
+                self.optimizer.load_state_dict(start_optim_state)
+                self.buffer = start_buffer  # ← restore buffer too!

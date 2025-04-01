@@ -48,6 +48,7 @@ class Config(ClassDict):
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
+    #pretrained_model_path: str = 'dataset/results-no-bc/a3c_gcn_pre_train_transformer/dataset/results-no-bc/model/model-29.pkl'
     pretrained_model_path: str = ''
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
@@ -86,7 +87,7 @@ class Config(ClassDict):
     l2reg_rate: float = 2.5e-4    # L2 regularization rate
     lr: float = 0.001          # Learning rate
     # lr_decay: float = 0.5      # Learning rate decay
-    pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final.pth"
+    pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
     pretrained_loaded: bool = False
     p_dimension_features: int = 10
     v_dimension_features: int = 6
@@ -103,7 +104,7 @@ class Config(ClassDict):
 
     ### Loss ###
     coef_critic_loss: float = 0.5
-    coef_entropy_loss: float = 0.01
+    coef_entropy_loss: float = 0.5
     coef_mask_loss: float = 0.01
     reward_weight: float = 0.5
 
@@ -149,7 +150,7 @@ class Config(ClassDict):
         use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
 
         if use_fixed:
-            fixed_dir = "dataset/results-no-bc"
+            fixed_dir = "dataset/results-tuned-rewards"
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
         else:

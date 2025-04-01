@@ -185,20 +185,22 @@ class RLSolver(Solver):
         action_prob_dist = F.softmax(candicate_action_logits / self.softmax_temp, dim=-1)
         return action_prob_dist, candicate_action_logits
 
-    def select_action(self, observation, sample=True):
+
+    def select_action(self, observation, sample=True, use_failure_aware=False):
         with torch.no_grad():
             action_logits = self.policy.act(observation)
+
+            if use_failure_aware:
+                failure_scores = self.policy.actor.decoder(observation, return_last_embed="failure_score")
+                alpha = 2.0  # Tune this
+                action_logits = action_logits - alpha * failure_scores.squeeze()
+
         if 'action_mask' in observation and self.mask_actions:
             mask = observation['action_mask']
             candicate_action_logits = apply_mask_to_logit(action_logits, mask) 
         else:
             candicate_action_logits = action_logits
-        # if self.mask_actions and self.maskable_policy:
-        #     candicate_action_probs = F.softmax(candicate_action_logits / self.softmax_temp, dim=-1)
-        #     candicate_action_dist = Categorical(probs=candicate_action_probs)
-        # else:
-        #     candicate_action_probs = F.softmax(action_logits / self.softmax_temp, dim=-1)
-        #     candicate_action_dist = Categorical(probs=candicate_action_probs)
+
         candicate_action_dist = Categorical(logits=candicate_action_logits / self.softmax_temp)
         raw_action_dist = Categorical(logits=action_logits / self.softmax_temp)
 
@@ -213,13 +215,15 @@ class RLSolver(Solver):
             action = candicate_action_logits.argmax(-1)
 
         action_logprob = action_dist_for_log_prob.log_prob(action)
-        
+
         if torch.numel(action) == 1:
             action = action.item()
         else:
             action = action.reshape(-1, ).cpu().detach().numpy()
-        # action = action.squeeze(-1).cpu()
+
         return action, action_logprob.cpu().detach().numpy()
+
+
 
     def evaluate_actions(self, old_observations, old_actions, return_others=False):
         actions_logits = self.policy.act(old_observations)

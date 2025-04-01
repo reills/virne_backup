@@ -20,10 +20,10 @@ from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2
 from ..utils import get_pyg_data
 
 @registry.register(
-    solver_name='a3c_gcn_pre_train_transformer', 
+    solver_name='a3c_gcn_transformer_failure', 
     env_cls=SolutionStepEnvironment,
     solver_type='r_learning')
-class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
+class A3CGcnTransformerFailureSolver(InstanceAgent, A2CSolver):
     """
     A Reinforcement Learning-based solver that uses 
     Advantage Actor-Critic (A3C) as the training algorithm,
@@ -119,6 +119,18 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         critic_loss = F.mse_loss(returns, values)
         # Combined loss: you can also weight critic_loss with a factor if desired
         total_loss = actor_loss + critic_loss - self.entropy_coef * dist_entropy.mean()
+        
+        # Failure prediction loss (supervised)
+        failure_scores = self.policy.actor.decoder(obs_tensors, return_last_embed="failure_score")
+        failure_result = getattr(self.buffer, 'solution_result', False)
+        failure_labels = torch.ones_like(failure_scores).to(self.device) if not failure_result else torch.zeros_like(failure_scores).to(self.device)
+        failure_loss = F.binary_cross_entropy(failure_scores.squeeze(), failure_labels)
+ 
+        # Add to total loss:
+        total_loss += 0.1 * failure_loss  # You can tune 0.1 later
+
+        # Optionally: add to logging
+        info["failure_loss"] = failure_loss.item() 
 
         # --- Backpropagation ---
         self.optimizer.zero_grad()
@@ -132,7 +144,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             "loss_total": total_loss.item(),
             "actor_loss": actor_loss.item(),
             "critic_loss": critic_loss.item(),
-            "entropy": dist_entropy.mean().item()
+            "entropy": dist_entropy.mean().item(),
+            "failure_loss": failure_loss.item()
         }
         if self.verbose >= 1 and self.update_time % 100 == 0:
             print(f"[Update {self.update_time}] {info}")
@@ -242,6 +255,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
 
+        sub_buffer.solution_result = sub_env.solution['result']
         return sub_env.solution, sub_buffer, last_value
         #print(f"Last Value: {last_value}")
         #print(f"Rewards: {sub_buffer.rewards}")
