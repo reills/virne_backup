@@ -13,18 +13,18 @@ import re
 # ------------------------------------------------------------------------------
 #v_path = "/Users/stephenreilly/Desktop/github/virne/save/sa/Stephens-MacBook-Pro-2.local-20250226T193311/records"
 #v_csv_filename = "/sa-Stephens-MacBook-Pro-2.local-20250226T193311-20250226T193311.csv"
-v_path = "/Users/stephenreilly/Downloads/check/"
-v_csv_filename ="sa-20250226T183614.csv"
+v_path = "/Users/stephenreilly/Desktop/github/virne/dataset/results-visualizer/"
+v_csv_filename ="sa-20250402T013438.csv"
 df = pd.read_csv(v_path + v_csv_filename)
 
 #p_path = "/Users/stephenreilly/Desktop/github/virne/dataset/p_net/10-waxman_[0.5-0.2]-cpu_[50-100]-max_cpu_None-bw_[50-100]-max_bw_None/p_net.gml"
-p_path = "/Users/stephenreilly/Downloads/check/p_net.gml"
+p_path = "/Users/stephenreilly/Desktop/github/virne/dataset/results-visualizer/p_net.gml"
 physical_graph = nx.read_gml(p_path)
 physical_graph = nx.relabel_nodes(physical_graph, lambda x: str(x))
 
 SFC_FOLDER_PATH = (
     #"/Users/stephenreilly/Desktop/github/virne/dataset/v_nets/100-[4-4]-random-500-0.04-cpu_[0-50]-bw_[0-50]/v_nets/"
-    "/Users/stephenreilly/Downloads/check/v_nets/"
+    "/Users/stephenreilly/Desktop/github/virne/dataset/results-visualizer/v_nets"
 )
 
 def get_vnet_gml_path(row_index):
@@ -389,7 +389,7 @@ def draw_graph(index):
     row = df.iloc[index]
     event_time = round(float(row[EVENT_TIME_COL]), 1)
     ax.set_title(
-        f"Row {index+1}/{len(df)} | "
+        #f"Row {index+1}/{len(df)} | "
         f"Event Time={event_time} | "
         f"Description={row[DESCRIPTION_COL]}",
         fontsize=14, fontweight="bold"
@@ -429,7 +429,8 @@ def draw_graph(index):
         # Place text at the bottom (y ~ 0.05) and center (x=0.5)
         # Use a partially transparent bbox so we can see the graph behind the text.
         ax.text(
-            0.5, 0.04,                  # X, Y in axes coordinates
+            #0.5, 0.04,                  # X, Y in axes coordinates
+            0.7, 0.8, 
             vnet_info_text,
             transform=ax.transAxes,
             ha="center", 

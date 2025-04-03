@@ -36,6 +36,7 @@ from .a3c_gcn_seq2seq import A3CGcnSeq2SeqSolver
 from .a3c_gcn_pre_train_transformer import A3CGcnPreTrainTransformerSolver
 from .a2c_gcn_transformer_encoder import A3CGcnTransformerEncoder
 from .a3c_gcn_transformer_failure import A3CGcnTransformerFailureSolver
+from .a3c_gcn_oneshot_transformer import A3CGcnOneshotTransformerSolver
 
 __all__ = [
     # Unsupervised learning solvers
@@ -52,5 +53,6 @@ __all__ = [
     'A3CGcnPreTrainTransformerSolver',
     'A3CGcnTransformerEncoder',
     'A3CGcnTransformerFailureSolver',
+    'A3CGcnOneshotTransformerSolver',
     'DdpgAttentionSolver'
 ]

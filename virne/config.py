@@ -150,7 +150,7 @@ class Config(ClassDict):
         use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
 
         if use_fixed:
-            fixed_dir = "dataset/results-tuned-rewards"
+            fixed_dir = "dataset/results-visualizer"
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
         else:

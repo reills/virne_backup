@@ -22,8 +22,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Use module-level cache
         global _norm_vector_p, _norm_vector_v
         # Set normalization paths
-        #dataset_path = "/home/stephen-reilly/dev/virne/dataset/training-data/merged_training_data.pt"
-        dataset_path = "/Users/stephenreilly/Desktop/github/virne/virne/solver/learning/a3c_gcn_pre_train_transformer/merged_training_data.pt"
+        dataset_path = "/home/stephen-reilly/dev/virne/dataset/training-data/merged_training_data.pt"
+        #dataset_path = "/Users/stephenreilly/Desktop/github/virne/virne/solver/learning/a3c_gcn_pre_train_transformer/merged_training_data.pt"
         if _norm_vector_p is None or _norm_vector_v is None:
             print("Loading normalization vectors...")
 
@@ -34,8 +34,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                     data = torch.load(dataset_path)
 
                 # Expect each item in data to be a dict with 'p_net_x' and 'v_net_x'
-                p_samples = torch.cat([s['p_net_x'].clone().detach() if isinstance(s['p_net_x'], torch.Tensor) else torch.tensor(s['p_net_x']) for s in data], dim=0)
-                v_samples = torch.cat([s['v_net_x'].clone().detach() if isinstance(s['v_net_x'], torch.Tensor) else torch.tensor(s['v_net_x']) for s in data], dim=0)
+                p_samples = torch.cat([torch.tensor(s['p_net_x']) for s in data], dim=0)
+                v_samples = torch.cat([torch.tensor(s['v_net_x']) for s in data], dim=0)
 
                 _norm_vector_p = torch.max(p_samples, dim=0)[0].float()
                 _norm_vector_v = torch.max(v_samples, dim=0)[0].float()
@@ -46,46 +46,30 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         self.norm_vector_p = _norm_vector_p
         self.norm_vector_v = _norm_vector_v
-        
-        self.max_revokes=40 
+    
+    def compute_reward(self, solution):
+        """Reward function for one-shot VNet deployment."""
 
-    def compute_reward(self, solution, revoke=False):
-        """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
+        vnodes = self.v_net.num_nodes
+        vlinks = self.v_net.num_links
+        total_reward = 0.0
 
-        vnodes = self.v_net.num_nodes            # Typically 8
-        placements = solution['num_placed_nodes']
-        revokes = solution['revoke_times']
-        revoke_pct = revokes / max(1, self.max_revokes)
-
-        # Case 1: Early rejection — should almost never happen, very bad
-        if solution['early_rejection']:
-            reward = -vnodes * 1.5  # Scaled: -1.5   Penalty applied at the step where early reject happens
-        # Case 2: Revoke was taken — penalize each time it happens
-        elif revoke:
-            reward = -(.5 + 0.1 * revokes)  # Increasing penalty per revoke step
-        # Case 3: Final step of a full success — high reward, scaled with revoke penalty
-        elif solution['result']:
-            # This will be called once at the last vnode placement step
-            penalty = revoke_pct * vnodes
-            bonus = vnodes - penalty
-            reward = vnodes + bonus  # e.g., 8 + bonus
-        # Case 4: Routing partially succeeded — some virtual nodes got routed
-        elif solution['route_result']:
-            # Encourage partial progress in routing
-            penalty = placements * revoke_pct
-            bonus = placements - penalty
-            reward = placements + bonus
-        # Case 5: All nodes placed, but routing failed entirely
-        elif solution['place_result']:
-            reward = -vnodes * 0.75  # Scaled: -0.75 # Mild penalty; worse than partial route, better than total failure
-        # Case 6: Total failure (e.g., placement failed)
+        if solution['result']:
+            # Success: all nodes placed and links routed
+            total_reward = 2.0
+        elif solution['place_result'] and not solution['route_result']:
+            # Node placement okay, routing failed
+            total_reward = -0.75
+        elif solution['route_result']:  # Partial routing success
+            routed_links = len(solution['link_paths'])
+            total_reward = 1.0 + (routed_links / vlinks)  # Slightly scaled
         else:
-            reward = -vnodes  # Large negative signal
-        # Normalize by number of vnodes to make reward scale consistent across different topologies
-        scaled_reward = reward / vnodes
+            # Total failure
+            total_reward = -1.0
 
-        self.solution['v_net_reward'] += scaled_reward
-        return scaled_reward
+        # Optional: scale to match your old scheme
+        return total_reward
+
 
     
     def get_observation(self):
