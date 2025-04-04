@@ -1,25 +1,35 @@
-
 import torch
-import os
+
+# Load checkpoint
+checkpoint = torch.load("/home/stephen-reilly/dev/virne/behavioral_cloning_checkpoint.pth", map_location='cpu')
+
+# Inspect state dict
+state_dict = checkpoint['model_state_dict']
+for k, v in state_dict.items():
+    print(f"{k}: {tuple(v.shape)}")
+    
+    
+# import torch
+# import os
 
 
-dataset_path = "dataset/training-data/merged_training_data.pt"
-dataset = torch.load(dataset_path)
+# dataset_path = "dataset/training-data/merged_training_data.pt"
+# dataset = torch.load(dataset_path)
 
-total_samples = 0
-zero_mask_count = 0
+# total_samples = 0
+# zero_mask_count = 0
 
-for i, sample  in  enumerate(dataset):
-    if( i == 48):
-        print(sample)
-    total_samples += 1
+# for i, sample  in  enumerate(dataset):
+#     if( i == 48):
+#         print(sample)
+#     total_samples += 1
 
-print(f"Total samples: {total_samples}")
-print(f"Samples with fully zero action masks: {zero_mask_count} ({zero_mask_count / total_samples:.2%})")
+# print(f"Total samples: {total_samples}")
+# print(f"Samples with fully zero action masks: {zero_mask_count} ({zero_mask_count / total_samples:.2%})")
 
-cleaned_dataset = [sample for sample in dataset if sample['action_mask'].sum() > 0]
-torch.save(cleaned_dataset, dataset_path)  # Overwrite the dataset
-print(f"Filtered dataset saved with {len(cleaned_dataset)} samples.")
+# cleaned_dataset = [sample for sample in dataset if sample['action_mask'].sum() > 0]
+# torch.save(cleaned_dataset, dataset_path)  # Overwrite the dataset
+# print(f"Filtered dataset saved with {len(cleaned_dataset)} samples.")
 
 
 # import torch

@@ -149,6 +149,23 @@ class ObservationHandler:
                 node_data[i] = node_data[i] / node_attr_benchmarks[attr_name]
         return node_data.T
 
+    def get_link_attrs_utils_obs(self, network: Network, link_attr_benchmarks: dict = None):
+        """
+        Returns edge attributes as [normalized_bandwidth, utilization]
+        where utilization = 1 - bw / max_bw
+        """
+        link_attrs = []
+        max_bw = link_attr_benchmarks.get('bw', 1.0) if link_attr_benchmarks else 1.0
+
+        for edge in network.links:
+            bw = network.links[edge].get('bw', 0.0)
+            bw_norm = bw / max_bw if max_bw > 0 else 0.0
+            utilization = 1.0 - bw_norm
+            link_attrs.append([bw_norm, utilization])
+
+        return np.array(link_attrs, dtype=np.float32)
+
+
     def get_link_attrs_obs(self, network: Network, link_attr_types=['resource', 'extrema'], link_attr_benchmarks: dict = None):
         l_attrs = network.get_link_attrs(link_attr_types)
         link_data = np.array(network.get_link_attrs_data(l_attrs), dtype=np.float32)

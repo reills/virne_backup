@@ -30,8 +30,9 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
     with a Transformer-based architecture.
     """
     def __init__(self, controller, recorder, counter, **kwargs):
-        print(f"allow_revocable: {kwargs.get('allow_revocable')}")
-       
+        print(f"allow_revocable: {kwargs.get('allow_revocable')}") 
+        self.global_history = []
+        
         # Initialize parent classes
         policy_builder = (
             lambda slf,
@@ -52,7 +53,7 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
         
         self.preprocess_encoder_obs = encoder_obs_to_tensor
 
-        InstanceAgent.__init__(self, InstanceEnv)
+        InstanceAgent.__init__(self, InstanceEnv )
         
         # New hyperparameters
         self.entropy_coef = kwargs.get("entropy_coef", 0.01)
@@ -96,12 +97,11 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
 
         # --- Forward Pass: Compute Actor and Critic Outputs ---
         # Run a single forward pass to obtain both the logits (for action selection)
-        # and the value estimates (for the critic)
-        logits, values = self.policy(
-            p_net_x=obs_tensors['p_net_x'],
-            p_edge_index=obs_tensors['p_net_edge_index'],
-            v_net_x=obs_tensors['v_net_x']
-        )
+        # and the value estimates (for the critic) 
+        logits = self.policy(obs_tensors['p_net_x'], obs_tensors['p_net_edge_index'], obs_tensors['v_net_x'])
+        values = self.policy.evaluate(obs_tensors['p_net_x'], obs_tensors['p_net_edge_index'], obs_tensors['v_net_x'])
+
+
         # Create a categorical distribution from logits
         dist = torch.distributions.Categorical(logits=logits)
         action_logprobs = dist.log_prob(actions)
@@ -145,8 +145,10 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
         """
         Evaluate log-probabilities, value, and entropy for chosen actions.
         """
-        logits = self.policy.act(obs)  # Shape: (B, p_net_num_nodes)
-        values = self.policy.evaluate(obs).squeeze(-1)
+        logits = self.policy.act(obs)  # Shape: (B, p_net_num_nodes) 
+        values = self.policy.evaluate(obs['p_net_x'], obs['p_net_edge_index'], obs['v_net_x'])
+
+
         dist = Categorical(logits=logits)
         action_logprobs = dist.log_prob(actions)
         dist_entropy = dist.entropy()
@@ -160,49 +162,78 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
 
     def solve(self, instance):
         v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+        sub_env = self.InstanceEnv(
+            p_net, v_net, self.controller, self.recorder, self.counter,
+            global_history=self.global_history,  # <- add this!
+            start_token=self.policy.actor.decoder.num_actions,
+            **self.basic_config
+        )
 
         obs = sub_env.get_observation()
 
         p_net_x = torch.tensor(obs['p_net_x'], dtype=torch.float32, device=self.device)
         p_edge_index = torch.tensor(obs['p_net_edge_index'], dtype=torch.long, device=self.device)
         v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=self.device).unsqueeze(0)  # add batch dim
+        edge_attr = torch.tensor(obs['edge_attr'], dtype=torch.float32, device=self.device)
+        history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=self.device).unsqueeze(0)  
+
 
         self.policy.eval()
         with torch.no_grad():
-            logits, _ = self.policy(p_net_x, p_edge_index, v_net_x)  # logits: (8, N_p)
+            logits = self.policy(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions)
             actions = torch.argmax(logits, dim=-1).tolist()          # list of 8 placements
 
         node_slots = {i: a for i, a in enumerate(actions)}
-        solution = Solution()
+        solution = Solution(v_net)
         self.controller.deploy_with_node_slots(v_net, p_net, node_slots, solution)
+        
+        # After finishing the VNet, update the global history with the chosen node placements
+        for _, pnode in solution['node_slots'].items():
+            self.global_history.append(pnode)
+            
         return solution
 
 
     def learn_with_instance(self, instance):
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+        sub_env = self.InstanceEnv(
+            p_net, v_net, self.controller, self.recorder, self.counter,
+            global_history=self.global_history,  # <- add this!
+            **self.basic_config
+        )
 
         obs = sub_env.get_observation()
 
         p_net_x = torch.tensor(obs['p_net_x'], dtype=torch.float32, device=self.device)
         p_edge_index = torch.tensor(obs['p_net_edge_index'], dtype=torch.long, device=self.device)
         v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, 8, F)
+        edge_attr = torch.tensor(obs['edge_attr'], dtype=torch.float32, device=self.device)
+        history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=self.device).unsqueeze(0)  
 
         self.policy.train()
-        logits, value = self.policy(p_net_x, p_edge_index, v_net_x)  # logits: (8, N_p)
+        logits = self.policy(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions)
+        value = self.policy.evaluate(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions)
 
         dist = Categorical(logits=logits)
         actions = dist.sample()
         logprobs = dist.log_prob(actions)
-
-        node_slots = {i: a.item() for i, a in enumerate(actions)}
-        solution = Solution()
+        
+        print("actions shape:", actions.shape)
+        print("actions raw:", actions)
+        print("actions.tolist():", actions.tolist())
+        actions = actions.squeeze(0)  # from shape [1, 8] → [8]
+        node_slots = {i: int(a) for i, a in enumerate(actions.tolist())}
+        solution = Solution(v_net)
+        
         self.controller.deploy_with_node_slots(v_net, p_net, node_slots, solution)
 
         # Reward is 1.0 if accepted, 0.0 or -1.0 if failed (tune as you like)
         reward = float(solution['result'])
+        
+        # After finishing the VNet, update the global history with the chosen node placements
+        for _, pnode in solution['node_slots'].items():
+            self.global_history.append(pnode)
 
         # Buffer expects lists per step — just wrap everything as one step
         sub_buffer.add(obs, actions.tolist(), reward, done=True, logprob=logprobs.sum(), value=value)
@@ -224,3 +255,40 @@ def make_policy(agent, p_dimension_features, v_dimension_features, **kwargs):
     optimizer = torch.optim.Adam(model.parameters(), lr=agent.lr_actor, weight_decay=agent.weight_decay)
     return model, optimizer
  
+ 
+def encoder_obs_to_tensor(obs, device):
+    """Process the v_net features for the Transformer Encoder."""
+    if isinstance(obs, dict):
+        # If obs['v_net_x'] is already a tensor, move it; otherwise, create one on the desired device.
+        if torch.is_tensor(obs['v_net_x']):
+            obs_v_net_x = obs['v_net_x'].float().to(device)
+        else:
+            obs_v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=device)
+        return {'v_net_x': obs_v_net_x}
+    elif isinstance(obs, list):
+        obs_batch = [
+            torch.tensor(o['v_net_x'], dtype=torch.float32, device=device)
+            if not torch.is_tensor(o['v_net_x']) else o['v_net_x'].float().to(device)
+            for o in obs
+        ]
+        padded = pad_sequence(obs_batch, batch_first=True)
+        return {'v_net_x': padded}
+    else:
+        raise Exception(f"Unrecognized type of observation {type(obs)}")
+
+
+def obs_as_tensor(obs, device):
+    data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'], obs['edge_attr'])
+    obs_p_net = Batch.from_data_list([data]).to(device)
+    history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
+    obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
+    obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
+    return {
+        'p_net': obs_p_net,
+        'history_actions': history_actions,
+        'edge_attr'        : obs['edge_attr'],
+        'encoder_outputs': obs_encoder_outputs,
+        'action_mask': obs_action_mask,
+        'mask': None
+    }
+    

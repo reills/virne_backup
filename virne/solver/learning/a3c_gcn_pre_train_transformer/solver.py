@@ -59,7 +59,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         self.normalize_advantage = kwargs.get("normalize_advantage", True)
  
         # Special start token (we use p_net.num_nodes as start token)
-        self.start_token = self.policy.actor.decoder.num_actions  # safe! 
+        self.start_token = self.policy.actor.decoder.start_token
+        self.pad_token   = self.policy.actor.decoder.pad_token
+
         self.preprocess_encoder_obs = encoder_obs_to_tensor
         
         # # Retrieve pretrained RL model path (if any)
@@ -71,56 +73,48 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         #    print("No pretrained model path specified, starting from scratch.")
             
         # # Retrieve pretrained model path from kwargs
-        self.behavioral_cloning_path = kwargs.get("pretrained_bc_path", None)   
+        # self.behavioral_cloning_path = kwargs.get("pretrained_bc_path", None)   
 
-        # # Load the behavioral cloning if it exisys and there is no RL pretraining 
-        if (not self.rl_pretrained_path or not os.path.exists(self.rl_pretrained_path)) and os.path.exists(self.behavioral_cloning_path):
-             with warnings.catch_warnings():
-                 warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-                 checkpoint = torch.load(self.behavioral_cloning_path, map_location=self.device)
+        # # # Load the behavioral cloning if it exisys and there is no RL pretraining 
+        # if (not self.rl_pretrained_path or not os.path.exists(self.rl_pretrained_path)) and os.path.exists(self.behavioral_cloning_path):
+        #      with warnings.catch_warnings():
+        #          warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
+        #          checkpoint = torch.load(self.behavioral_cloning_path, map_location=self.device)
 
-                 self.policy.load_state_dict(checkpoint['model_state_dict'])
-                 #print(f"Loaded pretrained model from {checkpoint}")
-                 pretrained_loaded = True
+        #          self.policy.load_state_dict(checkpoint['model_state_dict'])
+        #          #print(f"Loaded pretrained model from {checkpoint}")
+        #          pretrained_loaded = True
                  
     def update(self):
         """
         Updates both actor and critic using a single forward pass.
-        Because the actor and critic share parts of the network,
-        we compute a combined loss (actor loss + critic loss - entropy bonus)
-        and perform one backward pass, avoiding multiple backward calls
-        and the need for retain_graph=True.
+        Also includes a failure predictor head trained with BCE loss on non-revoke/non-reject actions.
         """
         # Collect batch data
-        obs_tensors = self.preprocess_obs(self.buffer.observations, self.device)
+        obs_tensors = self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)
         actions = torch.LongTensor(self.buffer.actions).to(self.device)
         returns = torch.FloatTensor(self.buffer.returns).to(self.device)
 
-        # --- Forward Pass: Compute Actor and Critic Outputs ---
-        # Run a single forward pass to obtain both the logits (for action selection)
-        # and the value estimates (for the critic)
-        logits = self.policy.act(obs_tensors)            # Actor branch; shape: (B, p_net_num_nodes)
-        values = self.policy.evaluate(obs_tensors).squeeze(-1)  # Critic branch; shape: (B,)
-        
-        # Create a categorical distribution from logits
+        # --- Forward Pass ---
+        logits = self.policy.act(obs_tensors)
+        values = self.policy.evaluate(obs_tensors).squeeze(-1)
+
+        # Categorical dist for actor
         dist = torch.distributions.Categorical(logits=logits)
         action_logprobs = dist.log_prob(actions)
         dist_entropy = dist.entropy()
 
-        # --- Loss Computation ---
-        # Compute advantage (detach critic to avoid backpropagating through it twice)
+        # --- Advantage ---
         advantages = returns - values.detach()
         if self.normalize_advantage and advantages.numel() > 0:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Actor loss (policy gradient loss)
-        actor_loss = -(action_logprobs * advantages).mean()
-        # Critic loss (value estimation loss)
-        critic_loss = F.mse_loss(returns, values)
-        # Combined loss: you can also weight critic_loss with a factor if desired
-        total_loss = actor_loss + critic_loss - self.entropy_coef * dist_entropy.mean()
 
-        # --- Backpropagation ---
+        # --- Losses ---
+        actor_loss = -(action_logprobs * advantages).mean()
+        critic_loss = F.mse_loss(returns, values)
+        total_loss = actor_loss + critic_loss - self.entropy_coef * dist_entropy.mean()
+        
+        # --- Backprop ---
         self.optimizer.zero_grad()
         total_loss.backward()
         if self.clip_grad:
@@ -136,7 +130,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         }
         if self.verbose >= 1 and self.update_time % 100 == 0:
             print(f"[Update {self.update_time}] {info}")
- 
+
         self.buffer.clear()
         self.update_time += 1
 
@@ -159,6 +153,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         
     def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env):
+        
+        filtered = [a for a in history_actions if a not in [100, 101]]
+        history_actions = [self.start_token] + filtered[:8]  # Cap at 8
+        
         return {
             'p_net_x'         : encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
@@ -292,7 +290,7 @@ def encoder_obs_to_tensor(obs, device):
         raise Exception(f"Unrecognized type of observation {type(obs)}")
 
 
-def obs_as_tensor(obs, device):
+def obs_as_tensor(obs, device, pad_token=None):
     """Preprocess the entire observation into tensor form."""
     if isinstance(obs, dict):
         data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'], obs['edge_attr'])
@@ -314,7 +312,8 @@ def obs_as_tensor(obs, device):
         encoder_outputs_list = [o['encoder_outputs'] for o in obs]
         action_mask_list = [o['action_mask'] for o in obs]
         obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
-        hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=0).to(device)
+        hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=pad_token).to(device)
+
         batch_size = len(encoder_outputs_list)
         max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
         emb_dim = encoder_outputs_list[0].shape[2]

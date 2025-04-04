@@ -48,7 +48,7 @@ class Config(ClassDict):
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
-    #pretrained_model_path: str = 'dataset/results-no-bc/a3c_gcn_pre_train_transformer/dataset/results-no-bc/model/model-29.pkl'
+    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-conv/a3c_gcn_pre_train_transformer/dataset/results-conv/model/model-best.pkl'
     pretrained_model_path: str = ''
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
@@ -71,7 +71,7 @@ class Config(ClassDict):
     distributed_training: bool = False
     num_train_epochs: int = 100 #changed by me was 100
     num_workers: int = 4 #changed by me was 10
-    batch_size: int = 64 # changed by me was 128
+    batch_size: int = 128 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
@@ -150,7 +150,7 @@ class Config(ClassDict):
         use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
 
         if use_fixed:
-            fixed_dir = "dataset/results-visualizer"
+            fixed_dir = "dataset/results-padding"
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
         else:

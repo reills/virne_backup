@@ -44,8 +44,8 @@ class InstanceRLEnv(RLBaseEnv):
         self.prev_obs = None  # Initialize to None
         self.prev_tensor_obs = None  # Initialize to None
         self.preprocess_obs_fn = kwargs.pop("preprocess_obs_fn", None)
-        if self.preprocess_obs_fn is None:
-            raise ValueError("Missing required 'preprocess_obs_fn'")
+        #if self.preprocess_obs_fn is None:
+        #    raise ValueError("Missing required 'preprocess_obs_fn'")
         self.device = kwargs.get("device", torch.device("cpu"))
 
         # set_sim_info_to_object(kwargs, self)
@@ -79,7 +79,8 @@ class InstanceRLEnv(RLBaseEnv):
             self.prev_obs = self.get_observation()
 
         # Also update the tensor version
-        self.prev_tensor_obs = self.preprocess_obs_fn(self.prev_obs, device=self.device)
+        self.prev_tensor_obs = self.preprocess_obs_fn(self.prev_obs, device=self.device, pad_token=self.pad_token)
+
 
         return self.prev_obs, self.compute_reward(self.solution, revoke=True), False, self.get_info(solution_info)
 
@@ -103,7 +104,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         p_node_id = int(action)
         self.solution.selected_actions.append(p_node_id)
 
-        if self.solution['revoke_times'] > 5 * self.v_net.num_nodes: 
+        if self.solution['revoke_times'] > 10 * self.v_net.num_nodes: 
             self.solution['description'] = 'Too Many Revokable Actions'
             self.solution['place_result'] = True
             self.solution['route_result'] = False
@@ -134,7 +135,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                                 check_feasibility=self.check_feasibility)
             # Step Failure
             if not place_and_route_result: 
-                if self.allow_revocable and self.solution['revoke_times'] <= self.v_net.num_nodes * 5:
+                if self.allow_revocable and self.solution['revoke_times'] <= self.v_net.num_nodes * 10:
                     self.solution['selected_actions'].append(self.revocable_action)
                     #print("[REVOCABLE] Retrying with a revocable action...")
                     return self.revoke()

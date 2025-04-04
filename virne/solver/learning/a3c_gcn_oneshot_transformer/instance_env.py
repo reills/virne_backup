@@ -13,12 +13,13 @@ _norm_vector_p = None
 _norm_vector_v = None
 class InstanceEnv(JointPRStepInstanceRLEnv):
 
-    def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
+    def __init__(self, p_net, v_net, controller, recorder, counter, global_history, **kwargs):
         super(InstanceEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
         num_p_net_node_attrs = len(self.p_net.get_node_attrs(['resource', 'extrema']))
         num_p_net_link_attrs = len(self.p_net.get_link_attrs(['resource', 'extrema']))
         num_p_net_features = num_p_net_node_attrs + 1
-         
+        self.window_size=100
+        self.global_history = global_history
         # Use module-level cache
         global _norm_vector_p, _norm_vector_v
         # Set normalization paths
@@ -33,9 +34,9 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                     warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
                     data = torch.load(dataset_path)
 
-                # Expect each item in data to be a dict with 'p_net_x' and 'v_net_x'
-                p_samples = torch.cat([torch.tensor(s['p_net_x']) for s in data], dim=0)
-                v_samples = torch.cat([torch.tensor(s['v_net_x']) for s in data], dim=0)
+                # Expect each item in data to be a dict with 'p_net_x' and 'v_net_x' 
+                p_samples = torch.cat([s['p_net_x'].clone().detach() for s in data], dim=0)
+                v_samples = torch.cat([s['v_net_x'].clone().detach() for s in data], dim=0)
 
                 _norm_vector_p = torch.max(p_samples, dim=0)[0].float()
                 _norm_vector_v = torch.max(v_samples, dim=0)[0].float()
@@ -242,12 +243,14 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Edge index for the physical network
         edge_index = self.obs_handler.get_link_index_obs(self.p_net)
 
-        # Compute edge attributes; here we use the obs_handler function to get (normalized) link attributes.
-        edge_attr = self.obs_handler.get_link_attrs_obs(
+        # Compute edge attributes; here we use the obs_handler function to get (normalized) link attributes. 
+        edge_attr_half = self.obs_handler.get_link_attrs_utils_obs(
             self.p_net,
-            link_attr_types=['resource'],
             link_attr_benchmarks=self.obs_handler.get_link_attr_benchmarks(self.p_net)
         )
+        edge_attr = np.concatenate([edge_attr_half, edge_attr_half], axis=0)  # Duplicate for both directions
+
+
           
         # Normalize
         p_net_x = p_net_x / self.norm_vector_p.cpu().numpy()
@@ -259,9 +262,13 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         }
 
     def get_history_actions(self):
-        """
-        Return the sequence of previously placed physical node IDs as int64 array.
-        This is used by the transformer decoder.
-        """
-        return np.array(self.selected_p_net_nodes, dtype=np.int64)
+        full_hist = self.global_history
+        tail_hist = full_hist[-self.window_size:]
+        
+        # If too short, pad with dummy node id (like num_nodes)
+        padded = [self.p_net.number_of_nodes()] * (self.window_size - len(tail_hist)) + tail_hist
+        # Expand to 8 rows (one for each v_node)
+        repeated = np.tile(np.array(padded, dtype=np.int64), (8, 1))  # shape (8, window_size)
+        
+        return repeated
 

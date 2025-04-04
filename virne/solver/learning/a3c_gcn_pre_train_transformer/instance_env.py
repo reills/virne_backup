@@ -18,6 +18,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         num_p_net_node_attrs = len(self.p_net.get_node_attrs(['resource', 'extrema']))
         num_p_net_link_attrs = len(self.p_net.get_link_attrs(['resource', 'extrema']))
         num_p_net_features = num_p_net_node_attrs + 1
+        self.pad_token = kwargs.get("pad_token", None)
          
         # Use module-level cache
         global _norm_vector_p, _norm_vector_v
@@ -34,8 +35,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                     data = torch.load(dataset_path)
 
                 # Expect each item in data to be a dict with 'p_net_x' and 'v_net_x'
-                p_samples = torch.cat([torch.tensor(s['p_net_x']) for s in data], dim=0)
-                v_samples = torch.cat([torch.tensor(s['v_net_x']) for s in data], dim=0)
+                p_samples = torch.cat([s['p_net_x'].clone().detach() for s in data], dim=0)
+                v_samples = torch.cat([s['v_net_x'].clone().detach() for s in data], dim=0)
 
                 _norm_vector_p = torch.max(p_samples, dim=0)[0].float()
                 _norm_vector_v = torch.max(v_samples, dim=0)[0].float()
@@ -46,45 +47,41 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         self.norm_vector_p = _norm_vector_p
         self.norm_vector_v = _norm_vector_v
-        self.max_revokes=40 
+        self.max_revokes=80 
 
     def compute_reward(self, solution, revoke=False):
         """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
 
         vnodes = self.v_net.num_nodes            # Typically 8
-        placements = solution['num_placed_nodes']
+        value = solution['v_net_r2c_ratio'] * 2
+        completion_pct = (solution['num_placed_nodes'] or 0) / self.v_net.num_nodes
         revokes = solution['revoke_times']
         revoke_pct = revokes / max(1, self.max_revokes)
 
         # Case 1: Early rejection — should almost never happen, very bad
-        if solution['early_rejection']:
-            reward = -vnodes * 1.5  # Scaled: -1.5   Penalty applied at the step where early reject happens
+        if solution['early_rejection']: 
+            reward = -2.0  # more punishing for not even trying to place
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
-            reward = -(.5 + 0.1 * revokes)  # Increasing penalty per revoke step
+            reward = -(.25 + 0.02 * revokes)  # Increasing penalty per revoke step
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step
-            penalty = revoke_pct * vnodes
-            bonus = vnodes - penalty
-            reward = vnodes + bonus  # e.g., 8 + bonus
+            bonus = max( 0, value - revoke_pct)
+            reward = value + bonus  # e.g., 8 + bonus
         # Case 4: Routing partially succeeded — some virtual nodes got routed
         elif solution['route_result']:
             # Encourage partial progress in routing
-            penalty = placements * revoke_pct
-            bonus = placements - penalty
-            reward = placements + bonus
-        # Case 5: All nodes placed, but routing failed entirely
-        elif solution['place_result']:
-            reward = -vnodes * 0.75  # Scaled: -0.75 # Mild penalty; worse than partial route, better than total failure
-        # Case 6: Total failure (e.g., placement failed)
+            completion_reward = (completion_pct/vnodes)
+            penalty = completion_reward * revoke_pct
+            bonus = completion_reward - penalty
+            reward = (value*completion_reward) + bonus
+        # Case 5: All nodes placed, but routing failed entirely --- same as failure
         else:
-            reward = -vnodes  # Large negative signal
-        # Normalize by number of vnodes to make reward scale consistent across different topologies
-        scaled_reward = reward / vnodes
+            reward = -1  # Large negative signal 
 
-        self.solution['v_net_reward'] += scaled_reward
-        return scaled_reward
+        self.solution['v_net_reward'] += reward
+        return reward
 
     
     def get_observation(self):
@@ -258,12 +255,13 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         edge_index = self.obs_handler.get_link_index_obs(self.p_net)
 
         # Compute edge attributes; here we use the obs_handler function to get (normalized) link attributes.
-        edge_attr = self.obs_handler.get_link_attrs_obs(
+        edge_attr_half = self.obs_handler.get_link_attrs_utils_obs(
             self.p_net,
-            link_attr_types=['resource'],
             link_attr_benchmarks=self.obs_handler.get_link_attr_benchmarks(self.p_net)
         )
-          
+        edge_attr = np.concatenate([edge_attr_half, edge_attr_half], axis=0)  # Duplicate for both directions
+
+
         # Normalize
         p_net_x = p_net_x / self.norm_vector_p.cpu().numpy()
 

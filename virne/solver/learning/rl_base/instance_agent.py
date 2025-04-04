@@ -123,6 +123,7 @@ class InstanceAgent(object):
 
     def learn_singly(self, env, num_epochs=1, **kwargs):
         best_success_count = -1
+        best_epoch = -1
         recent_buffers = []
         max_recent = 5
 
@@ -147,7 +148,7 @@ class InstanceAgent(object):
                 used_links = set()
                 for path in solution['link_paths'].values():
                     used_links.update(path)
-
+ 
                 # --- Penalty if this solution's failure may have been caused by earlier ones
                 if not solution['result']:
                     for prev_buf, prev_nodes, prev_links, prev_solution in recent_buffers:
@@ -201,12 +202,16 @@ class InstanceAgent(object):
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)
 
-            if success_count > best_success_count * .99:
-                best_success_count = success_count
-                print(f"[KEEP] Epoch {epoch_id}: success improved to {success_count}")
-                self.save_model("model-best.pkl")
+            if success_count > best_success_count * .97:
+                if( success_count > best_success_count):
+                    print(f"[SAVE] Epoch {epoch_id}: success improved to {success_count}")
+                    best_success_count = success_count
+                    best_epoch = epoch_id
+                    self.save_model("model-best.pkl")
+                else:
+                    print(f"[KEPT] Epoch {epoch_id}: not better than to {best_success_count} from epoch {best_epoch}, but close.")
             else:
-                print(f"[ROLLBACK] Epoch {epoch_id}: success={success_count} did not improve. Reverting.")
+                print(f"[ROLLBACK] Epoch {epoch_id}: success={success_count} did not improve over epoch {best_epoch}. It had {best_success_count}. Reverting.")
                 self.policy.load_state_dict(start_model_state)
                 self.optimizer.load_state_dict(start_optim_state)
                 self.buffer = start_buffer
