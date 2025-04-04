@@ -53,17 +53,17 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
 
         vnodes = self.v_net.num_nodes            # Typically 8
-        value = solution['v_net_r2c_ratio'] * 2
+        value = solution['v_net_r2c_ratio'] * 10
         completion_pct = (solution['num_placed_nodes'] or 0) / self.v_net.num_nodes
         revokes = solution['revoke_times']
         revoke_pct = revokes / max(1, self.max_revokes)
 
         # Case 1: Early rejection — should almost never happen, very bad
         if solution['early_rejection']: 
-            reward = -2.0  # more punishing for not even trying to place
+            reward = -3.0  # more punishing for not even trying to place
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
-            reward = -(.25 + 0.02 * revokes)  # Increasing penalty per revoke step
+            reward = -0.01 * revokes  # Increasing penalty per revoke step
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step
@@ -71,15 +71,15 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             reward = value + bonus  # e.g., 8 + bonus
         # Case 4: Routing partially succeeded — some virtual nodes got routed
         elif solution['route_result']:
-            # Encourage partial progress in routing
+            # Encourage partial progress in routing -- revoke and retry gets less reward
             completion_reward = (completion_pct/vnodes)
             penalty = completion_reward * revoke_pct
             bonus = completion_reward - penalty
             reward = (value*completion_reward) + bonus
-        # Case 5: All nodes placed, but routing failed entirely --- same as failure
+        # Case 5: All nodes placed and routing failure or place failure
         else:
-            reward = -1  # Large negative signal 
-
+            reward = -2  # Large negative signal 
+    
         self.solution['v_net_reward'] += reward
         return reward
 
