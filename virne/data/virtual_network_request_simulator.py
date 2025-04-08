@@ -42,14 +42,28 @@ class VirtualNetworkRequestSimulator(object):
         self.v_sim_setting = copy.deepcopy(v_sim_setting)
         self.num_v_nets = self.v_sim_setting.get('num_v_nets', 2000)
 
-        self.aver_arrival_rate = self.v_sim_setting['arrival_rate']['lam']
+        arrival_cfg = self.v_sim_setting['arrival_rate']
+        distribution = arrival_cfg.get('distribution', 'poisson')
 
-        if self.v_sim_setting['lifetime']['distribution'] == 'exponential':
-            self.aver_lifetime = self.v_sim_setting['lifetime']['scale']
-        elif self.v_sim_setting['lifetime']['distribution'] == 'uniform':
-            self.aver_lifetime = (self.v_sim_setting['lifetime']['high'] + self.v_sim_setting['lifetime']['low']) / 2.
+        if distribution == 'poisson':
+            lam = arrival_cfg['lam']
+            if arrival_cfg.get('reciprocal', False):
+                lam = 1 / lam
+            self.aver_arrival_rate = lam 
+        elif distribution == 'lognormal':
+            mean = arrival_cfg['mean']
+            sigma = arrival_cfg['sigma']
+            self.aver_arrival_rate = np.exp(mean + 0.5 * sigma**2) 
+        elif distribution == 'uniform':
+            low = arrival_cfg['low']
+            high = arrival_cfg['high']
+            self.aver_arrival_rate = (low + high) / 2 
+        elif distribution == 'exponential':
+            scale = arrival_cfg['scale']  # mean of exponential
+            self.aver_arrival_rate = scale
+
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Arrival distribution '{distribution}' is not supported.")
         
         self.v_nets = []
         self.events = []

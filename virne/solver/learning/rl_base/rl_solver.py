@@ -340,6 +340,13 @@ class RLSolver(Solver):
             else:
                 self.policy.load_state_dict(checkpoint['policy'])
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
+                # Rebuild optimizer to reset weight decay
+                print("Resetting optimizer with new weight_decay=0.0")
+                self.optimizer = torch.optim.Adam([
+                    {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor},
+                    {'params': self.policy.actor.parameters(),   'lr': self.lr_actor},
+                    {'params': self.policy.critic.parameters(),  'lr': self.lr_critic}
+                ], weight_decay=0.0)  # ← your new value here
             print(f'Loaded pretrained model from {checkpoint_path}') if self.verbose >= 0 else None
         except Exception as e:
             print(f'error {e}')

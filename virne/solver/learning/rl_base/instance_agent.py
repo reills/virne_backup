@@ -122,96 +122,39 @@ class InstanceAgent(object):
         return self.buffer
 
     def learn_singly(self, env, num_epochs=1, **kwargs):
-        best_success_count = -1
-        best_epoch = -1
-        recent_buffers = []
-        max_recent = 5
-
+        # main env
         for epoch_id in range(num_epochs):
             print(f'Training Epoch: {epoch_id}') if self.verbose > 0 else None
             self.training_epoch_id = epoch_id
-
-            start_model_state = copy.deepcopy(self.policy.state_dict())
-            start_optim_state = copy.deepcopy(self.optimizer.state_dict())
-            start_buffer = self.buffer.clone_detached()
 
             instance = env.reset()
             success_count = 0
             epoch_logprobs = []
             revenue2cost_list = []
-
             while True:
+                ### --- instance-level --- ###
                 solution, instance_buffer, last_value = self.learn_with_instance(instance)
                 epoch_logprobs += instance_buffer.logprobs
-
-                used_nodes = set(solution['node_slots'].values())
-                used_links = set()
-                for path in solution['link_paths'].values():
-                    used_links.update(path)
- 
-                # --- Penalty if this solution's failure may have been caused by earlier ones
-                if not solution['result']:
-                    for prev_buf, prev_nodes, prev_links, prev_solution in recent_buffers:
-                        if prev_solution['result']:
-                            if used_nodes & prev_nodes or used_links & prev_links:
-                                if len(prev_buf.rewards) > 0:
-                                    prev_buf.rewards[-1] -= 0.3  # Slightly stronger penalty
-
-                # --- NEW: If this solution failed due to early rejection, retro-penalize prior buffers too
-                if solution['early_rejection']:
-                    for prev_buf, prev_nodes, prev_links, prev_solution in recent_buffers:
-                        if prev_solution['result']:
-                            if len(prev_buf.rewards) > 0:
-                                prev_buf.rewards[-1] -= 0.4  # Bigger hit due to rejection fallout
-
-                    # Optionally: penalize this buffer too — unless you already do in `compute_reward`
-                    if len(instance_buffer.rewards) > 0:
-                        instance_buffer.rewards[-1] -= 0.5
-
-                # --- Encourage agent to not give up early (but not force it to go forever)
-                if solution['place_result'] and not solution['route_result']:
-                    # All 8 nodes placed but routing failed → small reward for effort
-                    if len(instance_buffer.rewards) > 0:
-                        instance_buffer.rewards[-1] += 0.3
-
-                # Merge instance experience
                 self.merge_instance_experience(instance, solution, instance_buffer, last_value)
-
-                # Save into recent buffers
-                recent_buffers.append((instance_buffer, used_nodes, used_links, solution))
-                if len(recent_buffers) > max_recent:
-                    recent_buffers.pop(0)
 
                 if solution.is_feasible():
                     success_count += 1
                     revenue2cost_list.append(solution['v_net_r2c_ratio'])
-
+                # update parameters
                 if self.buffer.size() >= self.target_steps:
-                    self.update()
+                    loss = self.update()
 
                 instance, reward, done, info = env.step(solution)
+
                 if done:
                     break
-
+                
             epoch_logprobs_tensor = np.concatenate(epoch_logprobs, axis=0)
             print(f'\nepoch {epoch_id:4d}, success_count {success_count:5d}, r2c {info["long_term_r2c_ratio"]:1.4f}, mean logprob {epoch_logprobs_tensor.mean():2.4f}') if self.verbose > 0 else None
-
             if self.rank == 0:
+                # save
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0:
                     self.save_model(f'model-{epoch_id}.pkl')
+                # validate
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)
-
-            if success_count > best_success_count * .97:
-                if( success_count > best_success_count):
-                    print(f"[SAVE] Epoch {epoch_id}: success improved to {success_count}")
-                    best_success_count = success_count
-                    best_epoch = epoch_id
-                    self.save_model("model-best.pkl")
-                else:
-                    print(f"[KEPT] Epoch {epoch_id}: not better than to {best_success_count} from epoch {best_epoch}, but close.")
-            else:
-                print(f"[ROLLBACK] Epoch {epoch_id}: success={success_count} did not improve over epoch {best_epoch}. It had {best_success_count}. Reverting.")
-                self.policy.load_state_dict(start_model_state)
-                self.optimizer.load_state_dict(start_optim_state)
-                self.buffer = start_buffer

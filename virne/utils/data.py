@@ -20,8 +20,9 @@ def generate_data_with_distribution(size: int, distribution: str, dtype: str, **
     Returns:
         np.ndarray: The generated data.
     """
-    assert distribution in ['uniform', 'normal', 'exponential', 'possion']
+    assert distribution in ['uniform', 'normal', 'exponential', 'poisson', 'lognormal', 'pareto']
     assert dtype in ['int', 'float', 'bool']
+
     if distribution == 'normal':
         loc, scale = kwargs.get('loc'), kwargs.get('scale')
         data = np.random.normal(loc, scale, size)
@@ -34,11 +35,21 @@ def generate_data_with_distribution(size: int, distribution: str, dtype: str, **
     elif distribution == 'exponential':
         scale = kwargs.get('scale')
         data = np.random.exponential(scale, size)
-    elif distribution == 'possion':
+    elif distribution == 'poisson':
         lam = kwargs.get('lam')
         if kwargs.get('reciprocal', False):
             lam = 1 / lam
         data = np.random.poisson(lam, size)
+    elif distribution == 'pareto':
+        shape = kwargs.get('shape', 2.0)
+        scale = kwargs.get('scale', 1.0)
+        data = (np.random.pareto(shape, size) + 1) * scale
+    # In generate_data_with_distribution
+    elif distribution == 'lognormal':
+        mean = kwargs.get('mean', 1.0)  # Adjust these parameters
+        sigma = kwargs.get('sigma', 1.5) # Adjust these parameters
+        # Ensure non-negative intervals; lognormal naturally produces positive values
+        data = np.random.lognormal(mean, sigma, size) 
     else:
         raise NotImplementedError(f'Generating {dtype} data following the {distribution} distribution is unsupporrted!')
     return data.astype(dtype).tolist()
@@ -83,11 +94,18 @@ def get_v_nets_dataset_dir_from_setting(v_sim_setting):
     # e_attrs = [l_attr['name'] for l_attr in v_sim_setting['link_attrs_setting']]
     node_attrs_str = '-'.join([f'{n_attr_setting["name"]}_{get_parameters_string(get_distribution_parameters(n_attr_setting))}' for n_attr_setting in v_sim_setting['node_attrs_setting']])
     link_attrs_str = '-'.join([f'{e_attr_setting["name"]}_{get_parameters_string(get_distribution_parameters(e_attr_setting))}' for e_attr_setting in v_sim_setting['link_attrs_setting']])
-    
+        
+        
+    arrival_cfg = v_sim_setting['arrival_rate']
+    # Get the parameters for the specified arrival distribution
+    arrival_params_str = get_parameters_string(get_distribution_parameters(arrival_cfg))
+    # Include the distribution *name* and its *parameters* in the directory name
+    arrival_rate_part = f"{arrival_cfg['distribution']}-{arrival_params_str}"
+
     v_nets_dataset_middir = f"{v_sim_setting['num_v_nets']}-[{v_sim_setting['v_net_size']['low']}-{v_sim_setting['v_net_size']['high']}]-" + \
-                        f"{v_sim_setting['topology']['type']}-{get_parameters_string(get_distribution_parameters(v_sim_setting['lifetime']))}-{v_sim_setting['arrival_rate']['lam']}-" + \
-                        node_attrs_str + '-' + link_attrs_str
-                        # f"{n_attrs}-[{v_sim_setting['node_attrs_setting'][0]['low']}-{v_sim_setting['node_attrs_setting'][0]['high']}]-" + \
+                        f"{v_sim_setting['topology']['type']}-{get_parameters_string(get_distribution_parameters(v_sim_setting['lifetime']))}-{arrival_rate_part}-" + \
+                            node_attrs_str + '-' + link_attrs_str
+                                        # f"{n_attrs}-[{v_sim_setting['node_attrs_setting'][0]['low']}-{v_sim_setting['node_attrs_setting'][0]['high']}]-" + \
                         # f"{e_attrs}-[{v_sim_setting['link_attrs_setting'][0]['low']}-{v_sim_setting['link_attrs_setting'][0]['high']}]"
     v_net_dataset_dir = os.path.join(v_nets_dataset_dir, v_nets_dataset_middir)
     return v_net_dataset_dir
@@ -95,16 +113,45 @@ def get_v_nets_dataset_dir_from_setting(v_sim_setting):
 def get_distribution_parameters(distribution_dict):
     """Get the parameters of the distribution."""
     distribution = distribution_dict.get('distribution', None)
+    parameters = []  # Initialize parameters as an empty list
+
     if distribution is None:
-        return []
-    if distribution == 'exponential':
-        parameters = [distribution_dict['scale']]
-    elif distribution == 'possion':
-        parameters = [distribution_dict['lam']]
+        return [] # Return the initialized empty list
+    elif distribution == 'exponential':
+        # Use .get() for safety in case the key is missing
+        scale = distribution_dict.get('scale')
+        if scale is not None:
+            parameters = [scale]
+    elif distribution == 'poisson' or distribution == 'possion': # Handle potential typo
+        lam = distribution_dict.get('lam')
+        if lam is not None:
+            parameters = [lam]
     elif distribution == 'uniform':
-        parameters = [distribution_dict['low'], distribution_dict['high']]
+        low = distribution_dict.get('low')
+        high = distribution_dict.get('high')
+        if low is not None and high is not None:
+            parameters = [low, high]
     elif distribution == 'customized':
-        parameters = [distribution_dict['min'], distribution_dict['max']]
+        min_val = distribution_dict.get('min')
+        max_val = distribution_dict.get('max')
+        if min_val is not None and max_val is not None:
+            parameters = [min_val, max_val]
+    # --- ADDED LOGNORMAL ---
+    elif distribution == 'lognormal':
+        mean = distribution_dict.get('mean')
+        sigma = distribution_dict.get('sigma')
+        if mean is not None and sigma is not None:
+            parameters = [mean, sigma]
+    # --- ADDED PARETO ---
+    elif distribution == 'pareto':
+        shape = distribution_dict.get('shape')
+        scale = distribution_dict.get('scale')
+        if shape is not None and scale is not None:
+            parameters = [shape, scale]
+    # Optional: Handle unknown distributions
+    # else:
+    #     print(f"Warning: Unknown distribution '{distribution}' in get_distribution_parameters.")
+    #     # parameters remains []
     return parameters
 
 def get_parameters_string(parameters):

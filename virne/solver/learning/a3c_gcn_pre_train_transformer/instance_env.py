@@ -47,7 +47,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         self.norm_vector_p = _norm_vector_p
         self.norm_vector_v = _norm_vector_v
-        self.max_revokes=80 
+        self.max_revokes=92 
 
     def compute_reward(self, solution, revoke=False):
         """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
@@ -60,10 +60,11 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         # Case 1: Early rejection — should almost never happen, very bad
         if solution['early_rejection']: 
-            reward = -3.0  # more punishing for not even trying to place
+            reward = -10.0  # more punishing for not even trying to place
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
-            reward = -0.01 * revokes  # Increasing penalty per revoke step
+            # maxes out at -11.72 after 81 revokes
+            reward = -0.01 * revokes  # Increasing penalty per revoke step 
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step
@@ -78,7 +79,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             reward = (value*completion_reward) + bonus
         # Case 5: All nodes placed and routing failure or place failure
         else:
-            reward = -2  # Large negative signal 
+            #technically if revoked is enabled this will never hit because revoke will just call reject (revoke=true) when it hits max revokes
+            reward = -3  # Large negative signal 
     
         self.solution['v_net_reward'] += reward
         return reward

@@ -1,26 +1,31 @@
-num_v_nets: 1000
+num_v_nets: 2000
 topology:
-  random_prob: 0.5
-  type: random
+  type: path
 v_net_size:
   distribution: uniform
   dtype: int
-  low: 8   # WAS 8
-  high: 8   # WAS 8 
+  low: 2
+  high: 15
 arrival_rate:
-  distribution: possion
-  dtype: float
-  lam: 0.04 # WAS .04 MAKING THEM COME MORE FREQUENTLY 
-  reciprocal: true
+  #distribution: poisson
+  #dtype: float
+  #lam: 0.04
+  #reciprocal: true
+
+  distribution: lognormal # <-- New distribution type
+  dtype: float          # <-- Keep dtype
+  mean: 2.0             # <-- Add mean parameter (Adjust this value!)
+  sigma: 1.5            # <-- Add sigma parameter (Adjust this value!)
+
+  #distribution: pareto
+  #dtype: float
+  #shape: 2.0
+  #scale: 15
+
 lifetime:
   distribution: exponential
   dtype: float
-  scale: 500
-# lifetime:
-#   distribution: uniform
-#   dtype: float
-#   low: 0
-#   high: 0
+  scale: 1000
 # max_latency:
 #   distribution: uniform
 #   dtype: float
@@ -32,17 +37,25 @@ node_attrs_setting:
     dtype: int
     generative: true
     low: 0
-    high: 50 # WAS 50 
+    high: 50
     owner: node
-    type: resource 
-  # - name: ram
-  #   distribution: uniform
-  #   dtype: int
-  #   generative: true
-  #   low: 0
-  #   high: 50
-  #   owner: node
-  #   type: resource
+    type: resource
+  - name: gpu
+    distribution: uniform
+    dtype: int
+    generative: true
+    low: 0
+    high: 50
+    owner: node
+    type: resource
+  - name: rom
+    distribution: uniform
+    dtype: int
+    generative: true
+    low: 0
+    high: 50
+    owner: node
+    type: resource
 link_attrs_setting:
   - name: bw
     distribution: uniform
@@ -63,4 +76,4 @@ save_dir: dataset/v_nets
 v_nets_file_name: v_net.gml
 v_nets_save_dir: v_nets
 events_file_name: events.yaml
-setting_file_name: v_sim_setting.yaml 
+setting_file_name: v_sim_setting.yaml

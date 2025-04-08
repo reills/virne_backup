@@ -55,7 +55,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         InstanceAgent.__init__(self, InstanceEnv)
         
         # New hyperparameters
-        self.entropy_coef = kwargs.get("entropy_coef", 0.01)
+        self.entropy_coef = kwargs.get("entropy_coef", 0.05)
         self.normalize_advantage = kwargs.get("normalize_advantage", True)
  
         # Special start token (we use p_net.num_nodes as start token)
@@ -245,29 +245,52 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         #print(f"Rewards: {sub_buffer.rewards}")
         #print(f"Values: {sub_buffer.values}")
 
-def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,is_rejection,  **kwargs):
+def make_policy(agent, is_revocable, is_rejection, **kwargs):
     """
     Create the ActorCritic policy with the same hyperparameters as used in pretraining.
+    Dynamically detect input feature dimensions for physical and virtual networks.
     """
     action_dim = agent.p_net_setting_num_nodes
+
+    # Try to detect feature dimensions from environment
+    try:
+        # Detect virtual node feature dimension
+        v_net_x_sample = agent.env.v_net.x if hasattr(agent.env.v_net, 'x') else np.zeros((8, 4))
+        v_dimension_features = v_net_x_sample.shape[1]
+    except Exception as e:
+        print("WARNING: Couldn't detect v_net feature dimension. Defaulting to 4.")
+        v_dimension_features = 4
+
+    try:
+        # Detect physical node feature dimension
+        p_net_x_sample = agent.env.p_net.x if hasattr(agent.env.p_net, 'x') else np.zeros((15, 10))
+        p_dimension_features = p_net_x_sample.shape[1]
+    except Exception as e:
+        print("WARNING: Couldn't detect p_net feature dimension. Defaulting to 10.")
+        p_dimension_features = 10
+
+    print(f"[DEBUG] Detected v_dimension_features = {v_dimension_features}, p_dimension_features = {p_dimension_features}")
+
     policy = ActorCritic(
         p_net_num_nodes=action_dim,
-        p_net_feature_dim=p_dimension_features,   # Match pretrainer: input dim of physical network features = 3
-        v_net_feature_dim=v_dimension_features,   # Match pretrainer: input dim of virtual network features = 3
-        embedding_dim=128,      # Must match the pretrainer
+        p_net_feature_dim=p_dimension_features,
+        v_net_feature_dim=v_dimension_features,
+        embedding_dim=128,
         n_heads=8,
         n_layers=6,
-        dropout=0.2, 
+        dropout=0.2,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection
     ).to(agent.device)
-  
+
     optimizer = torch.optim.Adam([
         {'params': policy.encoder.parameters(), 'lr': agent.lr_actor},
         {'params': policy.actor.parameters(),   'lr': agent.lr_actor},
         {'params': policy.critic.parameters(),  'lr': agent.lr_critic}
     ], weight_decay=agent.weight_decay)
+
     return policy, optimizer
+
 
 def encoder_obs_to_tensor(obs, device):
     """Process the v_net features for the Transformer Encoder."""

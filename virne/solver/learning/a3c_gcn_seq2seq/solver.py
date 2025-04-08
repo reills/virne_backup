@@ -124,17 +124,32 @@ class A3CGcnSeq2SeqSolver(InstanceAgent, A2CSolver):
 def make_policy(agent, **kwargs):
     action_dim = agent.p_net_setting_num_nodes
     feature_dim = agent.p_net_setting_num_node_resource_attrs + agent.p_net_setting_num_link_resource_attrs + 5
+
+    # Try to detect v_net feature dimension from sample
+    try:
+        v_net_x_sample = agent.env.v_net.x if hasattr(agent.env.v_net, 'x') else np.zeros((8, 4))
+        v_net_feature_dim = v_net_x_sample.shape[1]
+    except Exception as e:
+        print("WARNING: Couldn't detect v_net_feature_dim from env. Defaulting to 4.")
+        v_net_feature_dim = 4
+
+    print(f"[DEBUG] Detected v_net_feature_dim = {v_net_feature_dim}")
+
     policy = ActorCritic(
         p_net_num_nodes=action_dim, 
-        p_net_feature_dim=5, 
-        v_net_feature_dim=2, 
-        embedding_dim=agent.embedding_dim).to(agent.device)
+        p_net_feature_dim=feature_dim, 
+        v_net_feature_dim=v_net_feature_dim, 
+        embedding_dim=agent.embedding_dim
+    ).to(agent.device)
+
     optimizer = torch.optim.Adam([
         {'params': policy.encoder.parameters(), 'lr': agent.lr_actor},
         {'params': policy.actor.parameters(), 'lr': agent.lr_actor},
         {'params': policy.critic.parameters(), 'lr': agent.lr_critic}
     ], weight_decay=agent.weight_decay)
+
     return policy, optimizer
+
 
 
 def encoder_obs_to_tensor(obs, device):
