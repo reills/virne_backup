@@ -18,10 +18,10 @@ def run(config):
 if __name__ == '__main__':
     config = Config(
         #solver_name='sa',
-        #solver_name='a3c_gcn_seq2seq'
+        solver_name='a3c_gcn_seq2seq'
         #solver_name='a2c_gcn_transformer_encoder'
         #solver_name='a3c_gcn_oneshot_transformer'
-        solver_name='a3c_gcn_pre_train_transformer'
+        #solver_name='a3c_gcn_pre_train_transformer'
         # p_net_setting_path='customized_p_net_setting_file_path',
         # v_sim_setting_path='customized_v_sim_setting_file_path',
     ) 
@@ -31,8 +31,8 @@ if __name__ == '__main__':
         p_net=True,
         v_nets=True,
         save=True,
-        reuse_existing_p=True,  
-        reuse_existing_v=True
+        reuse_existing_p=False,  
+        reuse_existing_v=False
     )
 
     run(config) 

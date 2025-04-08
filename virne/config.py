@@ -48,7 +48,7 @@ class Config(ClassDict):
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
-    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-conv/a3c_gcn_pre_train_transformer/dataset/results-conv/model/model-best.pkl'
+    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
     pretrained_model_path: str = ''
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
@@ -60,8 +60,8 @@ class Config(ClassDict):
     matching_mathod: str = 'greedy'       # Method of node matching: 'greedy' or 'l2s2'
     shortest_method: str = 'k_shortest'   # Method of path finding: 'bfs_shortest' or 'k_shortest'
     k_shortest: int = 10                  # Number of shortest paths to be found
-    allow_revocable: bool = True           # Whether or not to allow to revoke a virtual node
-    allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
+    allow_revocable: bool = False           # Whether or not to allow to revoke a virtual node
+    allow_rejection: bool = False          # Whether or not to allow to reject a virtual node
 
     ### Training ###
     num_epochs: int = 1
@@ -150,7 +150,7 @@ class Config(ClassDict):
         use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
 
         if use_fixed:
-            fixed_dir = "dataset/results-padding"
+            fixed_dir = "dataset/results-seq-sfc"
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
         else:
