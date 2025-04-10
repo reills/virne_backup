@@ -49,43 +49,6 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.norm_vector_v = _norm_vector_v
         self.max_revokes=92 
 
-    def compute_reward(self, solution, revoke=False):
-        """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
-
-        vnodes = self.v_net.num_nodes            # Typically 8
-        value = solution['v_net_r2c_ratio'] * 10
-        completion_pct = (solution['num_placed_nodes'] or 0) / self.v_net.num_nodes
-        revokes = solution['revoke_times']
-        revoke_pct = revokes / max(1, self.max_revokes)
-
-        # Case 1: Early rejection — should almost never happen, very bad
-        if solution['early_rejection']: 
-            reward = -10.0  # more punishing for not even trying to place
-        # Case 2: Revoke was taken — penalize each time it happens
-        elif revoke:
-            # maxes out at -11.72 after 81 revokes
-            reward = -0.01 * revokes  # Increasing penalty per revoke step 
-        # Case 3: Final step of a full success — high reward, scaled with revoke penalty
-        elif solution['result']:
-            # This will be called once at the last vnode placement step
-            bonus = max( 0, value - revoke_pct)
-            reward = value + bonus  # e.g., 8 + bonus
-        # Case 4: Routing partially succeeded — some virtual nodes got routed
-        elif solution['route_result']:
-            # Encourage partial progress in routing -- revoke and retry gets less reward
-            completion_reward = (completion_pct/vnodes)
-            penalty = completion_reward * revoke_pct
-            bonus = completion_reward - penalty
-            reward = (value*completion_reward) + bonus
-        # Case 5: All nodes placed and routing failure or place failure
-        else:
-            #technically if revoked is enabled this will never hit because revoke will just call reject (revoke=true) when it hits max revokes
-            reward = -3  # Large negative signal 
-    
-        self.solution['v_net_reward'] += reward
-        return reward
-
-    
     def get_observation(self):
         """
         Returns the observation as a dictionary containing:
@@ -106,14 +69,50 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             'history_actions': history_actions,
         }
 
+    def compute_reward(self, solution, revoke=False):
+        """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
+
+        vnodes = self.v_net.num_nodes            # Typically 8
+        value = solution['v_net_r2c_ratio'] * 20
+        completion_pct = (solution['num_placed_nodes'] or 0) / self.v_net.num_nodes
+        revokes = solution['revoke_times']
+        revoke_pct = revokes / max(1, self.max_revokes)
+
+        # Case 1: Early rejection — should almost never happen, very bad
+        if solution['early_rejection']: 
+            reward = -25.0  # more punishing for not even trying to place
+        # Case 2: Revoke was taken — penalize each time it happens
+        elif revoke:
+            # maxes out at -11.72 after 81 revokes
+            reward = -0.02 * revokes  # Increasing penalty per revoke step 
+        # Case 3: Final step of a full success — high reward, scaled with revoke penalty
+        elif solution['result']:
+            # This will be called once at the last vnode placement step
+            bonus = max( 0, value - revoke_pct)
+            reward = value + bonus  # e.g., 8 + bonus
+        # Case 4: Routing partially succeeded — some virtual nodes got routed
+        elif solution['route_result']:
+            # Encourage partial progress in routing -- revoke and retry gets less reward
+            completion_reward = (completion_pct/vnodes)
+            penalty = completion_reward * revoke_pct
+            bonus = completion_reward - penalty
+            reward = (value*completion_reward) + bonus
+        # Case 5: All nodes placed and routing failure or place failure
+        else:
+            #technically if revoked is enabled this will never hit because revoke will just call reject (revoke=true) when it hits max revokes
+            reward = -3  # Large negative signal 
+    
+        self.solution['v_net_reward'] += reward
+        return reward
+
     def _get_v_net_obs(self):
         """
         Build v_net_x with four components:
         1. Resource features from the virtual network (using obs_handler)
-        2. Virtual node degrees (computed using obs_handler)
+        #2. Virtual node degrees (computed using obs_handler)
         3. Virtual total capacity (sum of resource features)
         4. Total required bandwidth (sum of bandwidth demands from connected edges)
-        5. Betweenness centrality
+        #5. Betweenness centrality
         6. Bandwidth variance
         """
         if self.curr_v_node_id >= self.v_net.num_nodes:
@@ -127,10 +126,10 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         )
         
         # Virtual node degrees
-        degrees = self.obs_handler.get_node_degree_obs(
-            self.v_net, 
-            self.obs_handler.get_degree_benchmark(self.v_net)
-        )
+        # degrees = self.obs_handler.get_node_degree_obs(
+        #     self.v_net, 
+        #     self.obs_handler.get_degree_benchmark(self.v_net)
+        # )
         
         # Total capacity
         total_capacity = np.sum(resource_features, axis=1, keepdims=True)
@@ -149,9 +148,9 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         ]).reshape(-1, 1)
         
         # Betweenness centrality
-        bc_dict = nx.betweenness_centrality(self.v_net)
-        bc = np.array([bc_dict[node] for node in range(self.v_net.num_nodes)], 
-                    dtype=np.float32).reshape(-1, 1)
+        # bc_dict = nx.betweenness_centrality(self.v_net)
+        # bc = np.array([bc_dict[node] for node in range(self.v_net.num_nodes)], 
+        #             dtype=np.float32).reshape(-1, 1)
 
         # Bandwidth variance
         bw_var = []
@@ -162,7 +161,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         bw_var = np.array(bw_var, dtype=np.float32).reshape(-1, 1)
 
         # Concatenate features: all should be 2D arrays now
-        v_net_x = np.hstack([resource_features, degrees, total_capacity, v_bw_agg, bc, bw_var])
+        #v_net_x = np.hstack([resource_features, degrees, total_capacity, v_bw_agg, bc, bw_var])
+        v_net_x = np.hstack([resource_features, total_capacity, v_bw_agg, bw_var])
 
         # Get virtual network edge index
         v_net_edge_index = self.obs_handler.get_link_index_obs(self.v_net)

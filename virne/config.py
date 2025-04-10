@@ -44,6 +44,7 @@ class Config(ClassDict):
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
     use_fixed_dataset: bool = True
+    dir_save_dataset: str = "dataset/results-sfc-trans"
 
     ### solver  ###
     solver_name: str = 'random_rank'
@@ -60,8 +61,8 @@ class Config(ClassDict):
     matching_mathod: str = 'greedy'       # Method of node matching: 'greedy' or 'l2s2'
     shortest_method: str = 'k_shortest'   # Method of path finding: 'bfs_shortest' or 'k_shortest'
     k_shortest: int = 10                  # Number of shortest paths to be found
-    allow_revocable: bool = False           # Whether or not to allow to revoke a virtual node
-    allow_rejection: bool = False          # Whether or not to allow to reject a virtual node
+    allow_revocable: bool = True           # Whether or not to allow to revoke a virtual node
+    allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
 
     ### Training ###
     num_epochs: int = 1
@@ -89,7 +90,7 @@ class Config(ClassDict):
     # lr_decay: float = 0.5      # Learning rate decay
     pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
     pretrained_loaded: bool = False
-    p_dimension_features: int = 10
+    p_dimension_features: int = 12
     v_dimension_features: int = 6
 
 
@@ -148,9 +149,9 @@ class Config(ClassDict):
 
     def get_run_id(self):
         use_fixed = self.use_fixed_dataset  # <- change this to False when you want a fresh run
+        fixed_dir = self.dir_save_dataset
 
         if use_fixed:
-            fixed_dir = "dataset/results-seq-sfc"
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
         else:

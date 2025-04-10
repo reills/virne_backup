@@ -152,19 +152,31 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             return values, action_logprobs, dist_entropy
         
         
-    def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env):
-        
+    def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env, rtg=None):
+        # Step 1: Remove invalid actions (e.g., 100 = pad, 101 = revoke)
         filtered = [a for a in history_actions if a not in [100, 101]]
-        history_actions = [self.start_token] + filtered[:8]  # Cap at 8
-        
-        return {
-            'p_net_x'         : encoder_obs['p_net_x'],
+        final_history_actions = [self.start_token] + filtered[:100]
+
+        # Step 2: Fix RTG length to match final_history_actions
+        if rtg is not None:
+            if len(rtg) > len(final_history_actions):
+                rtg = rtg[:len(final_history_actions)]
+            elif len(rtg) < len(final_history_actions):
+                rtg = list(rtg) + [0.0] * (len(final_history_actions) - len(rtg))
+        else:
+            rtg = [0.0] * len(final_history_actions)
+
+        obs = {
+            'p_net_x': encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
-            'edge_attr'       : encoder_obs['edge_attr'],
-            'history_actions' : np.array(history_actions, dtype=np.int64),
-            'encoder_outputs' : encoder_outputs,  # you can pass it as detached CPU numpy here if you prefer
-            'action_mask'     : np.expand_dims(sub_env.generate_action_mask(), axis=0)
+            'edge_attr': encoder_obs['edge_attr'],
+            'history_actions': np.array(final_history_actions, dtype=np.int64),
+            'encoder_outputs': encoder_outputs,
+            'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0),
+            'rtg': np.array(rtg, dtype=np.float32).reshape(1, -1)  # Shape: (1, T)
         }
+        return obs
+
 
 
     def solve(self, instance):
@@ -212,9 +224,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
         history_actions = [self.start_token]
         instance_done = False
-        
+         
         while not instance_done:
-            instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
+            #dummy first pass
+            rtg_slice = [0.0] * len(history_actions)
+            instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
 
             sub_env.prev_obs = {
@@ -224,52 +238,46 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
               
             # Accessing InstanceRLEnv attribute -- save for when revoke -- less recalculating..
             sub_env.prev_tensor_obs = tensor_instance_obs  # Accessing InstanceRLEnv attribute
+            
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
             value = self.estimate_value(tensor_instance_obs) if hasattr(self.policy, 'evaluate') else None
             
-            next_obs, reward, instance_done, info = sub_env.step(action)
+            next_obs, reward, instance_done, info = sub_env.step(action) 
             sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value)
             history_actions.append(action)
             
             if not instance_done:
                 encoder_obs = next_obs
 
+        # Now compute RTG
+        rtg = np.cumsum(sub_buffer.rewards[::-1])[::-1]
+
+        # Inject correct RTG values into buffer observations
+        for i, obs in enumerate(sub_buffer.observations):
+            rtg_slice = rtg[:len(obs['history_actions'])]  # ← add +1 if rtg is one shorter than history
+            if len(rtg_slice) < len(obs['history_actions']):
+                rtg_slice = np.pad(rtg_slice, (0, 1), constant_values=0.0)
+
+            obs['rtg'] = np.array(rtg_slice, dtype=np.float32)
+                
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
+            final_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env, rtg=[0.0]*len(history_actions))
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
+         
 
         return sub_env.solution, sub_buffer, last_value
         #print(f"Last Value: {last_value}")
         #print(f"Rewards: {sub_buffer.rewards}")
         #print(f"Values: {sub_buffer.values}")
 
-def make_policy(agent, is_revocable, is_rejection, **kwargs):
+def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable, is_rejection, **kwargs):
     """
     Create the ActorCritic policy with the same hyperparameters as used in pretraining.
-    Dynamically detect input feature dimensions for physical and virtual networks.
     """
-    action_dim = agent.p_net_setting_num_nodes
-
-    # Try to detect feature dimensions from environment
-    try:
-        # Detect virtual node feature dimension
-        v_net_x_sample = agent.env.v_net.x if hasattr(agent.env.v_net, 'x') else np.zeros((8, 4))
-        v_dimension_features = v_net_x_sample.shape[1]
-    except Exception as e:
-        print("WARNING: Couldn't detect v_net feature dimension. Defaulting to 4.")
-        v_dimension_features = 4
-
-    try:
-        # Detect physical node feature dimension
-        p_net_x_sample = agent.env.p_net.x if hasattr(agent.env.p_net, 'x') else np.zeros((15, 10))
-        p_dimension_features = p_net_x_sample.shape[1]
-    except Exception as e:
-        print("WARNING: Couldn't detect p_net feature dimension. Defaulting to 10.")
-        p_dimension_features = 10
-
-    print(f"[DEBUG] Detected v_dimension_features = {v_dimension_features}, p_dimension_features = {p_dimension_features}")
+    max_seq_len = kwargs.get("max_seq_len", 15)  # Default to 15 if not specified
+    action_dim = agent.p_net_setting_num_nodes  # ← this exists and is defined in RLSolver
 
     policy = ActorCritic(
         p_net_num_nodes=action_dim,
@@ -280,7 +288,8 @@ def make_policy(agent, is_revocable, is_rejection, **kwargs):
         n_layers=6,
         dropout=0.2,
         allow_revocable=is_revocable,
-        allow_rejection=is_rejection
+        allow_rejection=is_rejection,
+        max_seq_len=max_seq_len
     ).to(agent.device)
 
     optimizer = torch.optim.Adam([
@@ -292,6 +301,7 @@ def make_policy(agent, is_revocable, is_rejection, **kwargs):
     return policy, optimizer
 
 
+
 def encoder_obs_to_tensor(obs, device):
     """Process the v_net features for the Transformer Encoder."""
     if isinstance(obs, dict):
@@ -300,6 +310,13 @@ def encoder_obs_to_tensor(obs, device):
             obs_v_net_x = obs['v_net_x'].float().to(device)
         else:
             obs_v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=device)
+            
+        # Make sure it's [1, T, F] instead of [T, F]
+        if obs_v_net_x.dim() == 2:
+            obs_v_net_x = obs_v_net_x.unsqueeze(0)  # Add batch dim
+        elif obs_v_net_x.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D tensor, got {obs_v_net_x.dim()}D")
+
         return {'v_net_x': obs_v_net_x}
     elif isinstance(obs, list):
         obs_batch = [
@@ -307,7 +324,8 @@ def encoder_obs_to_tensor(obs, device):
             if not torch.is_tensor(o['v_net_x']) else o['v_net_x'].float().to(device)
             for o in obs
         ]
-        padded = pad_sequence(obs_batch, batch_first=True)
+        obs_batch_2d = [x if x.dim() == 2 else x.unsqueeze(0) for x in obs_batch]
+        padded = pad_sequence(obs_batch_2d, batch_first=True)
         return {'v_net_x': padded}
     else:
         raise Exception(f"Unrecognized type of observation {type(obs)}")
@@ -321,7 +339,8 @@ def obs_as_tensor(obs, device, pad_token=None):
         history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
         obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
         obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
-        return {
+       
+        result =  {
             'p_net': obs_p_net,
             'history_actions': history_actions,
             'edge_attr'        : obs['edge_attr'],
@@ -329,10 +348,17 @@ def obs_as_tensor(obs, device, pad_token=None):
             'action_mask': obs_action_mask,
             'mask': None
         }
+        
+        if 'rtg' in obs:
+            rtg = torch.tensor(obs['rtg'], dtype=torch.float32, device=device)
+            result['rtg'] = rtg  # shape: (1, T)
+            
+        return result 
+            
     elif isinstance(obs, list):
         p_net_data_list = [get_pyg_data(o['p_net_x'], o['p_net_edge_index'], o['edge_attr']) for o in obs]
         history_actions_list = [torch.LongTensor(o['history_actions']) for o in obs]
-        encoder_outputs_list = [o['encoder_outputs'] for o in obs]
+        encoder_outputs_list = [o['encoder_outputs'] for o in obs]  
         action_mask_list = [o['action_mask'] for o in obs]
         obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
         hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=pad_token).to(device)
@@ -341,17 +367,28 @@ def obs_as_tensor(obs, device, pad_token=None):
         max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
         emb_dim = encoder_outputs_list[0].shape[2]
         enc_padded = torch.zeros((batch_size, max_seq_len, emb_dim), dtype=torch.float32, device=device)
+        
         for i, eo in enumerate(encoder_outputs_list):
             slen = eo.shape[1]
             enc_padded[i, :slen, :] = torch.as_tensor(eo, device=device)
+            
         action_mask_np = np.array(action_mask_list)
         act_mask_t = torch.as_tensor(action_mask_np, dtype=torch.float32, device=device)
-        return {
+        
+        result =  {
             'p_net': obs_p_net,
             'history_actions': hist_padded,
             'encoder_outputs': enc_padded,
             'action_mask': act_mask_t,
             'mask': None
         }
+        
+         
+        if 'rtg' in obs[0]:
+            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32) for o in obs]
+            padded_rtg = pad_sequence(rtg_list, batch_first=True).to(device)
+            result['rtg'] = padded_rtg  # shape: (B, T, 1) or (B, T)
+        
+        return result 
     else:
         raise ValueError('obs type error: expected dict or list')
