@@ -3,6 +3,7 @@
 # ==============================================================================
 import os
 import torch
+import gc
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,10 +16,89 @@ import copy
 from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
 from .instance_env import InstanceEnv
-from .net import ActorCritic
+from .net import ActorCritic 
 from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2CSolver, RolloutBuffer
 from ..utils import get_pyg_data
 
+
+def obs_as_tensor(obs, device, pad_token=None):
+    """Preprocess the entire observation into tensor form."""
+    if isinstance(obs, dict):
+        data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'], obs['edge_attr'])
+        obs_p_net = Batch.from_data_list([data]).to(device)
+        history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
+        obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
+        obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
+       
+        result =  {
+            'p_net': obs_p_net,
+            'history_actions': history_actions,
+            'edge_attr'        : obs['edge_attr'],
+            'encoder_outputs': obs_encoder_outputs,
+            'action_mask': obs_action_mask,
+            'mask': None
+        }
+        
+        if 'rtg' in obs:
+            rtg = torch.tensor(obs['rtg'], dtype=torch.float32, device=device)
+            result['rtg'] = rtg  # shape: (1, T)
+            
+        return result 
+            
+    elif isinstance(obs, list):
+        p_net_data_list = [get_pyg_data(o['p_net_x'], o['p_net_edge_index'], o['edge_attr']) for o in obs]
+        history_actions_list = [torch.LongTensor(o['history_actions']) for o in obs]
+        encoder_outputs_list = [o['encoder_outputs'] for o in obs]  
+        action_mask_list = [o['action_mask'] for o in obs]
+        obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
+        hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=pad_token).to(device)
+
+        batch_size = len(encoder_outputs_list)
+        max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
+        emb_dim = encoder_outputs_list[0].shape[2]
+        enc_padded = torch.zeros((batch_size, max_seq_len, emb_dim), dtype=torch.float32, device=device)
+        
+        for i, eo in enumerate(encoder_outputs_list):
+            slen = eo.shape[1]
+            enc_padded[i, :slen, :] = torch.as_tensor(eo, device=device)
+            
+        action_mask_np = np.array(action_mask_list)
+        act_mask_t = torch.as_tensor(action_mask_np, dtype=torch.float32, device=device)
+        
+        result =  {
+            'p_net': obs_p_net,
+            'history_actions': hist_padded,
+            'encoder_outputs': enc_padded,
+            'action_mask': act_mask_t,
+            'mask': None
+        }
+        
+         
+        if 'rtg' in obs[0]:
+            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32) for o in obs]
+            padded_rtg = pad_sequence(rtg_list, batch_first=True).to(device)
+            result['rtg'] = padded_rtg  # shape: (B, T, 1) or (B, T)
+        
+        return result 
+    else:
+        raise ValueError('obs type error: expected dict or list')
+
+
+
+#for pickling and multithreading
+def transformer_policy_builder(slf, kwargs):
+    return make_policy(
+        slf,
+        p_dimension_features=kwargs.get("p_dimension_features"),
+        v_dimension_features=kwargs.get("v_dimension_features"),
+        is_revocable=kwargs.get("allow_revocable"),
+        is_rejection=kwargs.get("allow_rejection")
+    )
+    
+# Pickle-safe policy builder
+def policy_builder(slf):
+    return transformer_policy_builder(slf, slf.policy_builder_args)  
+    
 @registry.register(
     solver_name='a3c_gcn_pre_train_transformer', 
     env_cls=SolutionStepEnvironment,
@@ -33,22 +113,15 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         print(f"allow_revocable: {kwargs.get('allow_revocable')}")
        
         # Initialize parent classes
-        policy_builder = (
-            lambda slf,
-                p_dim=kwargs.get("p_dimension_features"),
-                v_dim=kwargs.get("v_dimension_features"),
-                rev=kwargs.get("allow_revocable"),
-                rej=kwargs.get("allow_rejection"): make_policy(
-                slf,
-                p_dimension_features=p_dim,
-                v_dimension_features=v_dim,
-                is_revocable=rev,
-                is_rejection=rej
-            )
-        )
-
+        self.policy_builder_args = kwargs 
+        
         # Initialize parent classes
-        A2CSolver.__init__(  self,  controller,   recorder, counter, policy_builder,   obs_as_tensor,  **kwargs )
+        make_policy = kwargs.pop("make_policy", policy_builder)
+        obs_as_tensor_func = kwargs.pop("obs_as_tensor", obs_as_tensor )
+        self.v_dimension_features = kwargs.get("v_dimension_features", None)
+        self.p_dimension_features = kwargs.get("p_dimension_features", None)
+
+        A2CSolver.__init__(  self,  controller,   recorder, counter, policy_builder,   obs_as_tensor_func,  **kwargs )
         
         self.preprocess_encoder_obs = encoder_obs_to_tensor
 
@@ -85,55 +158,77 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         #          #print(f"Loaded pretrained model from {checkpoint}")
         #          pretrained_loaded = True
                  
+    # Inside A3CGcnPreTrainTransformerSolver class
+
     def update(self):
         """
-        Updates both actor and critic using a single forward pass.
-        Also includes a failure predictor head trained with BCE loss on non-revoke/non-reject actions.
+        Update the policy using collected rollouts (A2C-style).
+        Leverages inherited update_grad for distributed synchronization.
         """
-        # Collect batch data
-        obs_tensors = self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)
-        actions = torch.LongTensor(self.buffer.actions).to(self.device)
-        returns = torch.FloatTensor(self.buffer.returns).to(self.device)
+        detached_total_loss = None
+        info = {}
 
-        # --- Forward Pass ---
-        logits = self.policy.act(obs_tensors)
-        values = self.policy.evaluate(obs_tensors).squeeze(-1)
+        try:
+            # === 1. Collect batch data ===
+            obs_tensors = self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)
+            actions = torch.LongTensor(self.buffer.actions).to(self.device)
+            returns = torch.FloatTensor(self.buffer.returns).to(self.device)
 
-        # Categorical dist for actor
-        dist = torch.distributions.Categorical(logits=logits)
-        action_logprobs = dist.log_prob(actions)
-        dist_entropy = dist.entropy()
+            # === 2. Forward pass ===
+            logits = self.policy.act(obs_tensors)
+            values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
-        # --- Advantage ---
-        advantages = returns - values.detach()
-        if self.normalize_advantage and advantages.numel() > 0:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            dist = torch.distributions.Categorical(logits=logits)
+            action_logprobs = dist.log_prob(actions)
+            dist_entropy = dist.entropy()
 
-        # --- Losses ---
-        actor_loss = -(action_logprobs * advantages).mean()
-        critic_loss = F.mse_loss(returns, values)
-        total_loss = actor_loss + critic_loss - self.entropy_coef * dist_entropy.mean()
-        
-        # --- Backprop ---
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        if self.clip_grad:
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+            # === 3. Compute advantage ===
+            advantages = returns - values.detach()
+            if self.normalize_advantage and advantages.numel() > 0:
+                advantages_mean = advantages.mean()
+                advantages_std = advantages.std()
+                advantages = (advantages - advantages_mean) / (advantages_std + 1e-8)
 
-        # --- Logging ---
-        info = {
-            "loss_total": total_loss.item(),
-            "actor_loss": actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "entropy": dist_entropy.mean().item()
-        }
-        if self.verbose >= 1 and self.update_time % 100 == 0:
-            print(f"[Update {self.update_time}] {info}")
+            # === 4. Losses ===
+            actor_loss = -(action_logprobs * advantages).mean()
+            critic_loss = F.mse_loss(returns, values)
+            entropy_loss = dist_entropy.mean()
+            # *** Use self.entropy_coef consistent with your class ***
+            total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
 
-        self.buffer.clear()
-        self.update_time += 1
+            detached_total_loss = total_loss.item()
 
+            # === 5. Backpropagation & Synchronization via inherited method ===
+            # *** Instead of direct backprop/step, call update_grad ***
+            grad_clipped_tensor = self.update_grad(total_loss) # This handles backprop, sync, shared step
+            grad_clipped_value = grad_clipped_tensor.item() if grad_clipped_tensor is not None else 0.0 
+
+
+        finally:
+            # === 7. Memory cleanup (Still important!) ===
+            try: del obs_tensors, actions, returns
+            except NameError: pass
+            try: del logits, values, dist, action_logprobs, dist_entropy
+            except NameError: pass
+            try: del advantages, actor_loss, critic_loss, entropy_loss, total_loss
+            except NameError: pass
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # === 8. Post-step housekeeping ===
+            self.buffer.clear()
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step() # Should this step based on shared optimizer? Depends.
+            self.update_time += 1 
+
+            # === 9. Sync Local Policy with Shared Policy ===
+            # *** Add this call, mirroring A2CSolver ***
+            if self.distributed_training:
+                self.sync_parameters()
+
+        # Return something if needed, e.g., the detached loss
+        # return detached_total_loss
 
     def evaluate_actions(self, obs, actions, return_others=False):
         """
@@ -195,16 +290,20 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         while not instance_done:
             instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
+                        
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
-            
+            tensor_instance_obs_cpu = {
+                k: v.cpu() if torch.is_tensor(v) else v
+                for k, v in tensor_instance_obs.items()
+            }
+            sub_env.prev_tensor_obs = tensor_instance_obs_cpu
+ 
             sub_env.prev_obs = {
                 **instance_obs,
                 'encoder_outputs': encoder_outputs.detach().cpu().numpy()
-            }
-            sub_env.prev_tensor_obs = tensor_instance_obs
-            
-            action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
-            next_obs, reward, instance_done, info = sub_env.step(action)
+            }  
+            action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
+            next_obs, reward, instance_done, info = sub_env.step(action) 
             history_actions.append(action)
             if instance_done:
                 break
@@ -229,7 +328,6 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             #dummy first pass
             rtg_slice = [0.0] * len(history_actions)
             instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
-            tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
 
             sub_env.prev_obs = {
                 **instance_obs,
@@ -237,12 +335,16 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             }
               
             # Accessing InstanceRLEnv attribute -- save for when revoke -- less recalculating..
-            sub_env.prev_tensor_obs = tensor_instance_obs  # Accessing InstanceRLEnv attribute
-            
-            action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
+            tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
+            tensor_instance_obs_cpu = {
+                k: v.cpu() if torch.is_tensor(v) else v
+                for k, v in tensor_instance_obs.items()
+            }
+            sub_env.prev_tensor_obs = tensor_instance_obs_cpu 
+            action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
             value = self.estimate_value(tensor_instance_obs) if hasattr(self.policy, 'evaluate') else None
             
-            next_obs, reward, instance_done, info = sub_env.step(action) 
+            next_obs, reward, instance_done, info = sub_env.step(action)  
             sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value)
             history_actions.append(action)
             
@@ -330,65 +432,3 @@ def encoder_obs_to_tensor(obs, device):
     else:
         raise Exception(f"Unrecognized type of observation {type(obs)}")
 
-
-def obs_as_tensor(obs, device, pad_token=None):
-    """Preprocess the entire observation into tensor form."""
-    if isinstance(obs, dict):
-        data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'], obs['edge_attr'])
-        obs_p_net = Batch.from_data_list([data]).to(device)
-        history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
-        obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
-        obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
-       
-        result =  {
-            'p_net': obs_p_net,
-            'history_actions': history_actions,
-            'edge_attr'        : obs['edge_attr'],
-            'encoder_outputs': obs_encoder_outputs,
-            'action_mask': obs_action_mask,
-            'mask': None
-        }
-        
-        if 'rtg' in obs:
-            rtg = torch.tensor(obs['rtg'], dtype=torch.float32, device=device)
-            result['rtg'] = rtg  # shape: (1, T)
-            
-        return result 
-            
-    elif isinstance(obs, list):
-        p_net_data_list = [get_pyg_data(o['p_net_x'], o['p_net_edge_index'], o['edge_attr']) for o in obs]
-        history_actions_list = [torch.LongTensor(o['history_actions']) for o in obs]
-        encoder_outputs_list = [o['encoder_outputs'] for o in obs]  
-        action_mask_list = [o['action_mask'] for o in obs]
-        obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
-        hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=pad_token).to(device)
-
-        batch_size = len(encoder_outputs_list)
-        max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
-        emb_dim = encoder_outputs_list[0].shape[2]
-        enc_padded = torch.zeros((batch_size, max_seq_len, emb_dim), dtype=torch.float32, device=device)
-        
-        for i, eo in enumerate(encoder_outputs_list):
-            slen = eo.shape[1]
-            enc_padded[i, :slen, :] = torch.as_tensor(eo, device=device)
-            
-        action_mask_np = np.array(action_mask_list)
-        act_mask_t = torch.as_tensor(action_mask_np, dtype=torch.float32, device=device)
-        
-        result =  {
-            'p_net': obs_p_net,
-            'history_actions': hist_padded,
-            'encoder_outputs': enc_padded,
-            'action_mask': act_mask_t,
-            'mask': None
-        }
-        
-         
-        if 'rtg' in obs[0]:
-            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32) for o in obs]
-            padded_rtg = pad_sequence(rtg_list, batch_first=True).to(device)
-            result['rtg'] = padded_rtg  # shape: (B, T, 1) or (B, T)
-        
-        return result 
-    else:
-        raise ValueError('obs type error: expected dict or list')

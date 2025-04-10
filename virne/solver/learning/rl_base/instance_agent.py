@@ -87,10 +87,12 @@ class InstanceAgent(object):
         instance_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
         instance_obs = instance_env.reset()
         while True:
-            tensor_instance_obs = self.preprocess_obs(instance_obs, self.device)
-            action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
+            tensor_instance_obs = self.preprocess_obs(instance_obs, self.device) 
+            action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
+
             value = self.estimate_value(tensor_instance_obs)
             next_instance_obs, instance_reward, instance_done, instance_info = instance_env.step(action)
+            
             instance_buffer.add(instance_obs, action, instance_reward, instance_done, action_logprob, value=value)
             # instance_buffer.action_masks.append(mask if isinstance(mask, np.ndarray) else mask.cpu().numpy())
 
@@ -121,7 +123,8 @@ class InstanceAgent(object):
             pass
         return self.buffer
 
-    def learn_singly(self, env, num_epochs=1, **kwargs):
+    def learn_singly(self, env, num_epochs=1, **kwargs): 
+
         # main env
         for epoch_id in range(num_epochs):
             print(f'Training Epoch: {epoch_id}') if self.verbose > 0 else None
@@ -144,7 +147,8 @@ class InstanceAgent(object):
                 if self.buffer.size() >= self.target_steps:
                     loss = self.update()
 
-                instance, reward, done, info = env.step(solution)
+                instance, reward, done, info = env.step(solution) 
+                torch.cuda.empty_cache()
 
                 if done:
                     break

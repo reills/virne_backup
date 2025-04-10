@@ -60,14 +60,24 @@ class RolloutBuffer:
             return False
         return self.curr_id == self.max_size
 
-    def add(self, obs, action, raward, done, logprob, value=None):
-        self.observations.append(obs)
-        self.actions.append(action)
-        self.rewards.append(raward)
-        self.dones.append(done)
-        self.logprobs.append(logprob)
-        self.values.append(value)
+    def add(self, obs, action, reward, done, logprob, value=None):
+        def move_to_cpu(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu()
+            elif isinstance(x, dict):
+                return {k: move_to_cpu(v) for k, v in x.items()}
+            elif isinstance(x, list):
+                return [move_to_cpu(v) for v in x]
+            return x
+
+        self.observations.append(move_to_cpu(obs))
+        self.actions.append(move_to_cpu(action))
+        self.rewards.append(float(reward))
+        self.dones.append(bool(done))
+        self.logprobs.append(move_to_cpu(logprob))
+        self.values.append(move_to_cpu(value))
         self.curr_idx += 1
+
     
     def merge(self, buffer):
         for item in self.all_items:

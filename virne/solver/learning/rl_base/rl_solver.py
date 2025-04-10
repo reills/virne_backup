@@ -31,6 +31,67 @@ from ..utils import apply_mask_to_logit, get_observations_sample, RunningMeanStd
 from virne.utils import test_running_time
 
 
+def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interval, eval_interval, lock, shared_policy, shared_optimizer):
+    """Target function for each spawned training worker process."""
+
+    print(f"[Worker {rank}] Process started. Initializing solver...")
+
+    # --- Set worker-specific config ---
+    config_dict['rank'] = rank
+    config_dict['verbose'] = 1 if rank == 0 else 0         # Only main worker prints logs
+    config_dict['open_tb'] = False                         # Disable TensorBoard in workers
+
+    # --- Assign CUDA or CPU device based on rank ---
+    use_cuda = config_dict.get('use_cuda', True)
+    worker_device = torch.device(
+        f'cuda:{rank % torch.cuda.device_count()}' if use_cuda and torch.cuda.is_available() else 'cpu'
+    )
+    config_dict['device'] = worker_device  # Ensure device is known to __init__ (if supported)
+
+    # --- Instantiate the solver with this config ---
+    solver = cls_type(**config_dict)
+
+    # --- Post-init corrections (safe redundancy) ---
+    solver.device = worker_device
+    solver.rank = rank
+    solver.verbose = config_dict['verbose']
+
+    print(f"[Worker {rank}] Solver instantiated on device: {solver.device}")
+
+    # --- Runtime parameters ---
+    solver.lock = lock
+    solver.save_interval = save_interval
+    solver.eval_interval = eval_interval
+
+    # --- Shared memory references ---
+    solver.shared_policy = shared_policy
+    solver.shared_optimizer = shared_optimizer
+
+    # --- (Re)initialize local policy & optimizer if missing ---
+    if not hasattr(solver, 'policy') or not hasattr(solver, 'optimizer'):
+        print(f"[Worker {rank}] Creating local policy and optimizer...")
+        solver.policy, solver.optimizer = solver.make_policy(solver)
+    else:
+        print(f"[Worker {rank}] Using policy/optimizer created during __init__.")
+
+    # --- Sync weights and move model to this worker's device ---
+    print(f"[Worker {rank}] Loading shared policy weights...")
+    solver.policy.load_state_dict(shared_policy.state_dict())
+
+    print(f"[Worker {rank}] Moving policy to device {solver.device}...")
+    solver.policy.to(solver.device)
+
+    # --- Disable per-worker logging/output tracking ---
+    solver.writer = None
+    solver.lr_scheduler = None  # Optional: usually managed globally
+
+    # --- Launch training loop ---
+    print(f"[Worker {rank}] Starting training loop...")
+    solver.learn_singly(env, num_epochs)
+    print(f"[Worker {rank}] Training loop finished.")
+
+
+        
 class RLSolver(Solver):
     """General Reinforcement Learning Solve"""
     def __init__(self, controller, recorder, counter, make_policy, obs_as_tensor, **kwargs):
@@ -112,14 +173,13 @@ class RLSolver(Solver):
         # counter
         self.update_time = 0
         self.time_step = 0
-        if self.verbose >= 0:
-            self.show_config()
+        
         # optimizer
         self.make_policy = make_policy
         self.policy, self.optimizer = self.make_policy(self)
         self.preprocess_obs = obs_as_tensor
 
-
+     
     def show_config(self, ):
         print(f'*' * 50)
         print(f'Key parameters of RL training are as following: ')
@@ -286,38 +346,6 @@ class RLSolver(Solver):
         sub_solver.policy.load_state_dict(self.policy.state_dict())
         return sub_solver
 
-    def get_worker(self, rank=0):
-        self.policy.share_memory()
-        shared_policy = self.policy
-        self.optimizer = SharedAdam.from_optim(self.optimizer)
-        shared_optimizer = self.optimizer
-
-        lr_scheduler = self.lr_scheduler
-        writer = self.writer
-        unnecessary_attributes = ['policy', 'optimizer', 'lr_scheduler', 'searcher', 'writer']
-        for attr_name in unnecessary_attributes:
-            if hasattr(self, attr_name):
-                delattr(self, attr_name)
-        # self.eval()
-        worker = copy.deepcopy(self)
-        worker.rank = rank
-        worker.writer = None
-        worker.lr_scheduler = None
-        if self.use_cuda:
-            num_gpu_devices = torch.cuda.device_count()
-            worker_device_id = rank % num_gpu_devices
-            worker.device = torch.device(f'cuda:{worker_device_id}')
-        worker.policy, worker.optimizer = worker.make_policy(worker)
-        worker.policy.load_state_dict(shared_policy.state_dict())
-        worker.policy.to(worker.device)
-        # worker.optimizer = torch.optim.Adam(worker.policy.parameters(), lr=self.lr)
-        worker.shared_policy = shared_policy
-        worker.shared_optimizer = shared_optimizer
-        self.lr_scheduler = lr_scheduler
-        self.writer = writer
-        self.policy = shared_policy
-        self.optimizer = shared_optimizer
-        return worker
 
     def save_model(self, checkpoint_fname):
         checkpoint_fname = os.path.join(self.model_dir, checkpoint_fname)
@@ -396,6 +424,9 @@ class RLSolver(Solver):
             self.policy.load_state_dict(self.shared_policy.state_dict())
 
     def learn(self, env, num_epochs=1, **kwargs):
+        if self.verbose >= 0: 
+            self.show_config()
+            
         self.start_time = time.time()
         if self.distributed_training:
             self.learn_distributedly(env, num_epochs)
@@ -408,34 +439,96 @@ class RLSolver(Solver):
         self.end_time = time.time()
         print(f'\nTotal training time: {(self.end_time - self.start_time) / 3600:4.6f} h')
 
+
+    def get_worker_config(self):
+            skip_keys = {
+                'policy', 'writer', 'optimizer', 'buffer',
+                'InstanceEnv' ,
+            }
+            # Dynamically collect most keys
+            config = {
+                k: v for k, v in vars(self).items()
+                if k not in skip_keys and not callable(v) and not k.startswith("_")
+            }
+            # Ensure critical ones are explicitly included or overridden
+            config.update({
+                "v_dimension_features": self.v_dimension_features,
+                "p_dimension_features": self.p_dimension_features,
+            })
+            return config
+        
+
     def learn_distributedly(self, env, num_epochs, **kwargs):
         assert self.distributed_training, 'distributed_training should be True'
         assert num_epochs % self.num_workers == 0, 'num_epochs should be divisible by num_workers'
-        job_list = []
-        mp.set_start_method('spawn')
+
+        mp.set_start_method('spawn', force=True)
         lock = mp.Lock()
-        worker_num_epochs = int(num_epochs // self.num_workers)
+        self.lock = lock
+ 
+        self.policy.share_memory()
+        if not isinstance(self.optimizer, SharedAdam):
+            self.optimizer = SharedAdam.from_optim(self.optimizer)
+
+        worker_num_epochs = num_epochs // self.num_workers
         worker_save_interval = int(np.ceil(self.save_interval / self.num_workers))
         worker_eval_interval = int(np.ceil(self.eval_interval / self.num_workers))
-        print(f'Distributed training with {self.num_workers} workers')
-        print(f'Worker num epochs:    {   worker_num_epochs:3d} epochs')
-        print(f'Worker save interval: {worker_save_interval:3d} epochs')
-        print(f'Worker eval interval: {worker_eval_interval:3d} epochs')
-        print()
+
+        config_dict = self.get_worker_config()
+        job_list = []
+
         for worker_rank in range(self.num_workers):
-            env = copy.deepcopy(env)
-            worker = self.get_worker(worker_rank)
-            worker.lock = lock
-            worker.save_interval = worker_save_interval
-            worker.eval_interval = worker_eval_interval
-            if worker_rank != 0: 
-                worker.verbose = 0
-                env.verbose = 0
-            job = mp.Process(target=worker.learn_singly, args=(env, worker_num_epochs))
+            env_copy = copy.deepcopy(env)
+
+            job = mp.Process(
+                target=run_worker_process,
+                args=(self.__class__, config_dict, worker_rank, env_copy,
+                    worker_num_epochs, worker_save_interval, worker_eval_interval,
+                    lock, self.policy, self.optimizer)
+            )
+
             job_list.append(job)
             job.start()
-        for job in job_list: 
+
+        for job in job_list:
             job.join()
+
+            
+    
+    def get_worker(self, rank=0):
+        """
+        Constructs a worker instance. Assumes that the shared policy and optimizer
+        were already initialized in the main process.
+        """
+        print(f"[Worker {rank} inside get_worker] Creating worker instance...")
+
+        # Create a new instance of the same class, using the parent's config
+        worker = type(self)(
+            controller=self.controller,
+            recorder=self.recorder,
+            counter=self.counter,
+            **self.get_worker_config()
+        )
+
+        # Set process-specific info
+        worker.rank = rank
+        worker.device = torch.device(f'cuda:{rank % torch.cuda.device_count()}') if self.use_cuda else torch.device('cpu')
+
+        # Create local policy and optimizer copies
+        worker.policy, worker.optimizer = worker.make_policy(worker)
+
+        # Load shared policy state into this worker’s policy
+        worker.policy.load_state_dict(self.policy.state_dict())
+        worker.policy.to(worker.device)
+
+        # Shared references from parent
+        worker.shared_policy = self.policy
+        worker.shared_optimizer = self.optimizer
+        worker.lr_scheduler = None
+        worker.writer = None  # Workers don’t write logs directly
+
+        print(f"[Worker {rank} inside get_worker] Setup complete.")
+        return worker
 
 
 class PGSolver(RLSolver):

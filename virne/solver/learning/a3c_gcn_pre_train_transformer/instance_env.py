@@ -8,6 +8,7 @@ import warnings
 import torch
 from gym import spaces
 from virne.solver.learning.rl_base import JointPRStepInstanceRLEnv, PlaceStepInstanceRLEnv
+from pathlib import Path
 
 _norm_vector_p = None
 _norm_vector_v = None
@@ -22,14 +23,18 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
          
         # Use module-level cache
         global _norm_vector_p, _norm_vector_v
-         
-        # With this:
-        norm_file = os.path.join(os.path.dirname(__file__), "precomputed_norm.pt")
-        norm_data = torch.load(norm_file)
+          
+        # Go from virne/solver/learning/ → virne/
+        project_root_pathlib = Path.cwd() # Get current working directory
+        norm_file = project_root_pathlib / "dataset" / "precomputed_norm.pt" 
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
+            norm_data = torch.load(norm_file)
         self.norm_vector_p = norm_data['norm_vector_p'].float()
         self.norm_vector_v = norm_data['norm_vector_v'].float()
 
-        self.max_revokes=92 
+        self.max_revokes=80
 
     def get_observation(self):
         """
@@ -62,11 +67,11 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         # Case 1: Early rejection — should almost never happen, very bad
         if solution['early_rejection']: 
-            reward = -25.0  # more punishing for not even trying to place
+            reward = -30.0  # more punishing for not even trying to place
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
             # maxes out at -11.72 after 81 revokes
-            reward = -0.02 * revokes  # Increasing penalty per revoke step 
+            reward = -0.01 * revokes  # Increasing penalty per revoke step 
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step

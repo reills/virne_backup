@@ -1,29 +1,4 @@
-# import torch
-
-# path = "/home/stephen-reilly/dev/virne/dataset/training-data/training_data_GG1_20250403_053636.pt"
-# dataset = torch.load(path, map_location='cpu')
-
-# print(f"Dataset size: {len(dataset)}")
-
-# for i, sample in enumerate(dataset):
-#     print(f"\n--- Sample {i} ---")
-#     for key, value in sample.items():
-#         print(f"\n{key}:")
-#         if torch.is_tensor(value):
-#             if value.ndim <= 2 and value.numel() < 100:
-#                 print(value)  # print small/flat tensors directly
-#             else:
-#                 print(value[:2])  # print first 2 elements/slices for larger tensors
-#         else:
-#             print(value)
-
-#     if i >= 2:  # limit to first 3 samples
-#         break
-
-    
-
-import os
-import re
+import os 
 import torch
 import warnings
  
@@ -73,11 +48,10 @@ def merge_pt_files(directory, output_filename="merged_training_data.pt"):
             v_samples = torch.cat([s['v_net_x'].float() for s in data], dim=0)
 
             norm_vector_p = torch.max(p_samples, dim=0)[0]
-            norm_vector_v = torch.max(v_samples, dim=0)
+            norm_vector_v = torch.max(v_samples, dim=0)[0]
 
             torch.save({'norm_vector_p': norm_vector_p, 'norm_vector_v': norm_vector_v}, "dataset/precomputed_norm.pt")
-
-
+                
         except Exception as e:
             print(f"Error saving merged data to {output_path}: {e}")
     else:
