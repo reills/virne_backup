@@ -22,31 +22,13 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
          
         # Use module-level cache
         global _norm_vector_p, _norm_vector_v
-        # Set normalization paths
-        dataset_path = "/home/stephen-reilly/dev/virne/dataset/merged_training_data.pt"
-        #dataset_path = "/Users/stephenreilly/Desktop/github/virne/virne/solver/learning/a3c_gcn_pre_train_transformer/merged_training_data.pt"
-        if _norm_vector_p is None or _norm_vector_v is None:
-            print("Loading normalization vectors...")
+         
+        # With this:
+        norm_file = os.path.join(os.path.dirname(__file__), "precomputed_norm.pt")
+        norm_data = torch.load(norm_file)
+        self.norm_vector_p = norm_data['norm_vector_p'].float()
+        self.norm_vector_v = norm_data['norm_vector_v'].float()
 
-            if os.path.exists(dataset_path):
-                print(f"Computing normalization vectors from: {dataset_path}")
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-                    data = torch.load(dataset_path)
-
-                # Expect each item in data to be a dict with 'p_net_x' and 'v_net_x'
-                p_samples = torch.cat([s['p_net_x'].clone().detach() for s in data], dim=0)
-                v_samples = torch.cat([s['v_net_x'].clone().detach() for s in data], dim=0)
-
-                _norm_vector_p = torch.max(p_samples, dim=0)[0].float()
-                _norm_vector_v = torch.max(v_samples, dim=0)[0].float()
-                print("Normalization vectors computed.")
-            else:
-                raise FileNotFoundError(f"No pretrained dataset found.\n"
-                                        f"Expected one of:\n  {dataset_path}")
-
-        self.norm_vector_p = _norm_vector_p
-        self.norm_vector_v = _norm_vector_v
         self.max_revokes=92 
 
     def get_observation(self):
