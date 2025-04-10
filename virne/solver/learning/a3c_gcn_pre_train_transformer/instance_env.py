@@ -23,7 +23,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Use module-level cache
         global _norm_vector_p, _norm_vector_v
         # Set normalization paths
-        dataset_path = "/home/stephen-reilly/dev/virne/dataset/training-data/merged_training_data.pt"
+        dataset_path = "/home/stephen-reilly/dev/virne/dataset/merged_training_data.pt"
         #dataset_path = "/Users/stephenreilly/Desktop/github/virne/virne/solver/learning/a3c_gcn_pre_train_transformer/merged_training_data.pt"
         if _norm_vector_p is None or _norm_vector_v is None:
             print("Loading normalization vectors...")

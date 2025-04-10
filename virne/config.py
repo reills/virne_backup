@@ -72,7 +72,7 @@ class Config(ClassDict):
     distributed_training: bool = False
     num_train_epochs: int = 100 #changed by me was 100
     num_workers: int = 4 #changed by me was 10
-    batch_size: int = 128 # changed by me was 128
+    batch_size: int = 64 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10

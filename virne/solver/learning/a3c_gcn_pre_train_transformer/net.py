@@ -244,8 +244,7 @@ class AutoregressiveDecoder(nn.Module):
             edge_embeddings.append(edge_features)
 
         # Project node features and reshape
-        graph_embedding = self.gat_projection(node_features)
-        graph_embedding = graph_embedding.reshape(batch_p_net.num_graphs, -1, self.embedding_dim)
+        graph_embedding = self.gat_projection(node_features) 
  
         # Embed history actions
         history_actions = obs['history_actions']  # Shape: (B, T)
@@ -286,6 +285,7 @@ class AutoregressiveDecoder(nn.Module):
         
         # === EARLY EXIT FOR CRITIC ===
         if return_last_embed or not self.is_actor:
+            #print("early critic exit!!!!!!!!!!!!!")
             return self.norm(last_decoder_output)
         # =============================
 

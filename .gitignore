@@ -2,12 +2,15 @@
 .vscode
 
 #datasets
-dataset
+dataset/results*
 *.pth
 analysis.py
 pre-train
 temp_data
-*.pt
+dataset/training-data
+p_net
+v_nets
+
 
 # build
 virne.egg-info
