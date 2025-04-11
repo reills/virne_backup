@@ -34,7 +34,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.norm_vector_p = norm_data['norm_vector_p'].float()
         self.norm_vector_v = norm_data['norm_vector_v'].float()
 
-        self.max_revokes=80
+        self.max_revokes=8
 
     def get_observation(self):
         """
@@ -60,8 +60,9 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
 
         vnodes = self.v_net.num_nodes            # Typically 8
+        self.max_revokes = vnodes * 8
         value = solution['v_net_r2c_ratio'] * 20
-        completion_pct = (solution['num_placed_nodes'] or 0) / self.v_net.num_nodes
+        completion_pct = (solution['num_placed_nodes'] or 0) / vnodes
         revokes = solution['revoke_times']
         revoke_pct = revokes / max(1, self.max_revokes)
 
@@ -71,7 +72,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
             # maxes out at -11.72 after 81 revokes
-            reward = -0.01 * revokes  # Increasing penalty per revoke step 
+            reward = -1 #+ -0.02 * revokes  # Increasing penalty per revoke step 
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step

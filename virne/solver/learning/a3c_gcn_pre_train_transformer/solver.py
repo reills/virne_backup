@@ -169,32 +169,33 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         info = {}
 
         try:
-            # === 1. Collect batch data ===
-            obs_tensors = self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)
-            actions = torch.LongTensor(self.buffer.actions).to(self.device)
-            returns = torch.FloatTensor(self.buffer.returns).to(self.device)
+            with torch.amp.autocast("cuda"):
+                # === 1. Collect batch data ===
+                obs_tensors = self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)
+                actions = torch.LongTensor(self.buffer.actions).to(self.device)
+                returns = torch.FloatTensor(self.buffer.returns).to(self.device)
 
-            # === 2. Forward pass ===
-            logits = self.policy.act(obs_tensors)
-            values = self.policy.evaluate(obs_tensors).squeeze(-1)
+                # === 2. Forward pass ===
+                logits = self.policy.act(obs_tensors)
+                values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
-            dist = torch.distributions.Categorical(logits=logits)
-            action_logprobs = dist.log_prob(actions)
-            dist_entropy = dist.entropy()
+                dist = torch.distributions.Categorical(logits=logits)
+                action_logprobs = dist.log_prob(actions)
+                dist_entropy = dist.entropy()
 
-            # === 3. Compute advantage ===
-            advantages = returns - values.detach()
-            if self.normalize_advantage and advantages.numel() > 0:
-                advantages_mean = advantages.mean()
-                advantages_std = advantages.std()
-                advantages = (advantages - advantages_mean) / (advantages_std + 1e-8)
+                # === 3. Compute advantage ===
+                advantages = returns - values.detach()
+                if self.normalize_advantage and advantages.numel() > 0:
+                    advantages_mean = advantages.mean()
+                    advantages_std = advantages.std()
+                    advantages = (advantages - advantages_mean) / (advantages_std + 1e-8)
 
-            # === 4. Losses ===
-            actor_loss = -(action_logprobs * advantages).mean()
-            critic_loss = F.mse_loss(returns, values)
-            entropy_loss = dist_entropy.mean()
-            # *** Use self.entropy_coef consistent with your class ***
-            total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
+                # === 4. Losses ===
+                actor_loss = -(action_logprobs * advantages).mean()
+                critic_loss = F.mse_loss(returns, values)
+                entropy_loss = dist_entropy.mean()
+                # *** Use self.entropy_coef consistent with your class ***
+                total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
 
             detached_total_loss = total_loss.item()
 
@@ -250,7 +251,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
     def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env, rtg=None):
         # Step 1: Remove invalid actions (e.g., 100 = pad, 101 = revoke)
         filtered = [a for a in history_actions if a not in [100, 101]]
-        final_history_actions = [self.start_token] + filtered[:100]
+        final_history_actions = [self.start_token] + filtered[:25]
 
         # Step 2: Fix RTG length to match final_history_actions
         if rtg is not None:
@@ -385,22 +386,16 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         p_net_num_nodes=action_dim,
         p_net_feature_dim=p_dimension_features,
         v_net_feature_dim=v_dimension_features,
-        embedding_dim=128,
-        n_heads=8,
-        n_layers=6,
-        dropout=0.2,
+        embedding_dim=100,
+        n_heads=5,
+        n_layers=4,
+        dropout=0.1,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection,
         max_seq_len=max_seq_len
-    ).to(agent.device)
-
-    optimizer = torch.optim.Adam([
-        {'params': policy.encoder.parameters(), 'lr': agent.lr_actor},
-        {'params': policy.actor.parameters(),   'lr': agent.lr_actor},
-        {'params': policy.critic.parameters(),  'lr': agent.lr_critic}
-    ], weight_decay=agent.weight_decay)
-
-    return policy, optimizer
+    ).to(agent.device) 
+    
+    return policy 
 
 
 

@@ -21,6 +21,8 @@ from torch.utils.tensorboard import SummaryWriter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from abc import abstractmethod
 
+from torch.amp import autocast, GradScaler
+
 from virne.solver import Solver
 from virne.solver.heuristic.node_rank import *
 
@@ -65,14 +67,7 @@ def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interv
 
     # --- Shared memory references ---
     solver.shared_policy = shared_policy
-    solver.shared_optimizer = shared_optimizer
-
-    # --- (Re)initialize local policy & optimizer if missing ---
-    if not hasattr(solver, 'policy') or not hasattr(solver, 'optimizer'):
-        print(f"[Worker {rank}] Creating local policy and optimizer...")
-        solver.policy, solver.optimizer = solver.make_policy(solver)
-    else:
-        print(f"[Worker {rank}] Using policy/optimizer created during __init__.")
+    solver.shared_optimizer = shared_optimizer 
 
     # --- Sync weights and move model to this worker's device ---
     print(f"[Worker {rank}] Loading shared policy weights...")
@@ -91,7 +86,6 @@ def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interv
     print(f"[Worker {rank}] Training loop finished.")
 
 
-        
 class RLSolver(Solver):
     """General Reinforcement Learning Solve"""
     def __init__(self, controller, recorder, counter, make_policy, obs_as_tensor, **kwargs):
@@ -176,8 +170,16 @@ class RLSolver(Solver):
         
         # optimizer
         self.make_policy = make_policy
-        self.policy, self.optimizer = self.make_policy(self)
+        self.policy = self.make_policy(self) #change now make+policy doesn't return an optimizer!? 
+        
+        self.optimizer = torch.optim.Adam([
+            {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor}, # Use self.lr_actor
+            {'params': self.policy.actor.parameters(),   'lr': self.lr_actor}, # Use self.lr_actor
+            {'params': self.policy.critic.parameters(),  'lr': self.lr_critic} # Use self.lr_critic
+        ], weight_decay=self.weight_decay)
+        
         self.preprocess_obs = obs_as_tensor
+        self.scaler = GradScaler()
 
      
     def show_config(self, ):
@@ -399,23 +401,36 @@ class RLSolver(Solver):
                                     k=k, device=self.device,
                                     mask_actions=self.mask_actions, 
                                     maskable_policy=self.maskable_policy)
+ 
+    def update_grad(self, loss): 
 
-    def update_grad(self, loss):
-        # update parameters
         if self.distributed_training:
             with self.lock:
                 self.optimizer.zero_grad()
                 self.shared_optimizer.zero_grad()
-                loss.backward()
-                grad_clipped = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm) if self.clip_grad else None
-                sync_gradients(self.shared_policy, self.policy)
-                self.optimizer.step()
-                self.shared_optimizer.step()
+
+                self.scaler.scale(loss).backward()
+                if self.clip_grad:
+                    self.scaler.unscale_(self.optimizer)
+                    grad_clipped = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                else:
+                    grad_clipped = None
+
+                self.scaler.step(self.optimizer)
+                self.scaler.step(self.shared_optimizer)
+                self.scaler.update()
         else:
             self.optimizer.zero_grad()
-            loss.backward()
-            grad_clipped = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm) if self.clip_grad else None
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            if self.clip_grad:
+                self.scaler.unscale_(self.optimizer)
+                grad_clipped = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            else:
+                grad_clipped = None
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
         return grad_clipped
 
     def sync_parameters(self):
@@ -460,31 +475,36 @@ class RLSolver(Solver):
 
     def learn_distributedly(self, env, num_epochs, **kwargs):
         assert self.distributed_training, 'distributed_training should be True'
-        assert num_epochs % self.num_workers == 0, 'num_epochs should be divisible by num_workers'
+        # Optional: Uncomment if your logic requires splitting epochs evenly
+        # assert num_epochs % self.num_workers == 0, 'num_epochs should be divisible by num_workers'
 
         mp.set_start_method('spawn', force=True)
         lock = mp.Lock()
-        self.lock = lock
- 
-        self.policy.share_memory()
+        self.lock = lock  # Store the lock for use in update and sync methods
+        self.policy.share_memory()  # Share the policy's parameters across processes
+        
         if not isinstance(self.optimizer, SharedAdam):
             self.optimizer = SharedAdam.from_optim(self.optimizer)
+            self.optimizer.share_memory()  # share optimizer 
+        else:
+            self.optimizer.share_memory()
 
-        worker_num_epochs = num_epochs // self.num_workers
-        worker_save_interval = int(np.ceil(self.save_interval / self.num_workers))
-        worker_eval_interval = int(np.ceil(self.eval_interval / self.num_workers))
+        # You can divide epochs across workers if needed, or let workers run the full span.
+        worker_num_epochs = int(num_epochs // self.num_workers)
+        worker_save_interval = self.save_interval
+        worker_eval_interval = self.eval_interval
 
         config_dict = self.get_worker_config()
         job_list = []
 
         for worker_rank in range(self.num_workers):
-            env_copy = copy.deepcopy(env)
+            env_copy = copy.deepcopy(env)  # Give each worker its own env
 
             job = mp.Process(
                 target=run_worker_process,
                 args=(self.__class__, config_dict, worker_rank, env_copy,
                     worker_num_epochs, worker_save_interval, worker_eval_interval,
-                    lock, self.policy, self.optimizer)
+                    lock, self.policy, self.optimizer)  # Shared policy and optimizer
             )
 
             job_list.append(job)
@@ -493,44 +513,9 @@ class RLSolver(Solver):
         for job in job_list:
             job.join()
 
-            
-    
-    def get_worker(self, rank=0):
-        """
-        Constructs a worker instance. Assumes that the shared policy and optimizer
-        were already initialized in the main process.
-        """
-        print(f"[Worker {rank} inside get_worker] Creating worker instance...")
+        print("[Main Process] All workers finished.")
 
-        # Create a new instance of the same class, using the parent's config
-        worker = type(self)(
-            controller=self.controller,
-            recorder=self.recorder,
-            counter=self.counter,
-            **self.get_worker_config()
-        )
-
-        # Set process-specific info
-        worker.rank = rank
-        worker.device = torch.device(f'cuda:{rank % torch.cuda.device_count()}') if self.use_cuda else torch.device('cpu')
-
-        # Create local policy and optimizer copies
-        worker.policy, worker.optimizer = worker.make_policy(worker)
-
-        # Load shared policy state into this worker’s policy
-        worker.policy.load_state_dict(self.policy.state_dict())
-        worker.policy.to(worker.device)
-
-        # Shared references from parent
-        worker.shared_policy = self.policy
-        worker.shared_optimizer = self.optimizer
-        worker.lr_scheduler = None
-        worker.writer = None  # Workers don’t write logs directly
-
-        print(f"[Worker {rank} inside get_worker] Setup complete.")
-        return worker
-
-
+  
 class PGSolver(RLSolver):
     
     def __init__(self, controller, recorder, counter, make_policy, obs_as_tensor, **kwargs):

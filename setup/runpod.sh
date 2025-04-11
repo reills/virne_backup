@@ -22,13 +22,12 @@ echo "📁 Cloning project repo..."
 git clone git@github.com:reills/virne.git
 cd virne
  
+echo "📁 Copying results-seq-sfc into dataset/results-sfc-trans..."
+mkdir -p dataset/results-sfc-trans
+cp -r results-seq-sfc/* dataset/results-sfc-trans/
+
+
 echo "Running experiment..."
 python -m virne.main
 
-# Optional: Auto-push results
-# echo "📤 Attempting to push results..."
-# git config --global user.name "Stephen Reilly"
-# git config --global user.email "you@example.com"
-# git add -f dataset/results-sfc-trans
-# git commit -m "Auto-pushed results from RunPod on $(date)"
-# git push origin main
+echo "done" > /root/training_complete.flag

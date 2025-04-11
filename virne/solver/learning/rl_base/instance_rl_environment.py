@@ -104,7 +104,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         p_node_id = int(action)
         self.solution.selected_actions.append(p_node_id)
 
-        if self.solution['revoke_times'] > 10 * self.v_net.num_nodes: 
+        if self.solution['revoke_times'] > 8 * self.v_net.num_nodes: 
             self.solution['description'] = 'Too Many Revokable Actions'
             self.solution['place_result'] = True
             self.solution['route_result'] = False
@@ -135,7 +135,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                                 check_feasibility=self.check_feasibility)
             # Step Failure
             if not place_and_route_result: 
-                if self.allow_revocable and self.solution['revoke_times'] <= self.v_net.num_nodes * 10:
+                if self.allow_revocable and self.solution['revoke_times'] <= self.v_net.num_nodes * 8:
                     self.solution['selected_actions'].append(self.revocable_action)
                     #print("[REVOCABLE] Retrying with a revocable action...")
                     return self.revoke()

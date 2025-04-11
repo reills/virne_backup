@@ -157,8 +157,8 @@ class InstanceAgent(object):
             print(f'\nepoch {epoch_id:4d}, success_count {success_count:5d}, r2c {info["long_term_r2c_ratio"]:1.4f}, mean logprob {epoch_logprobs_tensor.mean():2.4f}') if self.verbose > 0 else None
             if self.rank == 0:
                 # save
-                if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0:
-                    self.save_model(f'model-{epoch_id}.pkl')
+                if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0: 
+                    self.save_model(f'model-worker{self.rank}-epoch{epoch_id}.pkl')
                 # validate
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)

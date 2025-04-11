@@ -46,7 +46,7 @@ class MultiHeadGENLayer(nn.Module):
 # --- ActorCritic Model ---
 class ActorCritic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, v_net_feature_dim,
-                 embedding_dim=128, n_heads=8, n_layers=6, dropout=0.2, **kwargs):
+                 embedding_dim=100, n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
         
         common_kwargs = dict(
@@ -75,7 +75,7 @@ class ActorCritic(nn.Module):
 
 # --- Encoder Module ---
 class Encoder(nn.Module):
-    def __init__(self, v_net_feature_dim, embedding_dim=128, n_heads=8, n_layers=6, dropout=0.2, max_seq_len=15):
+    def __init__(self, v_net_feature_dim, embedding_dim=100, n_heads=5, n_layers=4, dropout=0.1, max_seq_len=15):
         super().__init__()
         
         self.token_embed = nn.Linear(v_net_feature_dim, embedding_dim)
@@ -108,8 +108,8 @@ class Encoder(nn.Module):
 
 # --- Actor Module ---
 class Actor(nn.Module):
-    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=6, dropout=0.2, **kwargs):
+    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
+                 n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
         # Retrieve special action flags from kwargs
         allow_revocable = kwargs.get("allow_revocable", False)
@@ -131,8 +131,8 @@ class Actor(nn.Module):
 
 # --- Critic Module ---
 class Critic(nn.Module):
-    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=6, dropout=0.2, **kwargs):
+    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
+                 n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
         # Retrieve special action flags from kwargs
         allow_revocable = kwargs.get("allow_revocable", False)
@@ -164,8 +164,8 @@ class AutoregressiveDecoder(nn.Module):
     Processes physical network graph features and historical actions to produce action logits or embeddings.
     Supports both actor (for action selection) and critic (for value estimation) modes.
     """
-    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=6, dropout=0.2, is_actor=True,
+    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
+                 n_heads=5, n_layers=4, dropout=0.1, is_actor=True,
                  allow_revocable=False, allow_rejection=False):
         super().__init__()
         self.embedding_dim = embedding_dim

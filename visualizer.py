@@ -6,26 +6,27 @@ import ast
 from matplotlib.widgets import Button
 from collections import defaultdict
 import re
-
+from matplotlib.patches import FancyArrowPatch
+import numpy as np
+from typing import Dict, Tuple, List, Any, Optional
 
 # ------------------------------------------------------------------------------
 # 1) Paths & CSV
 # ------------------------------------------------------------------------------
-#v_path = "/Users/stephenreilly/Desktop/github/virne/save/sa/Stephens-MacBook-Pro-2.local-20250226T193311/records"
-#v_csv_filename = "/sa-Stephens-MacBook-Pro-2.local-20250226T193311-20250226T193311.csv"
-v_path = "/Users/stephenreilly/Desktop/github/virne/dataset/results-visualizer/"
-v_csv_filename ="sa-20250402T013438.csv"
-df = pd.read_csv(v_path + v_csv_filename)
+root = "/Users/stephenreilly/Desktop/github/virne/dataset/results-sfc/"
+csv_files = [f for f in os.listdir(root) if f.endswith(".csv")]
+if not csv_files:
+    raise FileNotFoundError(f"No CSV files found in {root}")
+csv_filename = os.path.join(root, csv_files[0])
+        
+df = pd.read_csv(csv_filename)
 
 #p_path = "/Users/stephenreilly/Desktop/github/virne/dataset/p_net/10-waxman_[0.5-0.2]-cpu_[50-100]-max_cpu_None-bw_[50-100]-max_bw_None/p_net.gml"
-p_path = "/Users/stephenreilly/Desktop/github/virne/dataset/results-visualizer/p_net.gml"
+p_path = os.path.join(root, "p_net.gml")
 physical_graph = nx.read_gml(p_path)
 physical_graph = nx.relabel_nodes(physical_graph, lambda x: str(x))
 
-SFC_FOLDER_PATH = (
-    #"/Users/stephenreilly/Desktop/github/virne/dataset/v_nets/100-[4-4]-random-500-0.04-cpu_[0-50]-bw_[0-50]/v_nets/"
-    "/Users/stephenreilly/Desktop/github/virne/dataset/results-visualizer/v_nets"
-)
+SFC_FOLDER_PATH = os.path.join(root, "v_nets") 
 
 def get_vnet_gml_path(row_index):
     return os.path.join(SFC_FOLDER_PATH, f"v_net-{row_index:05d}.gml")
@@ -61,26 +62,15 @@ current_index = 0
 # ------------------------------------------------------------------------------
 # 3) Helpers to parse CSV row data & read GML
 # ------------------------------------------------------------------------------
-def parse_graph_data(row):
-    """
-    Safely parse node_slots/link_paths, converting keys to strings.
-    """
-    node_slots_str = row.get(NODE_SLOTS_COL, None)
-    link_paths_str = row.get(LINK_PATHS_COL, None)
-
-    node_slots = ast.literal_eval(node_slots_str) if pd.notna(node_slots_str) else {}
-    link_paths = ast.literal_eval(link_paths_str) if pd.notna(link_paths_str) else {}
-
+def parse_graph_data( node_slots_str: str, link_paths_str: str) -> Tuple[Dict[str, str], Dict]:
+    node_slots = ast.literal_eval(node_slots_str) if node_slots_str else {}
+    link_paths = ast.literal_eval(link_paths_str) if link_paths_str else {}
+    
     node_slots = {str(vn): str(pn) for vn, pn in node_slots.items()}
-
     fixed_link_paths = {}
     for (vsrc, vdst), ppath in link_paths.items():
-        vsrc_str, vdst_str = str(vsrc), str(vdst)
-        ppath_strs = [str(x) for x in ppath]
-        fixed_link_paths[(vsrc_str, vdst_str)] = ppath_strs
-
+        fixed_link_paths[(str(vsrc), str(vdst))] = [str(x) for x in ppath]
     return node_slots, fixed_link_paths
-
 
 def load_vnet_demands(row_index):
     """
@@ -97,6 +87,32 @@ def load_vnet_demands(row_index):
             edge_demands[(str(u), str(v))] = dict(data)
             edge_demands[(str(v), str(u))] = dict(data)  # Undirected
     return node_demands, edge_demands
+
+
+def flatten_link_path(provided_path):
+    """
+    Converts a list of edges [(0,12), (12,17)] into a flat list of node IDs ['0', '12', '17']
+    """
+    nodes = []
+    for item in provided_path:
+        if isinstance(item, str):
+            item = item.strip()
+            if item.startswith("(") and item.endswith(")"):
+                item = item[1:-1]
+            parts = [int(x.strip()) for x in item.split(",")]
+        elif isinstance(item, (tuple, list)):
+            parts = list(map(int, item))
+        else:
+            continue
+
+        if not nodes:
+            nodes.extend(parts)
+        else:
+            nodes.append(parts[1])  # continue path
+
+    return [str(x) for x in nodes]
+
+
 
 # ------------------------------------------------------------------------------
 # 4) Compute active vNets
@@ -124,7 +140,7 @@ def compute_active_vnets_upto(index):
             arrival = round(float(row[ARRIVAL_COL]), 1)
             life = round(float(row[LIFETIME_COL]), 1)
 
-            nslots, lpaths = parse_graph_data(row)
+            nslots, lpaths = parse_graph_data( row[NODE_SLOTS_COL], row[LINK_PATHS_COL])
             active_vnets[vnet_id] = {
                 "arrival_time": arrival,
                 "lifetime": life,
@@ -301,6 +317,44 @@ def initialize_edge_bw_usage():
         key_u, key_v = sorted([int(u), int(v)])
         edge_bw_usage[(str(key_u), str(key_v))] = 0.0
     return edge_bw_usage
+
+import numpy as np  # make sure this is imported
+
+def draw_arrows_for_path(path, color, pos, node_radius=0.06):  # was 0.1 before
+    for i in range(len(path) - 1):
+        src, dst = path[i], path[i + 1]
+        if src not in pos or dst not in pos:
+            continue
+
+        p1 = np.array(pos[src])
+        p2 = np.array(pos[dst])
+        direction = p2 - p1
+        length = np.linalg.norm(direction)
+        if length == 0:
+            continue
+
+        unit = direction / length
+        offset = unit * node_radius
+
+        # Slight offset, keeps arrows long but out of boxes
+        new_start = p1 + offset
+        new_end = p2 - offset
+
+        arrow = FancyArrowPatch(
+            posA=new_start,
+            posB=new_end,
+            arrowstyle='-|>',
+            color=color,
+            alpha=0.6,
+            mutation_scale=12,
+            linewidth=2.5,
+            connectionstyle="arc3,rad=0.4",  # smooth and natural
+            zorder=4
+        )
+        ax.add_patch(arrow)
+
+
+
 # ------------------------------------------------------------------------------
 # 5) Drawing Logic
 # ------------------------------------------------------------------------------
@@ -346,10 +400,16 @@ def draw_graph(index):
 
     # Draw *all* edges first in gray, then overlay colored edges
     nx.draw_networkx_edges(physical_graph, pos, edge_color="gray", alpha=0.5, width=1.5, ax=ax)
-    for color, edge_list in edges_to_draw.items():
-        color = "lime" if color == "palegreen" else "dodgerblue"
-        nx.draw_networkx_edges(physical_graph, pos, edgelist=edge_list, edge_color= color, width=4, ax=ax)
-
+ 
+    for vnet_id, data in active_vnets.items():
+        color = "yellowgreen" if (vnet_id in newly_allocated) else "dodgerblue"
+        for (vsrc, vdst), raw_path in data["link_paths"].items():
+            try:
+                flat_path = flatten_link_path(raw_path)
+                draw_arrows_for_path(flat_path, color, pos)
+            except Exception as e:
+                print(f"[ArrowDraw] Failed to parse path ({vsrc},{vdst}): {raw_path} — {e}")
+                
     # --- Labels (COLORED BACKGROUNDS) ---
     node_labels = {n: build_physical_node_label(n, node_usage_dict, pnode_to_sfc) for n in physical_graph.nodes()}
 
@@ -396,53 +456,62 @@ def draw_graph(index):
     )
 
     # --- VNet Info Display ---
-    row = df.iloc[index]
-    if row[RESULT] == True:  # Only display if successful
+    if row[RESULT] == True:
         vnet_id = int(row[V_NET_ID])
-        node_demands, _ = load_vnet_demands(vnet_id)
+        node_demands, edge_demands = load_vnet_demands(vnet_id)
+        node_slots, link_paths = parse_graph_data( row[NODE_SLOTS_COL], row[LINK_PATHS_COL])
 
-        # Build a multi-line string. First line: vNet ID
-        lines = [f"vNet: {vnet_id}"]
+        # Make sure everything uses string vnode IDs for consistency
+        vlink_paths_by_src = defaultdict(list)
+        for (vsrc, vdst), ppath in link_paths.items():
+            vsrc_str = str(vsrc)
+            try:
+                flat_path = flatten_link_path(ppath)
+                for i in range(len(flat_path) - 1):
+                    from_node = flat_path[i]
+                    to_node = flat_path[i + 1]
+                    vlink_paths_by_src[vsrc_str].append(f"({from_node},{to_node})")
+            except Exception as e:
+                print(f"Error parsing path for ({vsrc},{vdst}): {ppath} — {e}")
 
-        # Then each virtual node on its own line
-        for v_node, demands in node_demands.items():
-            # Gather relevant demands
-            demand_strs = []
-            for resource, value in demands.items():
-                resource_lower = resource.lower()
-                # Exclude attributes you don't want to display, like 'ID', 'pos', or 'max' fields
-                if resource_lower not in ["id", "label", "pos"] and "max" not in resource_lower:
-                    try:
-                        float(value)
-                        demand_strs.append(f"{resource.upper()} {value}")
-                    except ValueError:
-                        pass
 
-            # Join the demands into something like: "CPU 30, GPU 4, ROM 2" 
-            demand_part = ", ".join(demand_strs)
-            # Add a line like "**vID 3**: CPU 30, GPU 4, ROM 2"
-            lines.append(f"vNode ID {v_node}: {demand_part}")
+        lines = [f"SFC: {vnet_id}"] 
 
-        # Combine all lines with newlines
-        vnet_info_text = "\n".join(lines)
+        vnodes = sorted(node_demands.keys(), key=int)
+
+        for i, v_node in enumerate(vnodes):
+            cpu = node_demands[v_node].get('cpu', '?')
+            
+            # Only try to get bandwidth if there is a next vNode
+            if i < len(vnodes) - 1:
+                next_v = vnodes[i + 1]
+                bw = edge_demands.get((v_node, next_v), {}).get('bw') or edge_demands.get((next_v, v_node), {}).get('bw')
+                bw_str = f"{bw}" if bw is not None else "—"
+                
+                path = link_paths.get((v_node, next_v), [])
+                path_str = f"({', '.join(path)})" if path else "—"
+            else:
+                bw_str = "—"
+                path_str = "—"
+            
+            lines.append(f"vID {v_node}: CPU {cpu}, bw→ {bw_str}, paths: {path_str}")
 
         # Place text at the bottom (y ~ 0.05) and center (x=0.5)
         # Use a partially transparent bbox so we can see the graph behind the text.
-        ax.text(
-            #0.5, 0.04,                  # X, Y in axes coordinates
-            0.7, 0.8, 
-            vnet_info_text,
+        tooltip_text = "\n".join(lines)
+
+        bbox_props = dict(boxstyle="round,pad=0.5", fc="white", ec="gray", lw=1)
+
+        # Example: place box in bottom-center with left-aligned text
+        tooltip = ax.text(
+            0.5, 0.05,  # x and y in axes fraction (0.5 = center horizontally, 0.05 = bottom)
+            tooltip_text,
             transform=ax.transAxes,
-            ha="center", 
-            va="bottom",
-            fontsize=10, 
-            family="monospace",
-            bbox=dict(
-                facecolor="white", 
-                alpha=0.8, 
-                boxstyle="round,pad=0.3", 
-                edgecolor="gray"
-            )
+            ha='left',     # << Left-align the text
+            va='bottom',   # << Keep the bottom of the box aligned
+            fontsize=10,
+            family='monospace',
+            bbox=bbox_props
         )
 
     plt.draw()
