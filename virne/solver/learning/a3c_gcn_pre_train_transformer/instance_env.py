@@ -72,7 +72,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
             # maxes out at -11.72 after 81 revokes
-            reward = -1 #+ -0.02 * revokes  # Increasing penalty per revoke step 
+            reward = -0.015 * revokes  # Increasing penalty per revoke step 
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step

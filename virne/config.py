@@ -98,8 +98,8 @@ class Config(ClassDict):
     rl_gamma: float = 0.99
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
-    lr_actor: float = 5e-5
-    lr_critic: float = 1e-4
+    lr_actor: float = 1e-4
+    lr_critic: float = 2e-4
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 

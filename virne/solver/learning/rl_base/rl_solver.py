@@ -42,6 +42,7 @@ def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interv
     config_dict['rank'] = rank
     config_dict['verbose'] = 1 if rank == 0 else 0         # Only main worker prints logs
     config_dict['open_tb'] = False                         # Disable TensorBoard in workers
+    env.worker_id = rank
 
     # --- Assign CUDA or CPU device based on rank ---
     use_cuda = config_dict.get('use_cuda', True)
@@ -401,78 +402,7 @@ class RLSolver(Solver):
                                     k=k, device=self.device,
                                     mask_actions=self.mask_actions, 
                                     maskable_policy=self.maskable_policy)
- 
-    def update_grad(self, loss):
-        """
-        Handles gradient calculation, scaling, syncing (if distributed),
-        clipping, and optimizer stepping. Uses GradScaler to support mixed precision.
-        Returns the gradient norm (before clipping) as a float. Returns 0.0 if skipped.
-        """
-        grad_norm = None  # Initialize
-
-        # --- Early exit on invalid loss ---
-        if not torch.isfinite(loss).all():
-            print(f"[Rank {getattr(self, 'rank', '?')}] ⚠️ Skipping update: non-finite loss = {loss.item()}")
-            return 0.0
-
-        # --- Distributed Training Mode ---
-        if self.distributed_training:
-            if self.shared_optimizer is None or self.shared_policy is None or self.lock is None:
-                raise RuntimeError(f"[Rank {self.rank}] Missing shared components in distributed mode.")
-
-            with self.lock:
-                # 1. Zero SHARED optimizer grads
-                self.shared_optimizer.zero_grad(set_to_none=True)
-
-                # 2. Compute scaled gradients on LOCAL model
-                self.scaler.scale(loss).backward()
-
-                # 3. Copy gradients from LOCAL -> SHARED model
-                sync_gradients(self.shared_policy, self.policy)
-
-                # 4. Optionally unscale & clip SHARED gradients
-                if self.clip_grad:
-                    self.scaler.unscale_(self.shared_optimizer)
-                    shared_grads = [p.grad for p in self.shared_policy.parameters() if p.grad is not None]
-                    grad_norm = torch.nn.utils.clip_grad_norm_(shared_grads, self.max_grad_norm) if shared_grads else torch.tensor(0.0, device=self.device)
-
-                # 5. Step SHARED optimizer
-                self.scaler.step(self.shared_optimizer)
-
-                # 6. Update scaler scale for next step
-                self.scaler.update()
-
-            # 7. Clear LOCAL grads (optional but clean)
-            self.policy.zero_grad(set_to_none=True)
-
-        # --- Local (Single GPU) Training ---
-        else:
-            if self.optimizer is None:
-                raise RuntimeError(f"[Rank {self.rank}] Missing local optimizer in non-distributed mode.")
-
-            # 1. Zero LOCAL optimizer grads
-            self.optimizer.zero_grad(set_to_none=True)
-
-            # 2. Compute scaled gradients
-            self.scaler.scale(loss).backward()
-
-            # 3. Optional unscale & clip
-            if self.clip_grad:
-                self.scaler.unscale_(self.optimizer)
-                local_grads = [p.grad for p in self.policy.parameters() if p.grad is not None]
-                grad_norm = torch.nn.utils.clip_grad_norm_(local_grads, self.max_grad_norm) if local_grads else torch.tensor(0.0, device=self.device)
-
-            # 4. Step optimizer
-            self.scaler.step(self.optimizer)
-
-            # 5. Update scaler
-            self.scaler.update()
-
-        # --- Return gradient norm as float ---
-        if isinstance(grad_norm, torch.Tensor):
-            return grad_norm.item()
-        return float(grad_norm) if grad_norm is not None else 0.0
-
+  
 
     def sync_parameters(self):
         assert self.distributed_training, 'distributed_training should be True'

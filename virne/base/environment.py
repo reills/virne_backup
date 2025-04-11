@@ -47,6 +47,8 @@ class Environment:
 
         self.extra_summary_info = {}
         self.extra_record_info = {}
+        #so files are assigned corretly
+        self.worker_id = -1
 
         self.r2c_ratio_threshold = kwargs.get('r2c_ratio_threshold', 0.0)
         self.vn_size_threshold = kwargs.get('vn_size_threshold', 10000)
@@ -106,7 +108,7 @@ class Environment:
         seed = seed if seed is not None else self.seed
 
         self.p_net = copy.deepcopy(self.init_p_net)
-        self.recorder.reset()
+        self.recorder.reset(self.worker_id)
         self.recorder.count_init_p_net_info(self.p_net)
         if self.recorder.if_temp_save_records and self.verbose >= 1:
             print(f'temp save record in {self.recorder.temp_save_path}\n')

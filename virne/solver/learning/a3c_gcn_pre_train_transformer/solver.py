@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch_geometric.data import Data, Batch
-from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence
+from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence 
 import warnings
 import copy
 
@@ -17,6 +17,7 @@ from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
 from .instance_env import InstanceEnv
 from .net import ActorCritic 
+from virne.solver.learning.rl_base.shared_adam import SharedAdam, sync_gradients
 from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2CSolver, RolloutBuffer
 from ..utils import get_pyg_data
 
@@ -139,6 +140,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         # # Retrieve pretrained RL model path (if any)
         self.rl_pretrained_path = kwargs.get("pretrained_model_path", None)
+        
+        self.grad_accum_steps = 4  # or whatever you want
+        self._grad_step = 0
         #if self.rl_pretrained_path is not None:
         #    print(f"Pretrained model path specified: {self.rl_pretrained_path}")
         #    self.load_model(self.rl_pretrained_path) # Call the inherited load_model method
@@ -162,20 +166,30 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
     def update(self):
         """
-        Update the policy using collected rollouts (A2C-style).
-        Leverages inherited update_grad for distributed synchronization.
+        Performs memory-efficient policy update using gradient accumulation.
+        Slices self.buffer into micro-batches to reduce peak GPU memory usage.
         """
-        detached_total_loss = None
-        info = {}
+        grad_accum_steps = self.grad_accum_steps
+        buffer_size = self.buffer.size()
 
-        try:
+        if buffer_size == 0:
+            return None, 0.0
+
+        micro_batch_size = buffer_size // grad_accum_steps
+        grad_clipped_value = 0.0
+        total_loss_value = 0.0
+
+        for step in range(grad_accum_steps):
+            start_idx = step * micro_batch_size
+            end_idx = (step + 1) * micro_batch_size if step < grad_accum_steps - 1 else buffer_size
+
+            obs_slice = self.buffer.observations[start_idx:end_idx]
+            actions = torch.LongTensor(self.buffer.actions[start_idx:end_idx]).to(self.device)
+            returns = torch.FloatTensor(self.buffer.returns[start_idx:end_idx]).to(self.device)
+
+            obs_tensors = self.preprocess_obs(obs_slice, self.device, pad_token=self.pad_token)
+
             with torch.amp.autocast("cuda"):
-                # === 1. Collect batch data ===
-                obs_tensors = self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)
-                actions = torch.LongTensor(self.buffer.actions).to(self.device)
-                returns = torch.FloatTensor(self.buffer.returns).to(self.device)
-
-                # === 2. Forward pass ===
                 logits = self.policy.act(obs_tensors)
                 values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
@@ -183,53 +197,93 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 action_logprobs = dist.log_prob(actions)
                 dist_entropy = dist.entropy()
 
-                # === 3. Compute advantage ===
                 advantages = returns - values.detach()
                 if self.normalize_advantage and advantages.numel() > 0:
-                    advantages_mean = advantages.mean()
-                    advantages_std = advantages.std()
-                    advantages = (advantages - advantages_mean) / (advantages_std + 1e-8)
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                # === 4. Losses ===
                 actor_loss = -(action_logprobs * advantages).mean()
                 critic_loss = F.mse_loss(returns, values)
                 entropy_loss = dist_entropy.mean()
-                # *** Use self.entropy_coef consistent with your class ***
                 total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
 
-            detached_total_loss = total_loss.item()
+                total_loss_value += total_loss.item()
 
-            # === 5. Backpropagation & Synchronization via inherited method ===
-            # *** Instead of direct backprop/step, call update_grad ***
-            grad_clipped_tensor = self.update_grad(total_loss) # This handles backprop, sync, shared step
-            grad_clipped_value = float(grad_clipped_tensor or 0.0)
+            # Accumulate gradients
+            scaled_loss = total_loss / grad_accum_steps
+            self.scaler.scale(scaled_loss).backward()
 
-
-        finally:
-            # === 7. Memory cleanup (Still important!) ===
-            try: del obs_tensors, actions, returns
-            except NameError: pass
-            try: del logits, values, dist, action_logprobs, dist_entropy
-            except NameError: pass
-            try: del advantages, actor_loss, critic_loss, entropy_loss, total_loss
-            except NameError: pass
+            # Free memory from current micro-batch
+            for var in ['obs_tensors', 'actions', 'returns', 'logits', 'values', 'dist',
+                        'action_logprobs', 'dist_entropy', 'advantages', 'actor_loss',
+                        'critic_loss', 'entropy_loss', 'total_loss']:
+                try: del locals()[var]
+                except KeyError: pass
 
             gc.collect()
             torch.cuda.empty_cache()
 
-            # === 8. Post-step housekeeping ===
-            self.buffer.clear()
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step() # Should this step based on shared optimizer? Depends.
-            self.update_time += 1 
+        # Step using accumulated gradients
+        grad_clipped_value = self.perform_accumulated_step_and_sync()
 
-            # === 9. Sync Local Policy with Shared Policy ===
-            # *** Add this call, mirroring A2CSolver ***
-            if self.distributed_training:
-                self.sync_parameters()
+        # Final cleanup and sync
+        self.buffer.clear()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+        self.update_time += 1
 
-        # Return something if needed, e.g., the detached loss
-        # return detached_total_loss
+        if self.distributed_training:
+            self.sync_parameters()
+
+        return total_loss_value / grad_accum_steps, grad_clipped_value
+
+    def perform_accumulated_step_and_sync(self):
+        """
+        Finalizes a gradient accumulation cycle by syncing gradients,
+        performing the optimizer step, updating the scaler, and zeroing gradients.
+        Assumes gradients were already computed across multiple micro-batches.
+        """
+        grad_norm = None
+
+        if self.distributed_training:
+            if self.shared_optimizer is None or self.shared_policy is None or self.lock is None:
+                raise RuntimeError(f"[Rank {self.rank}] Missing shared components in distributed mode.")
+
+            with self.lock:
+                # 1. Sync accumulated grads to shared policy
+                sync_gradients(self.shared_policy, self.policy)
+
+                # 2. Clip gradients on shared policy
+                if self.clip_grad:
+                    self.scaler.unscale_(self.shared_optimizer)
+                    shared_grads = [p.grad for p in self.shared_policy.parameters() if p.grad is not None]
+                    grad_norm = torch.nn.utils.clip_grad_norm_(shared_grads, self.max_grad_norm) if shared_grads else torch.tensor(0.0, device=self.device)
+
+                # 3. Step optimizer
+                self.scaler.step(self.shared_optimizer)
+                self.scaler.update()
+
+                # 4. Clear grads
+                self.shared_optimizer.zero_grad(set_to_none=True)
+                self.policy.zero_grad(set_to_none=True)
+
+        else:
+            if self.optimizer is None:
+                raise RuntimeError(f"[Rank {self.rank}] Missing local optimizer in non-distributed mode.")
+
+            if self.clip_grad:
+                self.scaler.unscale_(self.optimizer)
+                local_grads = [p.grad for p in self.policy.parameters() if p.grad is not None]
+                grad_norm = torch.nn.utils.clip_grad_norm_(local_grads, self.max_grad_norm) if local_grads else torch.tensor(0.0, device=self.device)
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.policy.zero_grad(set_to_none=True)
+
+        if isinstance(grad_norm, torch.Tensor):
+            return grad_norm.item()
+        return float(grad_norm or 0.0)
+    
 
     def evaluate_actions(self, obs, actions, return_others=False):
         """
@@ -386,10 +440,10 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         p_net_num_nodes=action_dim,
         p_net_feature_dim=p_dimension_features,
         v_net_feature_dim=v_dimension_features,
-        embedding_dim=100,
-        n_heads=5,
-        n_layers=4,
-        dropout=0.1,
+        embedding_dim=128,
+        n_heads=8,
+        n_layers=6,
+        dropout=0.2,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection,
         max_seq_len=max_seq_len

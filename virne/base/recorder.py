@@ -73,7 +73,7 @@ class Recorder:
                 pass
         self.reset()
 
-    def reset(self) -> None:
+    def reset(self, workerid) -> None:
         """Reset the recorder, clear the memory and the current record."""
         self.curr_record = {}
         self.memory = []
@@ -95,7 +95,7 @@ class Recorder:
             suffixes = 0
             available_fname = False
             while not available_fname:
-                temp_save_path = os.path.join(self.record_dir , f'temp-{suffixes}.csv')
+                temp_save_path = os.path.join(self.record_dir , f'temp-{suffixes}-w{workerid}.csv')
                 suffixes += 1
                 if not os.path.exists(temp_save_path):
                     available_fname = True
