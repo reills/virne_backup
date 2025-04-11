@@ -202,7 +202,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             # === 5. Backpropagation & Synchronization via inherited method ===
             # *** Instead of direct backprop/step, call update_grad ***
             grad_clipped_tensor = self.update_grad(total_loss) # This handles backprop, sync, shared step
-            grad_clipped_value = grad_clipped_tensor.item() if grad_clipped_tensor is not None else 0.0 
+            grad_clipped_value = float(grad_clipped_tensor or 0.0)
 
 
         finally:
