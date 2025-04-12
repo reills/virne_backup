@@ -209,6 +209,16 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             return None, 0.0, None, None, None
 
         micro_batch_size = buffer_size // grad_accum_steps
+        
+        all_returns = torch.FloatTensor(self.buffer.returns).to(self.device)
+        all_values = self.policy.evaluate(self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)).squeeze(-1).detach()
+        all_advantages = all_returns - all_values
+
+        if self.normalize_advantage and all_advantages.numel() > 0:
+            all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+
+        all_advantages = torch.clamp(all_advantages, -5.0, 5.0)
+
         grad_clipped_value = 0.0
         total_loss_value = 0.0
 
@@ -237,12 +247,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 action_logprobs = dist.log_prob(actions)
                 dist_entropy = dist.entropy()
 
-                advantages = returns - values.detach()
-
-                if self.normalize_advantage and advantages.numel() > 0:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                 
-                advantages = torch.clamp(advantages, -5.0, 5.0)
+                advantages = all_advantages[start_idx:end_idx]
 
                 actor_loss = -(action_logprobs * advantages).mean()
                 critic_loss = F.mse_loss(returns, values)
@@ -304,9 +309,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             with self.lock:
                 # 1. Sync accumulated grads to shared policy
                 sync_gradients(self.shared_policy, self.policy)
+                
+                # Average gradients by dividing by num_workers
+                for param in self.shared_policy.parameters():
+                    if param.grad is not None:
+                        param.grad.div_(self.num_workers)
 
                 # 2. Clip gradients on shared policy
-                grad_norm = self.clip_grads(self.policy, self.shared_optimizer)
+                grad_norm = self.clip_grads(self.shared_policy, self.shared_optimizer)
 
                 # 3. Step optimizer
                 self.optimizer_step(self.shared_optimizer) 
