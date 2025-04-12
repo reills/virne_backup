@@ -139,7 +139,8 @@ class Critic(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            is_actor=False, 
+            is_actor=False,  
+            **kwargs
         )
         self.value_head = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim // 2),

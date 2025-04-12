@@ -180,23 +180,15 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         curr_v_node_id = self.curr_v_node_id  # Property access
         current_v_idx = -1
 
-        # Step 1: Locate current vnode in the ranked list 
-        try:
-            # Ensure v_net and ranked_nodes exist before access
-            if hasattr(self.v_net, 'ranked_nodes') and curr_v_node_id < self.v_net.num_nodes:
-                 current_v_idx = self.v_net.ranked_nodes.index(curr_v_node_id)
-            # else: current_v_idx remains -1 or handle appropriately
-        except ValueError:
-            print(f"[DistanceFeature] VNF {curr_v_node_id} not in ranked_nodes.")
-        except AttributeError:
-            print("[DistanceFeature] self.v_net or ranked_nodes not available.")
-
-        # Step 2: Find physical node of previously placed VNF (if any)
+        ranked_node_array = self.v_net.ranked_nodes
+        ranked_list = list(ranked_node_array)
+        current_v_idx = ranked_list.index(curr_v_node_id)
+         
         if current_v_idx > 0:
             prev_v_node_id = self.v_net.ranked_nodes[current_v_idx - 1]
             # Ensure solution and node_slots exist
-            if hasattr(self, 'solution') and 'node_slots' in self.solution:
-                 p_prev = self.solution['node_slots'].get(prev_v_node_id, None)
+            if prev_v_node_id in self.solution['node_slots']:
+                 p_prev = prev_v_node_id 
 
         # Step 3: Compute using the instance method or fallback to zeros
         distance_feature = self._get_normalized_distance_feature(p_prev) # <<< CORRECTED CALL
