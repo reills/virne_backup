@@ -13,6 +13,7 @@ from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence
 import warnings
 import copy
 
+from contextlib import nullcontext
 from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
 from .instance_env import InstanceEnv
@@ -126,6 +127,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         obs_as_tensor_func = kwargs.pop("obs_as_tensor", obs_as_tensor )
         self.v_dimension_features = kwargs.get("v_dimension_features", None)
         self.p_dimension_features = kwargs.get("p_dimension_features", None)
+        self.use_amp =  kwargs.get("use_amp", False)
 
         A2CSolver.__init__(  self,  controller,   recorder, counter, policy_builder,   obs_as_tensor_func,  **kwargs )
         
@@ -144,8 +146,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         self.preprocess_encoder_obs = encoder_obs_to_tensor
         
         # # Retrieve pretrained RL model path (if any)
-        self.rl_pretrained_path = kwargs.get("pretrained_model_path", None)
-        
+        self.rl_pretrained_path = kwargs.get("pretrained_model_path", None) 
         self.grad_accum_steps = 4  # or whatever you want
         self._grad_step = 0
         #if self.rl_pretrained_path is not None:
@@ -168,7 +169,33 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         #          pretrained_loaded = True
                  
     # Inside A3CGcnPreTrainTransformerSolver class
+    def backward_loss(self, loss):
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
+    def optimizer_step(self, optimizer):
+        if optimizer is None:
+            raise ValueError("optimizer must be provided to optimizer_step.")
+        if self.use_amp:
+            self.scaler.step(optimizer)
+            self.scaler.update()
+        else:
+            optimizer.step()
+    
+    def clip_grads(self, model, optimizer):
+        if self.clip_grad:
+            if self.use_amp:
+                self.scaler.unscale_(optimizer)
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            return torch.nn.utils.clip_grad_norm_(grads, self.max_grad_norm) if grads else torch.tensor(0.0, device=self.device)
+        return torch.tensor(0.0, device=self.device)
+
+    def zero_grads(self, model, optimizer):
+        optimizer.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
+    
     def update(self):
         """
         Performs memory-efficient policy update using gradient accumulation.
@@ -200,7 +227,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             obs_tensors = self.preprocess_obs(obs_slice, self.device, pad_token=self.pad_token)
 
-            with torch.amp.autocast("cuda"):
+            amp_ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
+            with amp_ctx:
+                print(f"Inside AMP context: enabled = {torch.is_autocast_enabled()}")
                 logits = self.policy.act(obs_tensors)
                 values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
@@ -209,8 +238,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 dist_entropy = dist.entropy()
 
                 advantages = returns - values.detach()
+
                 if self.normalize_advantage and advantages.numel() > 0:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                 
+                advantages = torch.clamp(advantages, -5.0, 5.0)
 
                 actor_loss = -(action_logprobs * advantages).mean()
                 critic_loss = F.mse_loss(returns, values)
@@ -225,7 +257,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             # Accumulate gradients
             scaled_loss = total_loss / grad_accum_steps
-            self.scaler.scale(scaled_loss).backward()
+            self.backward_loss(scaled_loss)
 
             # Free memory from current micro-batch
             for var in ['obs_tensors', 'actions', 'returns', 'logits', 'values', 'dist',
@@ -274,32 +306,23 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 sync_gradients(self.shared_policy, self.policy)
 
                 # 2. Clip gradients on shared policy
-                if self.clip_grad:
-                    self.scaler.unscale_(self.shared_optimizer)
-                    shared_grads = [p.grad for p in self.shared_policy.parameters() if p.grad is not None]
-                    grad_norm = torch.nn.utils.clip_grad_norm_(shared_grads, self.max_grad_norm) if shared_grads else torch.tensor(0.0, device=self.device)
+                grad_norm = self.clip_grads(self.policy, self.shared_optimizer)
 
                 # 3. Step optimizer
-                self.scaler.step(self.shared_optimizer)
-                self.scaler.update()
+                self.optimizer_step(self.shared_optimizer) 
 
                 # 4. Clear grads
-                self.shared_optimizer.zero_grad(set_to_none=True)
-                self.policy.zero_grad(set_to_none=True)
+                self.zero_grads(self.policy, self.shared_optimizer)
 
         else:
             if self.optimizer is None:
                 raise RuntimeError(f"[Rank {self.rank}] Missing local optimizer in non-distributed mode.")
 
-            if self.clip_grad:
-                self.scaler.unscale_(self.optimizer)
-                local_grads = [p.grad for p in self.policy.parameters() if p.grad is not None]
-                grad_norm = torch.nn.utils.clip_grad_norm_(local_grads, self.max_grad_norm) if local_grads else torch.tensor(0.0, device=self.device)
+            grad_norm = self.clip_grads(self.policy, self.optimizer)
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.policy.zero_grad(set_to_none=True)
+            self.optimizer_step(self.optimizer)
+            
+            self.zero_grads(self.policy, self.optimizer)
 
         if isinstance(grad_norm, torch.Tensor):
             return grad_norm.item()

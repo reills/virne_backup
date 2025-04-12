@@ -325,6 +325,7 @@ class AutoregressiveDecoder(nn.Module):
 
         # === Apply Action Mask ===
         action_mask = obs['action_mask']  # (B, num_actions)
-        logits = logits.masked_fill(action_mask == 0, -1e9)
+        #logits = logits.masked_fill(action_mask == 0, -1e9) if not using amp
+        logits = logits.masked_fill(action_mask == 0, -1e4)
 
         return logits

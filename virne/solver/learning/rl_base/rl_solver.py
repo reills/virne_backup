@@ -22,6 +22,8 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from abc import abstractmethod
 
 from torch.amp import autocast, GradScaler
+from contextlib import nullcontext
+
 
 from virne.solver import Solver
 from virne.solver.heuristic.node_rank import *
@@ -148,6 +150,7 @@ class RLSolver(Solver):
         self.clip_reward = kwargs.get('clip_reward', False)
         self.clip_reward = kwargs.get('max_reward', 1.0)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.)
+        self.use_amp = kwargs.get('use_amp', False)
         self.softmax_temp = 1.
 
         print(f'save_dir: {self.save_dir}')
@@ -180,7 +183,9 @@ class RLSolver(Solver):
         ], weight_decay=self.weight_decay)
         
         self.preprocess_obs = obs_as_tensor
-        self.scaler = GradScaler()
+        
+        self.scaler = GradScaler() if self.use_amp else None 
+
 
      
     def show_config(self, ):
@@ -251,8 +256,12 @@ class RLSolver(Solver):
 
     def select_action(self, observation, sample=True, use_failure_aware=False):
         with torch.no_grad():
-            action_logits = self.policy.act(observation)
-
+            action_logits = self.policy.act(observation) 
+            if torch.isnan(action_logits).any(): 
+                print(f"Rank {self.rank} - Raw action_logits from policy: {action_logits}")
+                print(f"Rank {self.rank} - !!! NaN DETECTED in raw action_logits !!!")
+                print(f"Rank {self.rank} - Observation leading to NaN: {observation}") 
+                
             if use_failure_aware:
                 failure_scores = self.policy.actor.decoder(observation, return_last_embed="failure_score")
                 alpha = 2.0  # Tune this
@@ -439,7 +448,7 @@ class RLSolver(Solver):
             # Ensure critical ones are explicitly included or overridden
             config.update({
                 "v_dimension_features": self.v_dimension_features,
-                "p_dimension_features": self.p_dimension_features,
+                "p_dimension_features": self.p_dimension_features, 
             })
             return config
         

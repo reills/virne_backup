@@ -44,7 +44,7 @@ class Config(ClassDict):
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
     use_fixed_dataset: bool = True
-    dir_save_dataset: str = "dataset/results-sfc-trans"
+    dir_save_dataset: str = "dataset/results-3060-sfc"
 
     ### solver  ###
     solver_name: str = 'random_rank'
@@ -71,7 +71,7 @@ class Config(ClassDict):
     cuda_id: int = 0
     distributed_training: bool = True
     num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 10 #changed by me was 10
+    num_workers: int = 2 #changed by me was 10
     batch_size: int = 256 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
@@ -90,8 +90,9 @@ class Config(ClassDict):
     # lr_decay: float = 0.5      # Learning rate decay
     pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
     pretrained_loaded: bool = False
-    p_dimension_features: int = 8
+    p_dimension_features: int = 9
     v_dimension_features: int = 4
+    use_amp: bool= False
 
 
     ### Reinforcement Learning ###
@@ -175,7 +176,7 @@ class Config(ClassDict):
         print(f'='*20 + '=======================' + '='*20) if self.verbose > 0 else None
 
     def save(self, fname='config.yaml'):
-        save_dir = os.path.join(self.save_dir, self.solver_name, self.run_id)
+        save_dir = os.path.join(self.save_dir, self.solver_name )
         if not os.path.exists(save_dir): os.makedirs(save_dir)
         config_path = os.path.join(save_dir, fname)
         write_setting(vars(self), config_path)
@@ -312,7 +313,7 @@ def show_config(config):
     pprint.pprint(vars(config))
 
 def save_config(config, fname='config.yaml'):
-    save_dir = os.path.join(config.save_dir, config.solver_name, config.run_id)
+    save_dir = os.path.join(config.save_dir, config.solver_name )
     if not os.path.exists(save_dir): os.makedirs(save_dir)
     config_path = os.path.join(save_dir, fname)
     write_setting(vars(config), config_path)

@@ -17,7 +17,7 @@ from ...rank.node_rank import rank_nodes
 class RLBaseEnv(gym.Env):
 
     def __init__(self, allow_rejection=False, allow_revocable=False, **kwargs):
-        super(RLBaseEnv, self).__init__()
+        super(RLBaseEnv, self).__init__() 
         self.allow_rejection = allow_rejection
         self.allow_revocable = allow_revocable
         self.rejection_action = self.p_net.num_nodes - 1 + int(self.allow_rejection) if allow_rejection else None

@@ -29,8 +29,15 @@ pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geo
   -f https://data.pyg.org/whl/torch-2.5.1+cu118.html
 
 
+echo "set -g mouse on" >> ~/.tmux.conf
+
 echo "Launching experiment in tmux session 'train'..."
-tmux new -s train -d "source ~/.bashrc && conda activate nfv && python -m virne.main && echo 'done' > /root/training_complete.flag"
+tmux new -s train -d 
 
 echo "Started in tmux session. Run this to reattach:"
 echo "  tmux attach -t train"
+
+conda activate nfv 
+python -m virne.main 
+
+echo 'done' > /root/training_complete.flag"

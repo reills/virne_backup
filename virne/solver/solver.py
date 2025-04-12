@@ -41,10 +41,8 @@ class Solver:
         self.reusable = kwargs.get('reusable', False)
         self.verbose = kwargs.get('verbose', 1)
         self.num_arrived_v_nets = 0
-        save_dir = kwargs.get('save_dir', 'save')
-        solver_name = kwargs.get('solver_name', 'unknown_solver')
-        run_id = kwargs.get('run_id', 'unknown_host-unknown_time')
-        self.save_dir = os.path.join(save_dir, solver_name, run_id)
+        save_dir = kwargs.get('save_dir', 'save') 
+        self.save_dir = os.path.join(save_dir, "output")
         # ranking strategy
         self.node_rank = None
         self.link_rank = None
@@ -57,7 +55,7 @@ class Solver:
         self.k_shortest = kwargs.get('k_shortest', 10)
         # action
         self.allow_rejection = kwargs.get('allow_rejection', False)
-        self.allow_revocable = kwargs.get('allow_revocable', False)
+        self.allow_revocable = kwargs.get('allow_revocable', False) 
         self.basic_config = {
             'reusable': self.reusable,
             'node_ranking_method': self.node_ranking_method,
@@ -66,7 +64,7 @@ class Solver:
             'shortest_method': self.shortest_method,
             'k_shortest': self.k_shortest,
             'allow_rejection': self.allow_rejection,
-            'allow_revocable': self.allow_revocable
+            'allow_revocable': self.allow_revocable, 
         }
         set_sim_info_to_object(kwargs, self)
 

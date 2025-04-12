@@ -162,6 +162,7 @@ class InstanceAgent(object):
             epoch_logprobs_tensor = np.concatenate(epoch_logprobs, axis=0)
 
             if self.verbose > 0:
+                mean_logprob = np.nanmean(epoch_logprobs_tensor)
                 print(f"\nepoch {epoch_id:4d}, success_count {success_count:5d}, "
                     f"r2c {info['long_term_r2c_ratio']:1.4f}, "
                     f"mean logprob {epoch_logprobs_tensor.mean():2.4f}")

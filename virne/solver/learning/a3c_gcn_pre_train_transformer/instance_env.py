@@ -59,7 +59,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
             # maxes out at -11.72 after 81 revokes
-            reward = -0.015 * revokes  # Increasing penalty per revoke step 
+            reward = -1 + -0.05 * revokes  # Increasing penalty per revoke step 
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step
@@ -197,7 +197,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             if p_prev is not None:
                 print(f"Warning: Distance calc failed for p_prev={p_prev}. Using zeros.")
             distance_feature = np.zeros((self.p_net.num_nodes, 1), dtype=np.float32)
-             
+              
         # Final node feature matrix
         p_net_x = np.hstack([
             resource_features,
