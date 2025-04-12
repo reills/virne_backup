@@ -8,6 +8,8 @@ import copy
 import time
 import numpy as np
 from pprint import pprint
+import networkx as nx
+
 
 from .solution import Solution
 from virne.config import set_sim_info_to_object
@@ -53,28 +55,10 @@ class Environment:
         self.r2c_ratio_threshold = kwargs.get('r2c_ratio_threshold', 0.0)
         self.vn_size_threshold = kwargs.get('vn_size_threshold', 10000)
         set_sim_info_to_object(kwargs, self)
-
-    # @classmethod
-    # def from_config(cls, config):
-    #     """Create an environment following the settings in config."""
-    #     if not isinstance(config, dict): config = vars(config)
-    #     config = copy.deepcopy(config)
-
-    #     verbose = config.pop('verbose', 1)
-    #     p_net_setting = config.get('p_net_setting')
-    #     v_sim_setting = config.get('v_sim_setting')
-    #     p_net_dataset_dir = get_p_net_dataset_dir_from_setting(p_net_setting)
-    #     config['p_net_dataset_dir'] = p_net_dataset_dir
-    #     # create p_net and v_sim
-    #     if os.path.exists(p_net_dataset_dir):
-    #         p_net = PhysicalNetwork.load_dataset(p_net_dataset_dir)
-    #         print(f'Load Physical Network from {p_net_dataset_dir}') if verbose >= 1 else None
-    #     else:
-    #         p_net = PhysicalNetwork.from_setting(p_net_setting)
-    #         print(f'Generate Physical Network from setting') if verbose >= 1 else None
-    #     v_net_simulator = VirtualNetworkRequestSimulator.from_setting(v_sim_setting)
-    #     recorder = Recorder(**config)
-    #     return cls(p_net, v_net_simulator, controller, recorder, counter, **config)
+        
+        # <<< --- Add Initialization for Distance Feature --- >>> 
+        self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
+        self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}  
 
     def ready(self, event_id: int = 0):
         """
@@ -114,7 +98,7 @@ class Environment:
             print(f'temp save record in {self.recorder.temp_save_path}\n')
 
         self.v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(self.v_net_simulator.v_sim_setting)
-        print(f'reset vnet yeah it is actually trying to generating them from: {self.v_nets_dataset_dir }')
+        #print(f'reset vnet yeah it is actually trying to generating them from: {self.v_nets_dataset_dir }')
         #self.v_nets_dataset_dir =
         self.v_nets_dataset_dir = self.v_net_simulator.v_sim_setting.get('save_dir')
         if self.renew_v_net_simulator:
@@ -122,7 +106,7 @@ class Environment:
             print(f'Generate virtual networks with seed {seed}') if self.verbose >= 1 else None
         elif os.path.exists(self.v_nets_dataset_dir):
             self.v_net_simulator = self.v_net_simulator.load_dataset(self.v_nets_dataset_dir)
-            print(f'Load virtual networks from {self.v_nets_dataset_dir}') if self.verbose >= 1 else None
+            #print(f'Load virtual networks from {self.v_nets_dataset_dir}') if self.verbose >= 1 else None
         else: 
             self.v_net_simulator.renew(v_nets=True, events=True, seed=seed)
             print(f'\n*** Generate virtual networks with seed {seed}') if self.verbose >= 1 else None
@@ -130,7 +114,61 @@ class Environment:
         self.num_processed_v_nets = 0
         self.start_run_time = time.time()
         self.ready(event_id=0)
+        self._distance_cache.clear()
+        self._normalized_distance_vector_cache.clear()
+        
         return self.get_observation()
+
+    def _get_normalized_distance_feature(self, source_p_node_id):
+        """
+        Returns a normalized shortest-path distance vector from the given source physical node
+        to all other nodes in the physical network. Values are cached for reuse.
+        """
+        # Access diameter directly from p_net property
+        current_diameter = self.p_net.diameter # Access the cached property
+
+        if source_p_node_id is None or source_p_node_id not in self.p_net.nodes:
+            return None
+
+        # 1. Return cached normalized result if available
+        if source_p_node_id in self._normalized_distance_vector_cache:
+            return self._normalized_distance_vector_cache[source_p_node_id]
+
+        # 2. Retrieve or compute raw distances
+        if source_p_node_id in self._distance_cache:
+            dist_dict = self._distance_cache[source_p_node_id]
+        else:
+            try:
+                dist_dict = nx.single_source_shortest_path_length(self.p_net, source=source_p_node_id)
+                self._distance_cache[source_p_node_id] = dist_dict
+            except nx.NodeNotFound:
+                print(f"[Distance] Node {source_p_node_id} not found.")
+                return None
+            except Exception as e:
+                print(f"[Distance] Error computing from node {source_p_node_id}: {e}")
+                return None
+
+        # 3. Build full distance array with defaults
+        num_p_nodes = self.p_net.num_nodes
+        distances = np.full(num_p_nodes, np.inf, dtype=np.float32)
+        for target_node, dist in dist_dict.items():
+            if 0 <= target_node < num_p_nodes:
+                distances[target_node] = dist
+
+        # Ensure self-distance is zero (nx usually handles this, but good safety check)
+        if 0 <= source_p_node_id < num_p_nodes:
+            distances[source_p_node_id] = 0
+
+        # 4. Replace infinities and normalize
+        # Use the diameter obtained from self.p_net.diameter
+        distances[distances == np.inf] = current_diameter + 1.0
+        normalized = distances / max(1.0, float(current_diameter)) # Use the fetched diameter
+        normalized_vector = normalized.reshape(-1, 1)
+
+        # 5. Cache and return
+        self._normalized_distance_vector_cache[source_p_node_id] = normalized_vector
+        return normalized_vector
+ 
 
     def step(self, action):
         """

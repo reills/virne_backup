@@ -124,18 +124,23 @@ class InstanceAgent(object):
         return self.buffer
 
     def learn_singly(self, env, num_epochs=1, **kwargs): 
-
-        # main env
         for epoch_id in range(num_epochs):
-            print(f'Training Epoch: {epoch_id}') if self.verbose > 0 else None
-            self.training_epoch_id = epoch_id
+            if self.verbose > 0:
+                print(f'=============== Training Epoch: {epoch_id} ===================')
 
+            self.training_epoch_id = epoch_id
             instance = env.reset()
+
             success_count = 0
             epoch_logprobs = []
             revenue2cost_list = []
+
+            # Safe defaults in case update never happens
+            actor_loss_val = 0.0
+            critic_loss_val = 0.0
+            entropy_val = 0.0
+
             while True:
-                ### --- instance-level --- ###
                 solution, instance_buffer, last_value = self.learn_with_instance(instance)
                 epoch_logprobs += instance_buffer.logprobs
                 self.merge_instance_experience(instance, solution, instance_buffer, last_value)
@@ -143,22 +148,30 @@ class InstanceAgent(object):
                 if solution.is_feasible():
                     success_count += 1
                     revenue2cost_list.append(solution['v_net_r2c_ratio'])
-                # update parameters
-                if self.buffer.size() >= self.target_steps:
-                    loss = self.update()
 
-                instance, reward, done, info = env.step(solution) 
+                # Update when buffer is full
+                if self.buffer.size() >= self.target_steps:
+                    _, _, actor_loss_val, critic_loss_val, entropy_val = self.update()
+
+                instance, reward, done, info = env.step(solution)
                 torch.cuda.empty_cache()
 
                 if done:
                     break
-                
+
             epoch_logprobs_tensor = np.concatenate(epoch_logprobs, axis=0)
-            print(f'\nepoch {epoch_id:4d}, success_count {success_count:5d}, r2c {info["long_term_r2c_ratio"]:1.4f}, mean logprob {epoch_logprobs_tensor.mean():2.4f}') if self.verbose > 0 else None
+
+            if self.verbose > 0:
+                print(f"\nepoch {epoch_id:4d}, success_count {success_count:5d}, "
+                    f"r2c {info['long_term_r2c_ratio']:1.4f}, "
+                    f"mean logprob {epoch_logprobs_tensor.mean():2.4f}")
+                print(f"[Worker {self.rank}] epoch {epoch_id:4d} | "
+                    f"actor_loss={actor_loss_val:.4f} | "
+                    f"critic_loss={critic_loss_val:.4f} | "
+                    f"entropy={entropy_val:.4f}")
+
             if self.rank == 0:
-                # save
-                if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0: 
+                if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0:
                     self.save_model(f'model-worker{self.rank}-epoch{epoch_id}.pkl')
-                # validate
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)

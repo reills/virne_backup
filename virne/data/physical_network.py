@@ -170,6 +170,26 @@ class PhysicalNetwork(Network):
         file_path = os.path.join(dataset_dir, 'p_net.gml')
         self.to_gml(file_path)
 
+
+    @cached_property
+    def diameter(self):
+        """Calculates the diameter of the largest connected component."""
+        print("Calculating physical network diameter...") # Add logging/timing if needed
+        if not self or self.num_nodes == 0: return 1.0
+        try:
+            if nx.is_connected(self):
+                diam = float(nx.diameter(self))
+            else:
+                largest_cc = max(nx.connected_components(self), key=len)
+                subgraph = self.subgraph(largest_cc)
+                diam = float(nx.diameter(subgraph)) if subgraph.number_of_nodes() > 0 else 1.0
+                print(f"Warning: Physical network disconnected. Using diameter of largest component: {diam}")
+        except Exception as e:
+            print(f"Error calculating diameter: {e}. Using num_nodes as fallback.")
+            diam = float(self.num_nodes)
+        # Ensure diameter is at least 1 for normalization
+        return max(1.0, diam)
+
     @staticmethod
     def load_dataset(dataset_dir: str) -> 'PhysicalNetwork':
         """
@@ -192,4 +212,5 @@ class PhysicalNetwork(Network):
         p_net.node_attr_benchmarks = p_net.get_node_attr_benchmarks()
         p_net.link_attr_benchmarks = p_net.get_link_attr_benchmarks()
         p_net.link_sum_attr_benchmarks = p_net.get_link_sum_attr_benchmarks()
+        _ = p_net.diameter # Trigger calculation and caching after load
         return p_net

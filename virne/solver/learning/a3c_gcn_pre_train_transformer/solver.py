@@ -30,27 +30,31 @@ def obs_as_tensor(obs, device, pad_token=None):
         history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
         obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
         obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
-       
-        result =  {
+
+        result = {
             'p_net': obs_p_net,
             'history_actions': history_actions,
-            'edge_attr'        : obs['edge_attr'],
             'encoder_outputs': obs_encoder_outputs,
             'action_mask': obs_action_mask,
+            'curr_v_node_id': torch.tensor([obs['curr_v_node_id']], dtype=torch.long, device=device),
+            'vnfs_remaining': torch.tensor([obs['vnfs_remaining']], dtype=torch.long, device=device),
             'mask': None
         }
-        
+
         if 'rtg' in obs:
             rtg = torch.tensor(obs['rtg'], dtype=torch.float32, device=device)
-            result['rtg'] = rtg  # shape: (1, T)
-            
-        return result 
-            
+            result['rtg'] = rtg
+
+        return result
+
     elif isinstance(obs, list):
         p_net_data_list = [get_pyg_data(o['p_net_x'], o['p_net_edge_index'], o['edge_attr']) for o in obs]
         history_actions_list = [torch.LongTensor(o['history_actions']) for o in obs]
-        encoder_outputs_list = [o['encoder_outputs'] for o in obs]  
+        encoder_outputs_list = [o['encoder_outputs'] for o in obs]
         action_mask_list = [o['action_mask'] for o in obs]
+        curr_v_ids = [o['curr_v_node_id'] for o in obs]
+        vnfs_remaining = [o['vnfs_remaining'] for o in obs]
+
         obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
         hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=pad_token).to(device)
 
@@ -58,32 +62,33 @@ def obs_as_tensor(obs, device, pad_token=None):
         max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
         emb_dim = encoder_outputs_list[0].shape[2]
         enc_padded = torch.zeros((batch_size, max_seq_len, emb_dim), dtype=torch.float32, device=device)
-        
+
         for i, eo in enumerate(encoder_outputs_list):
             slen = eo.shape[1]
             enc_padded[i, :slen, :] = torch.as_tensor(eo, device=device)
-            
+
         action_mask_np = np.array(action_mask_list)
         act_mask_t = torch.as_tensor(action_mask_np, dtype=torch.float32, device=device)
-        
-        result =  {
+
+        result = {
             'p_net': obs_p_net,
             'history_actions': hist_padded,
             'encoder_outputs': enc_padded,
             'action_mask': act_mask_t,
+            'curr_v_node_id': torch.tensor(curr_v_ids, dtype=torch.long, device=device),
+            'vnfs_remaining': torch.tensor(vnfs_remaining, dtype=torch.long, device=device),
             'mask': None
         }
-        
-         
+
         if 'rtg' in obs[0]:
             rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32) for o in obs]
             padded_rtg = pad_sequence(rtg_list, batch_first=True).to(device)
-            result['rtg'] = padded_rtg  # shape: (B, T, 1) or (B, T)
-        
-        return result 
+            result['rtg'] = padded_rtg
+
+        return result
+
     else:
         raise ValueError('obs type error: expected dict or list')
-
 
 
 #for pickling and multithreading
@@ -168,16 +173,22 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """
         Performs memory-efficient policy update using gradient accumulation.
         Slices self.buffer into micro-batches to reduce peak GPU memory usage.
+        Returns averaged loss values for logging.
         """
         grad_accum_steps = self.grad_accum_steps
         buffer_size = self.buffer.size()
 
         if buffer_size == 0:
-            return None, 0.0
+            return None, 0.0, None, None, None
 
         micro_batch_size = buffer_size // grad_accum_steps
         grad_clipped_value = 0.0
         total_loss_value = 0.0
+
+        # Initialize accumulators for loss tracking
+        actor_loss_val = 0.0
+        critic_loss_val = 0.0
+        entropy_val = 0.0
 
         for step in range(grad_accum_steps):
             start_idx = step * micro_batch_size
@@ -193,7 +204,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 logits = self.policy.act(obs_tensors)
                 values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
-                dist = torch.distributions.Categorical(logits=logits)
+                dist = torch.distributions.Categorical(logits=logits, validate_args=False)
                 action_logprobs = dist.log_prob(actions)
                 dist_entropy = dist.entropy()
 
@@ -206,6 +217,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 entropy_loss = dist_entropy.mean()
                 total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
 
+                # Track summed losses for averaging
+                actor_loss_val += actor_loss.item()
+                critic_loss_val += critic_loss.item()
+                entropy_val += entropy_loss.item()
                 total_loss_value += total_loss.item()
 
             # Accumulate gradients
@@ -222,10 +237,16 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Step using accumulated gradients
+        # Average tracked values
+        actor_loss_val /= grad_accum_steps
+        critic_loss_val /= grad_accum_steps
+        entropy_val /= grad_accum_steps
+        avg_total_loss = total_loss_value / grad_accum_steps
+
+        # Optimizer step
         grad_clipped_value = self.perform_accumulated_step_and_sync()
 
-        # Final cleanup and sync
+        # Final cleanup
         self.buffer.clear()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -234,7 +255,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         if self.distributed_training:
             self.sync_parameters()
 
-        return total_loss_value / grad_accum_steps, grad_clipped_value
+        return avg_total_loss, grad_clipped_value, actor_loss_val, critic_loss_val, entropy_val
 
     def perform_accumulated_step_and_sync(self):
         """
@@ -291,7 +312,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """
         logits = self.policy.act(obs)  # Shape: (B, p_net_num_nodes)
         values = self.policy.evaluate(obs).squeeze(-1)
-        dist = Categorical(logits=logits)
+        dist = torch.distributions.Categorical(logits=logits, validate_args=False)
         action_logprobs = dist.log_prob(actions)
         dist_entropy = dist.entropy()
 
@@ -323,7 +344,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             'history_actions': np.array(final_history_actions, dtype=np.int64),
             'encoder_outputs': encoder_outputs,
             'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0),
-            'rtg': np.array(rtg, dtype=np.float32).reshape(1, -1)  # Shape: (1, T)
+            'rtg': np.array(rtg, dtype=np.float32).reshape(1, -1),
+            'curr_v_node_id': encoder_obs['curr_v_node_id'],
+            'vnfs_remaining': encoder_obs['vnfs_remaining'],
         }
         return obs
 

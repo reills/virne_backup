@@ -40,7 +40,7 @@ def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interv
 
     # --- Set worker-specific config ---
     config_dict['rank'] = rank
-    config_dict['verbose'] = 1 if rank == 0 else 0         # Only main worker prints logs
+    config_dict['verbose'] = 1 #if rank == 0 else 0         # Only main worker prints logs
     config_dict['open_tb'] = False                         # Disable TensorBoard in workers
     env.worker_id = rank
 

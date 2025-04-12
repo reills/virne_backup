@@ -71,7 +71,7 @@ class Recorder:
                 os.makedirs(self.record_dir)
             except:
                 pass
-        self.reset()
+        self.reset(-1)
 
     def reset(self, workerid) -> None:
         """Reset the recorder, clear the memory and the current record."""
@@ -267,11 +267,11 @@ class Recorder:
         
     def save_records(self, fname):
         """Save the records to a csv file."""
-        print(f"save folder: {self.record_dir}")  # Debug print
-        print(f"fname: {fname}")  # Debug print
+        #print(f"save folder: {self.record_dir}")  # Debug print
+        #print(f"fname: {fname}")  # Debug print
         save_path = os.path.join(self.record_dir, fname)
         
-        print(f"Saving records to: {save_path}")  # Debug print
+        #print(f"Saving records to: {save_path}")  # Debug print
         pd_records = pd.DataFrame(self.memory)
         pd_records.to_csv(save_path, index=False)
         try:

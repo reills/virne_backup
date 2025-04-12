@@ -82,8 +82,6 @@ class RLBaseEnv(gym.Env):
         # candidate_nodes = self.controller.find_feasible_nodes(self.p_net, self.v_net, self.curr_v_node_id, self.solution['node_slots'])
         mask = np.zeros(self.num_actions, dtype=bool)
         # add special actions
-        if self.allow_rejection:
-            candidate_nodes.append(self.rejection_action)
         if self.allow_revocable:
             if self.num_placed_v_net_nodes != 0:
                 candidate_nodes.append(self.revocable_action)
@@ -93,7 +91,9 @@ class RLBaseEnv(gym.Env):
 
             # Correct: only remove if actually present in the list
             [candidate_nodes.remove(a_id) for a_id in revoked_actions if a_id in candidate_nodes]
-
+        if self.allow_rejection:
+            candidate_nodes.append(self.rejection_action)
+            
         mask[candidate_nodes] = True
         # if mask.sum() == 0: 
             # mask[0] = True

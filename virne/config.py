@@ -72,7 +72,7 @@ class Config(ClassDict):
     distributed_training: bool = True
     num_train_epochs: int = 100 #changed by me was 100
     num_workers: int = 4 #changed by me was 10
-    batch_size: int = 64 # changed by me was 128
+    batch_size: int = 128 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
@@ -90,8 +90,8 @@ class Config(ClassDict):
     # lr_decay: float = 0.5      # Learning rate decay
     pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
     pretrained_loaded: bool = False
-    p_dimension_features: int = 12
-    v_dimension_features: int = 6
+    p_dimension_features: int = 8
+    v_dimension_features: int = 4
 
 
     ### Reinforcement Learning ###
@@ -99,7 +99,7 @@ class Config(ClassDict):
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
     lr_actor: float = 1e-4
-    lr_critic: float = 2e-4
+    lr_critic: float = 5e-4
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 

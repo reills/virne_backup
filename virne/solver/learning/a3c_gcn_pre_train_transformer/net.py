@@ -101,7 +101,7 @@ class Encoder(nn.Module):
 
     def forward(self, x):  # x: [B, T, F]
         B, T, _ = x.size()
-        positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  # [B, T]
+        positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  # [B, T] 
         x = self.token_embed(x) + self.position_embed(positions)               # [B, T, E]
         x = self.transformer_encoder(x)
         return self.norm(x)  # Optional final norm for stabilization
@@ -111,9 +111,7 @@ class Actor(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
-        # Retrieve special action flags from kwargs
-        allow_revocable = kwargs.get("allow_revocable", False)
-        allow_rejection = kwargs.get("allow_rejection", False)
+        # Retrieve special action flags from kwargs 
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -122,8 +120,7 @@ class Actor(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             is_actor=True, 
-            allow_revocable=allow_revocable,
-            allow_rejection=allow_rejection
+            **kwargs
         )
 
     def forward(self, obs):
@@ -134,9 +131,7 @@ class Critic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
-        # Retrieve special action flags from kwargs
-        allow_revocable = kwargs.get("allow_revocable", False)
-        allow_rejection = kwargs.get("allow_rejection", False)
+        # Retrieve special action flags from kwargs 
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -144,9 +139,7 @@ class Critic(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            is_actor=False,
-            allow_revocable=allow_revocable,      # ← pass these through
-            allow_rejection=allow_rejection
+            is_actor=False, 
         )
         self.value_head = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim // 2),
@@ -166,7 +159,7 @@ class AutoregressiveDecoder(nn.Module):
     """
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, is_actor=True,
-                 allow_revocable=False, allow_rejection=False):
+                 allow_revocable=False, allow_rejection=False, max_seq_len=15):
         super().__init__()
         self.embedding_dim = embedding_dim
         
@@ -179,6 +172,12 @@ class AutoregressiveDecoder(nn.Module):
         # Embeddings
         self.rtg_embed = nn.Linear(1, embedding_dim)  # Embeds return-to-go scalar
         self.token_embed = nn.Embedding(self.vocab_size, embedding_dim)  # Embeds action tokens
+        
+        # *** NEW: Context Embeddings ***
+        # max_seq_len determines max curr_v_node_id (0 to max_seq_len-1)
+        self.step_embedding = nn.Embedding(max_seq_len, embedding_dim)
+        # Size needs to be max_seq_len + 1 to accommodate value 0 to max_seq_len
+        self.remaining_embedding = nn.Embedding(max_seq_len + 1, embedding_dim)
 
         # Graph Attention Network (GAT) for physical network feature extraction
         self.gat_layers = nn.ModuleList([
@@ -220,81 +219,80 @@ class AutoregressiveDecoder(nn.Module):
                 nn.Linear(embedding_dim, self.num_actions)
             )
         else:
-            self.output_head = nn.Identity()  # Critic uses external value head
+            pass
+        
+        # --- Initialization --- 
+        nn.init.xavier_uniform_(self.step_embedding.weight)
+        nn.init.xavier_uniform_(self.remaining_embedding.weight)
 
-    def forward(self, obs, return_last_embed=False ):
-        """Forward pass for the autoregressive decoder. 
-        Args:
-            obs (dict): Observation containing physical network, history actions, encoder outputs, and RTG.
-            return_last_embed (bool): If True, returns the last decoder embedding for critic.
-            return_failure_pred (bool): If True, returns logits for failure prediction (unused). 
-        Returns:
-            torch.Tensor: Action logits (B, num_actions) or last embedding (B, E) based on flags.
-        """
-        # Extract physical network features
+    def forward(self, obs, return_last_embed=False):
+        """Forward pass for the autoregressive decoder."""
+        
+        # === GAT: Physical Node Embedding ===
         batch_p_net = obs['p_net']
         node_features = batch_p_net.x
         edge_index = batch_p_net.edge_index
         edge_attr = batch_p_net.edge_attr
 
-        # Process graph with GAT layers
-        edge_embeddings = []
         for gat_layer in self.gat_layers:
-            node_features, edge_features = gat_layer(node_features, edge_index, edge_attr)
-            edge_embeddings.append(edge_features)
+            node_features, _ = gat_layer(node_features, edge_index, edge_attr)
 
-        # Project node features and reshape
-        graph_embedding = self.gat_projection(node_features) 
- 
-        # Embed history actions
-        history_actions = obs['history_actions']  # Shape: (B, T)
-        assert history_actions.max().item() < self.token_embed.num_embeddings, (
-            f"Invalid action index {history_actions.max().item()} for embedding size "
-            f"{self.token_embed.num_embeddings}"
-        )
-        action_embeddings = self.token_embed(history_actions)  # Shape: (B, T, E)
+        graph_embedding = self.gat_projection(node_features)  # (TotalNodes, E)
 
-        # Add return-to-go (RTG) conditioning
+        # === Sequence Embedding ===
+        history_actions = obs['history_actions']  # (B, T)
+        action_embeddings = self.token_embed(history_actions)  # (B, T, E)
+
         if 'rtg' not in obs:
             raise ValueError("Observation missing 'rtg' key")
-        rtg = obs['rtg']  # Shape: (B, T, 1) or (B, T)
+        rtg = obs['rtg']
         if rtg.dim() == 2:
             rtg = rtg.unsqueeze(-1)
-        rtg_embedding = self.rtg_embed(rtg)  # Shape: (B, T, E)
+        rtg_embedding = self.rtg_embed(rtg)  # (B, T, E)
 
-        # Combine action and RTG embeddings
-        combined_target = action_embeddings + rtg_embedding  # Shape: (B, T, E)
+        combined_target = action_embeddings + rtg_embedding  # (B, T, E)
 
-        # Create causal and padding masks
+        # === Transformer Decoder ===
         batch_size, seq_len = history_actions.shape
         causal_mask = torch.triu(
             torch.ones(seq_len, seq_len, device=history_actions.device), diagonal=1
         ).bool()
         padding_mask = (history_actions == self.pad_token)
 
-        # Decode with transformer
         decoder_output = self.transformer_decoder(
             tgt=combined_target,
-            memory=obs['encoder_outputs'],
+            memory=obs['encoder_outputs'],  # from encoder
             tgt_mask=causal_mask,
             tgt_key_padding_mask=padding_mask
-        )  # Shape: (B, T, E)
+        )  # (B, T, E)
 
-        # Extract last time step for output
-        last_decoder_output = decoder_output[:, -1, :]  # Shape: (B, E)
-        
-        # === EARLY EXIT FOR CRITIC ===
+        last_decoder_output = decoder_output[:, -1, :]  # (B, E)
+
+        # === Context Embedding: curr_v_node_id & vnfs_remaining ===
+        if 'curr_v_node_id' not in obs:
+            raise ValueError("Observation missing 'curr_v_node_id'")
+        if 'vnfs_remaining' not in obs:
+            raise ValueError("Observation missing 'vnfs_remaining'")
+
+        curr_v_ids = torch.clamp(obs['curr_v_node_id'], 0, self.step_embedding.num_embeddings - 1)
+        remaining_ids = torch.clamp(obs['vnfs_remaining'], 0, self.remaining_embedding.num_embeddings - 1)
+
+        step_emb = self.step_embedding(curr_v_ids)          # (B, E)
+        remaining_emb = self.remaining_embedding(remaining_ids)  # (B, E)
+
+        # Final context representation
+        contextualized_last_output = last_decoder_output + step_emb + remaining_emb
+        final_context_embedding = self.norm(contextualized_last_output)  # (B, E)
+
+        # === Return for Critic ===
         if return_last_embed or not self.is_actor:
-            #print("early critic exit!!!!!!!!!!!!!")
-            return self.norm(last_decoder_output)
-        # =============================
+            return final_context_embedding
 
-        # node_embeddings = graph_embedding from GAT (TotalNodes, E)
-        node_batch = batch_p_net.batch  # shape: (TotalNodes,)
+        # === Actor Path: Cross-Attention over Nodes ===
+        node_batch = batch_p_net.batch  # (TotalNodes,)
         B = batch_p_net.num_graphs
-
-        # Reshape to group node embeddings per graph
         max_nodes = scatter(torch.ones_like(node_batch), node_batch, dim=0, reduce='sum').max().item()
+
         padded_nodes = torch.zeros(B, max_nodes, self.embedding_dim, device=graph_embedding.device)
         padding_mask = torch.ones(B, max_nodes, dtype=torch.bool, device=graph_embedding.device)
 
@@ -303,21 +301,19 @@ class AutoregressiveDecoder(nn.Module):
             padded_nodes[i, :len(idxs)] = graph_embedding[idxs]
             padding_mask[i, :len(idxs)] = False
 
-        # Transpose to match attention input: (Seq, B, E)
         key = value = padded_nodes.transpose(0, 1)  # (N_max, B, E)
-        query = last_decoder_output.unsqueeze(0)    # (1, B, E)
+        query = final_context_embedding.unsqueeze(0)  # (1, B, E)
 
         attn_output, _ = self.node_cross_attention(
             query=query, key=key, value=value,
             key_padding_mask=padding_mask
-        )  # Output: (1, B, E)
+        )  # (1, B, E)
 
         attn_context = attn_output.squeeze(0)  # (B, E)
 
-        # Broadcast attended context to each node
+        # === Combine per-node embeddings with context ===
         attn_context_per_node = attn_context[node_batch]  # (TotalNodes, E)
 
-        # Combine: Node state + decoder context (from attention)
         combined = torch.cat([
             F.normalize(graph_embedding, dim=-1),
             F.normalize(attn_context_per_node, dim=-1)
@@ -325,6 +321,9 @@ class AutoregressiveDecoder(nn.Module):
 
         logits_per_node = self.output_head(combined)  # (TotalNodes, num_actions)
         logits = scatter(logits_per_node, node_batch, dim=0, reduce='mean')  # (B, num_actions)
-        logits = torch.clamp(logits, min=-1e9, max=1e9)
- 
+
+        # === Apply Action Mask ===
+        action_mask = obs['action_mask']  # (B, num_actions)
+        logits = logits.masked_fill(action_mask == 0, -1e9)
+
         return logits
