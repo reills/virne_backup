@@ -256,7 +256,6 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             return None, 0.0, None, None, None
 
         micro_batch_size = buffer_size // grad_accum_steps
-
         all_returns = torch.FloatTensor(self.buffer.returns).to(self.device)
         all_values = self.policy.evaluate(self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)).squeeze(-1).detach()
         all_advantages = all_returns - all_values
