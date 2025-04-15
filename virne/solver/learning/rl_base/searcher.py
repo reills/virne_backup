@@ -88,6 +88,7 @@ def greedy_search_solution(
         mask_actions=True, 
         maskable_policy=True
     ):
+    #obs = instance_env.get_observation()
     obs = instance_env.get_observation()
     done = False
     while not done:

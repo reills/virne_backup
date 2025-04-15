@@ -27,11 +27,13 @@ class Actor(nn.Module):
     def __init__(self, feature_dim, action_dim, embedding_dim=64):
         super(Actor, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
+            nn.Linear(feature_dim, 180),
             nn.ReLU(),
-            nn.Linear(feature_dim, action_dim),
-            nn.ReLU(),
-            nn.Linear(action_dim, action_dim)
+            nn.Linear(180, 151),
+            nn.Tanh(),
+            nn.Linear(151, 127),
+            nn.Tanh(),
+            nn.Linear(127, action_dim)
         )
         # n_mid_channcels = action_dim * 2
         # self.net = nn.Sequential(
@@ -63,11 +65,13 @@ class Critic(nn.Module):
     def __init__(self, feature_dim, action_dim, embedding_dim=64):
         super(Critic, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
+            nn.Linear(feature_dim, 180),
             nn.ReLU(),
-            nn.Linear(feature_dim, action_dim),
-            nn.ReLU(),
-            nn.Linear(action_dim, 1)
+            nn.Linear(180, 151),
+            nn.Tanh(),
+            nn.Linear(151, 127),
+            nn.Tanh(),
+            nn.Linear(127, 1)  # <- not action_dim
         )
         
     def forward(self, obs):

@@ -20,46 +20,53 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         num_p_net_features = num_p_net_node_attrs + 1
         self.pad_token = kwargs.get("pad_token", None) 
         self.max_revokes=8
+        self.calcuate_graph_metrics()
 
-    def get_observation(self):
+
+    def get_observation(self ):
         """
-        Returns the observation as a dictionary containing:
-            - p_net_x and its edge index and edge attributes.
-            - v_net_x and its edge index.
-            - action_mask and history_actions. 
+        Returns the observation as a dictionary.
+        If a transformer policy is provided, injects encoder_outputs.
         """
         p_net_obs = self._get_p_net_obs()
         v_net_obs = self._get_v_net_obs()
         history_actions = self.get_history_actions()
-        return {
-            'p_net_x': p_net_obs['x'], 
+
+        obs = {
+            'p_net_x': p_net_obs['x'],
             'p_net_edge_index': p_net_obs['edge_index'],
             'edge_attr': p_net_obs['edge_attr'],
             'v_net_x': v_net_obs['x'],
             'v_net_edge_index': v_net_obs['edge_index'],
             'action_mask': self.generate_action_mask(),
             'history_actions': history_actions,
-            'curr_v_node_id': self.curr_v_node_id, # Index of VNF being placed
+            'curr_v_node_id': self.curr_v_node_id,
             'vnfs_remaining': self.v_net.num_nodes - self.curr_v_node_id,
         }
 
+        return obs
+
+ 
+ 
+
+    
     def compute_reward(self, solution, revoke=False):
         """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
 
         vnodes = self.v_net.num_nodes            # Typically 8
         self.max_revokes = vnodes * 8
-        value = solution['v_net_r2c_ratio'] * 20
+        value = solution['v_net_r2c_ratio'] * 5
         completion_pct = (solution['num_placed_nodes'] or 0) / vnodes
         revokes = solution['revoke_times']
         revoke_pct = revokes / max(1, self.max_revokes)
 
         # Case 1: Early rejection — should almost never happen, very bad
         if solution['early_rejection']: 
-            reward = -30.0  # more punishing for not even trying to place
+            reward = -4  # more punishing for not even trying to place
         # Case 2: Revoke was taken — penalize each time it happens
         elif revoke:
             # maxes out at -11.72 after 81 revokes
-            reward = -1 + -0.05 * revokes  # Increasing penalty per revoke step 
+            reward =  -0.01 * revokes  # Increasing penalty per revoke step 
         # Case 3: Final step of a full success — high reward, scaled with revoke penalty
         elif solution['result']:
             # This will be called once at the last vnode placement step
@@ -71,15 +78,16 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             completion_reward = (completion_pct/vnodes)
             penalty = completion_reward * revoke_pct
             bonus = completion_reward - penalty
-            reward = (value*completion_reward) + bonus
+            reward = .1
         # Case 5: All nodes placed and routing failure or place failure
         else:
             #technically if revoked is enabled this will never hit because revoke will just call reject (revoke=true) when it hits max revokes
-            reward = -3  # Large negative signal 
+            reward = -1  # Large negative signal 
     
         self.solution['v_net_reward'] += reward
         return reward
-
+     
+    
     def _get_v_net_obs(self):
         """
         Construct virtual network observation matrix with:

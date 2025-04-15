@@ -11,6 +11,7 @@ from torch_geometric.data import Data, Batch
 from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence
 import warnings
 import copy
+from torch.nn.utils.rnn import pad_sequence
 
 from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
@@ -165,7 +166,7 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
         sub_env = self.InstanceEnv(
             p_net, v_net, self.controller, self.recorder, self.counter,
             global_history=self.global_history,  # <- add this!
-            start_token=self.policy.actor.decoder.num_actions,
+            start_token=100,
             **self.basic_config
         )
 
@@ -173,15 +174,27 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
 
         p_net_x = torch.tensor(obs['p_net_x'], dtype=torch.float32, device=self.device)
         p_edge_index = torch.tensor(obs['p_net_edge_index'], dtype=torch.long, device=self.device)
-        v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=self.device).unsqueeze(0)  # add batch dim
+        # Convert to tensor and pad to batch shape (1, L, F)
+        vnet_list = [torch.tensor(obs['v_net_x'], dtype=torch.float32, device=self.device)]
+        v_net_x, attn_mask = pad_vnet_batch(vnet_list)
+
         edge_attr = torch.tensor(obs['edge_attr'], dtype=torch.float32, device=self.device)
-        history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=self.device).unsqueeze(0)  
+        history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=self.device)
 
 
         self.policy.eval()
         with torch.no_grad():
-            logits = self.policy(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions)
-            actions = torch.argmax(logits, dim=-1).tolist()          # list of 8 placements
+            logits = self.policy(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions, attn_mask)
+
+            # ==== INSERT MASKING HERE ====
+            action_mask = torch.tensor(obs['action_mask'], dtype=torch.bool, device=self.device)  # (L, N)
+            if action_mask.shape != logits.shape:
+                raise ValueError(f"Mask shape {action_mask.shape} does not match logits {logits.shape}")
+
+            logits = logits.masked_fill(~action_mask, float('-inf'))  # Mask out invalid actions
+
+            # ==== SELECT VALID ACTIONS ====
+            actions = torch.argmax(logits, dim=-1).tolist()  # List of L placements
 
         node_slots = {i: a for i, a in enumerate(actions)}
         solution = Solution(v_net)
@@ -207,23 +220,24 @@ class A3CGcnOneshotTransformerSolver(InstanceAgent, A2CSolver):
 
         p_net_x = torch.tensor(obs['p_net_x'], dtype=torch.float32, device=self.device)
         p_edge_index = torch.tensor(obs['p_net_edge_index'], dtype=torch.long, device=self.device)
-        v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, 8, F)
+        # Convert to tensor and pad to batch shape (1, L, F)
+        vnet_list = [torch.tensor(obs['v_net_x'], dtype=torch.float32, device=self.device)]
+        v_net_x, attn_mask = pad_vnet_batch(vnet_list)
+
         edge_attr = torch.tensor(obs['edge_attr'], dtype=torch.float32, device=self.device)
-        history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=self.device).unsqueeze(0)  
+        history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=self.device)  
 
         self.policy.train()
-        logits = self.policy(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions)
-        value = self.policy.evaluate(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions)
+        logits = self.policy(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions, attn_mask)
+
+        value = self.policy.evaluate(p_net_x, p_edge_index, edge_attr, v_net_x, history_actions, attn_mask)
 
         dist = Categorical(logits=logits)
         actions = dist.sample()
         logprobs = dist.log_prob(actions)
         
-        print("actions shape:", actions.shape)
-        print("actions raw:", actions)
-        print("actions.tolist():", actions.tolist())
         actions = actions.squeeze(0)  # from shape [1, 8] → [8]
-        node_slots = {i: int(a) for i, a in enumerate(actions.tolist())}
+        node_slots = dict(enumerate(actions))
         solution = Solution(v_net)
         
         self.controller.deploy_with_node_slots(v_net, p_net, node_slots, solution)
@@ -276,11 +290,20 @@ def encoder_obs_to_tensor(obs, device):
     else:
         raise Exception(f"Unrecognized type of observation {type(obs)}")
 
+def pad_vnet_batch(vnet_list):
+    lengths = [v.shape[0] for v in vnet_list]  # [L1, L2, ...]
+    padded = pad_sequence(vnet_list, batch_first=True)  # (B, L_max, F)
+    attention_mask = torch.zeros(padded.shape[:2], dtype=torch.bool, device=padded.device)  # Move to same device
+    for i, l in enumerate(lengths):
+        attention_mask[i, :l] = 1
+    return padded, attention_mask
+
 
 def obs_as_tensor(obs, device):
     data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'], obs['edge_attr'])
     obs_p_net = Batch.from_data_list([data]).to(device)
-    history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
+    history_actions = torch.tensor(obs['history_actions'], dtype=torch.long, device=device)
+    # No need to unsqueeze!
     obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
     obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
     return {

@@ -44,7 +44,7 @@ class Config(ClassDict):
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
     use_fixed_dataset: bool = True
-    dir_save_dataset: str = "dataset/results-3060-sfc"
+    dir_save_dataset: str = "dataset/results-sfc-trans"
 
     ### solver  ###
     solver_name: str = 'random_rank'
@@ -71,12 +71,12 @@ class Config(ClassDict):
     cuda_id: int = 0
     distributed_training: bool = True
     num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 2 #changed by me was 10
+    num_workers: int = 10 #changed by me was 10
     batch_size: int = 256 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
-    eval_interval: int = 120 #changed was 10
+    eval_interval: int = 400 #changed was 10
 
     ### Neural Network ###
     embedding_dim: int = 128   # Embedding dimension
@@ -99,14 +99,14 @@ class Config(ClassDict):
     rl_gamma: float = 0.99
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
-    lr_actor: float = 1e-4
-    lr_critic: float = 5e-4
+    lr_actor: float = 5e-5
+    lr_critic: float = 5e-5
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 
     ### Loss ###
     coef_critic_loss: float = 0.5
-    coef_entropy_loss: float = 0.5
+    coef_entropy_loss: float = 0.01
     coef_mask_loss: float = 0.01
     reward_weight: float = 0.5
 

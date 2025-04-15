@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GENConv
 
+
 class MultiHeadGENLayer(nn.Module):
     def __init__(self, in_dim, out_dim, edge_dim=2, aggr='softmax'):
         super().__init__()
@@ -63,21 +64,27 @@ class BatchPlacementNet(nn.Module):
             nn.Linear(embedding_dim, 1)
         )
 
-    def forward(self, p_net_x, p_edge_index, edge_attr, v_net_x, history_actions):
+    def forward(self, p_net_x, p_edge_index, edge_attr, v_net_x, history_actions, attn_mask=None):
+
         B = v_net_x.size(0)
 
         # Encode physical network
         p_emb = self.gat(p_net_x, p_edge_index, edge_attr)       # (N_p, 1024)
         p_global = p_emb.mean(dim=0, keepdim=True)               # (1, 1024)
-        p_repeated = p_global.unsqueeze(1).expand(B, 8, -1)      # (B, 8, 1024)
+        L = v_net_x.size(1)
+        p_repeated = p_global.unsqueeze(1).expand(B, L, -1)
 
         # Encode virtual network
         v_emb = self.v_emb(v_net_x)                              # (B, 8, 128)
-        v_encoded = self.v_encoder(v_emb)                        # (B, 8, 128)
+        v_encoded = self.v_encoder(v_emb, src_key_padding_mask=~attn_mask)  # invert mask for transformer
+          # (B, 8, 128)
 
         # History encoding
         hist_emb = self.action_embed(history_actions)            # (B, 8, window, 128)
         hist_context = hist_emb.mean(dim=2)                      # (B, 8, 128)
+        print("v_encoded shape:", v_encoded.shape)
+        print("p_repeated shape:", p_repeated.shape)
+        print("hist_context shape:", hist_context.shape)
 
         # Concatenate all
         #print(f"v_encoded.shape = {v_encoded.shape}")
@@ -89,7 +96,7 @@ class BatchPlacementNet(nn.Module):
         return logits
 
 
-    def evaluate(self, p_net_x, p_edge_index, edge_attr, v_net_x, history_actions):
+    def evaluate(self, p_net_x, p_edge_index, edge_attr, v_net_x, history_actions, attn_mask=None):
         B = v_net_x.size(0)
 
         # Physical encoding
@@ -99,14 +106,17 @@ class BatchPlacementNet(nn.Module):
 
         # Virtual encoding
         v_emb = self.v_emb(v_net_x)                    # (B, 8, emb) -> (B, 8, 128)
-        v_encoded = self.v_encoder(v_emb)              # (B, 8, emb) -> (B, 8, 128)
-        v_global = v_encoded.mean(dim=1)               # (B, emb) -> (B, 128)
+        v_encoded = self.v_encoder(v_emb, src_key_padding_mask=~attn_mask)
+        v_global = (v_encoded * attn_mask.unsqueeze(-1)).sum(dim=1) / attn_mask.sum(dim=1, keepdim=True)
+        
+        v_global = (v_encoded * attn_mask.unsqueeze(-1)).sum(dim=1) / attn_mask.sum(dim=1, keepdim=True)
+
             
             
         # History encoding
-        hist_emb = self.action_embed(history_actions)       # (B, 8, window_size, emb)
-        hist_context = hist_emb.mean(dim=2)                 # (B, 8, emb)
-        hist_global = hist_context.mean(dim=1)              # (B, emb)
+        hist_emb = self.action_embed(history_actions)       # (B, 8, window_size, emb) 
+        hist_context = self.action_embed(history_actions).mean(dim=2)
+        hist_global = (hist_context * attn_mask.unsqueeze(-1)).sum(dim=1) / attn_mask.sum(dim=1, keepdim=True)
 
 
         # Combine for value prediction

@@ -47,13 +47,16 @@ class SharedAdam(torch.optim.Adam):
 
 
 def sync_gradients(shared_model, local_model):
-    for (shared_name, shared_param), (local_name, local_param) in zip(shared_model.named_parameters(), local_model.named_parameters()):
-        try:
-            shared_param._grad = local_param.grad.clone().to(shared_param.device)
-        except:
-            # print('Warning: No gradient!', shared_name, type(shared_param), local_name, type(local_param))
-            pass
-
+    for (shared_name, shared_param), (local_name, local_param) in zip(
+        shared_model.named_parameters(), local_model.named_parameters()
+    ):
+        if local_param.grad is not None:
+            if shared_param.grad is None:
+                # First contribution: clone the grad
+                shared_param.grad = local_param.grad.clone().to(shared_param.device)
+            else:
+                # Add the grad from this worker to the existing shared gradient
+                shared_param.grad += local_param.grad.to(shared_param.device)
 
 
 

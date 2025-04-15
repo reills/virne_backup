@@ -174,8 +174,8 @@ class RLSolver(Solver):
         
         # optimizer
         self.make_policy = make_policy
-        self.policy = self.make_policy(self) #change now make+policy doesn't return an optimizer!? 
-        
+        self.policy  = self.make_policy(self) #change now make+policy doesn't return an optimizer!? 
+         
         self.optimizer = torch.optim.Adam([
             {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor}, # Use self.lr_actor
             {'params': self.policy.actor.parameters(),   'lr': self.lr_actor}, # Use self.lr_actor

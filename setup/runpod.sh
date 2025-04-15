@@ -38,6 +38,6 @@ echo "Started in tmux session. Run this to reattach:"
 echo "  tmux attach -t train"
 
 conda activate nfv 
-python -m virne.main 
+#python -m virne.main 
 
-echo 'done' > /root/training_complete.flag"
+#echo 'done' > /root/training_complete.flag"

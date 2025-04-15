@@ -8,9 +8,7 @@ import warnings
 import torch
 from gym import spaces
 from virne.solver.learning.rl_base import JointPRStepInstanceRLEnv, PlaceStepInstanceRLEnv
-
-_norm_vector_p = None
-_norm_vector_v = None
+ 
 class InstanceEnv(JointPRStepInstanceRLEnv):
 
     def __init__(self, p_net, v_net, controller, recorder, counter, global_history, **kwargs):
@@ -19,34 +17,11 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         num_p_net_link_attrs = len(self.p_net.get_link_attrs(['resource', 'extrema']))
         num_p_net_features = num_p_net_node_attrs + 1
         self.window_size=100
-        self.global_history = global_history
-        # Use module-level cache
-        global _norm_vector_p, _norm_vector_v
-        # Set normalization paths
-        dataset_path = "/home/stephen-reilly/dev/virne/dataset/training-data/merged_training_data.pt"
-        #dataset_path = "/Users/stephenreilly/Desktop/github/virne/virne/solver/learning/a3c_gcn_pre_train_transformer/merged_training_data.pt"
-        if _norm_vector_p is None or _norm_vector_v is None:
-            print("Loading normalization vectors...")
+        self.global_history = global_history  
+        self.pad_token = kwargs.get("pad_token", None) 
+        self.max_revokes=8
+        self.calcuate_graph_metrics()
 
-            if os.path.exists(dataset_path):
-                print(f"Computing normalization vectors from: {dataset_path}")
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-                    data = torch.load(dataset_path)
-
-                # Expect each item in data to be a dict with 'p_net_x' and 'v_net_x' 
-                p_samples = torch.cat([s['p_net_x'].clone().detach() for s in data], dim=0)
-                v_samples = torch.cat([s['v_net_x'].clone().detach() for s in data], dim=0)
-
-                _norm_vector_p = torch.max(p_samples, dim=0)[0].float()
-                _norm_vector_v = torch.max(v_samples, dim=0)[0].float()
-                print("Normalization vectors computed.")
-            else:
-                raise FileNotFoundError(f"No pretrained dataset found.\n"
-                                        f"Expected one of:\n  {dataset_path}")
-
-        self.norm_vector_p = _norm_vector_p
-        self.norm_vector_v = _norm_vector_v
     
     def compute_reward(self, solution):
         """Reward function for one-shot VNet deployment."""
@@ -95,180 +70,139 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
     def _get_v_net_obs(self):
         """
-        Build v_net_x with four components:
-        1. Resource features from the virtual network (using obs_handler)
-        2. Virtual node degrees (computed using obs_handler)
-        3. Virtual total capacity (sum of resource features)
-        4. Total required bandwidth (sum of bandwidth demands from connected edges)
-        5. Betweenness centrality
-        6. Bandwidth variance
+        Construct virtual network observation matrix with:
+        - Node resource features (normalized)
+        - Aggregated link bandwidth per node (normalized)
+        - Edge index for GNN input
         """
         if self.curr_v_node_id >= self.v_net.num_nodes:
-            return {'x': np.empty((0, 4), dtype=np.float32)}
-        
-        # Resource features
-        resource_features = self.obs_handler.get_node_attrs_obs(
+            return {
+                'x': np.empty((0, 0), dtype=np.float32),
+                'edge_index': np.empty((2, 0), dtype=np.int64)
+            }
+
+        # 1. Node resource features (e.g., CPU, RAM), already normalized
+        node_data = self.obs_handler.get_node_attrs_obs(
             self.v_net, 
             node_attr_types=['resource'], 
             node_attr_benchmarks=self.node_attr_benchmarks
         )
         
-        # Virtual node degrees
-        degrees = self.obs_handler.get_node_degree_obs(
+        # 2. Aggregated bandwidth from adjacent virtual links (normalized)
+        edge_bw_agg = self.obs_handler.get_link_aggr_attrs_obs(
             self.v_net, 
-            self.obs_handler.get_degree_benchmark(self.v_net)
+            link_attr_types=['resource'], 
+            aggr='sum', 
+            link_sum_attr_benchmarks=self.link_sum_attr_benchmarks
         )
-        
-        # Total capacity
-        total_capacity = np.sum(resource_features, axis=1, keepdims=True)
-        
-        # Total required bandwidth (sum of 'bw' demands from connected edges)
-        # Get edge demands similar to load_vnet_demands
-        edge_demands = {
-            tuple(sorted([str(u), str(v)])): float(data.get('bw', 0.0))
-            for u, v, data in self.v_net.edges(data=True)
-        }
-        v_nodes = list(self.v_net.nodes())
-        v_bw_agg = np.array([
-            sum(edge_demands.get(tuple(sorted([str(v), str(adj)])), 0.0) 
-                for adj in self.v_net.adj[v])
-            for v in v_nodes
-        ]).reshape(-1, 1)
-        
-        # Betweenness centrality
-        bc_dict = nx.betweenness_centrality(self.v_net)
-        bc = np.array([bc_dict[node] for node in range(self.v_net.num_nodes)], 
-                    dtype=np.float32).reshape(-1, 1)
 
-        # Bandwidth variance
-        bw_var = []
-        for node in range(self.v_net.num_nodes):
-            demands = [self.v_net.links[(node, neighbor)]['bw'] 
-                    for neighbor in self.v_net.adj[node]]
-            bw_var.append(np.var(demands) if demands else 0.0)
-        bw_var = np.array(bw_var, dtype=np.float32).reshape(-1, 1)
+        # Final virtual node feature matrix
+        v_net_x = np.concatenate((node_data, edge_bw_agg), axis=-1)
 
-        # Concatenate features: all should be 2D arrays now
-        v_net_x = np.hstack([resource_features, degrees, total_capacity, v_bw_agg, bc, bw_var])
-
-        # Get virtual network edge index
+        # Graph connectivity (for GNN)
         v_net_edge_index = self.obs_handler.get_link_index_obs(self.v_net)
         
-        #normalize with dataset
-        v_net_x = v_net_x / self.norm_vector_v.cpu().numpy()  # convert torch -> numpy
+        return {
+            'x': v_net_x,
+            'edge_index': v_net_edge_index
+        }
 
-        return {'x': v_net_x, 'edge_index': v_net_edge_index}
 
     def _get_p_net_obs(self):
         """
-        Updated to include extended physical features:
-        1. Available resources
-        2. Degree
-        3. Total capacity
-        4. Aggregated bandwidth
-        5. Betweenness
-        6. Neighbor bandwidth average
-        7. Node utilization
-        8. Avg link utilization
-        9. Link variance
-        10. Critical links
+        Construct physical network observation matrix with the following features:
+        - Normalized available resources per node
+        - Node degree (normalized)
+        - Aggregated available bandwidth from adjacent links
+        - Average available bandwidth over neighboring links (normalized)
+        - Average node resource utilization (0–1)
+        - Average link utilization around each node (0–1)
         """
-        # Resource features
+        # 1. Resource features (e.g., CPU, RAM, GPU), already normalized
         resource_features = self.obs_handler.get_node_attrs_obs(
             self.p_net, 
             node_attr_types=['resource'], 
             node_attr_benchmarks=self.node_attr_benchmarks
         )
         
-        # Physical node degrees
+        # 2. Node degree (normalized)
         p_degrees = self.obs_handler.get_node_degree_obs(
             self.p_net, 
             self.obs_handler.get_degree_benchmark(self.p_net)
         )
-        
-        # Total available capacity
-        p_total_capacity = np.sum(resource_features, axis=1, keepdims=True)
-        
-        # Aggregated available bandwidth (sum of 'bw' from connected edges)
+
+        # 3. Aggregated available bandwidth from adjacent links (normalized)
         p_bw_agg = self.obs_handler.get_link_aggr_attrs_obs(
             self.p_net, 
             link_attr_types=['resource'], 
             aggr='sum', 
             link_sum_attr_benchmarks=self.obs_handler.get_link_sum_attr_benchmarks(self.p_net)
         )
-        
-        # 5. Betweenness centrality for physical network
-        bc_dict = nx.betweenness_centrality(self.p_net)
-        bc = np.array([bc_dict[node] for node in range(self.p_net.num_nodes)], dtype=np.float32).reshape((-1, 1))
 
-        # 6. Neighbor bandwidth average: for each node, average the 'bw' over its neighboring edges
+        # 4. Neighbor bandwidth average (normalized by max link BW)
+        link_benchmarks = self.obs_handler.get_link_attr_benchmarks(self.p_net)
+        max_bw = link_benchmarks.get('bw', 1.0)
         neighbor_bw_avg = []
         for node in range(self.p_net.num_nodes):
             neighbors = list(self.p_net.adj[node])
             if neighbors:
-                bw_values = []
-                for nb in neighbors:
-                    # Assumes each edge has a 'bw' attribute
-                    bw_values.append(self.p_net.links[(node, nb)]['bw'])
+                bw_values = [
+                    self.p_net.links[tuple(sorted((node, nb)))]['bw'] 
+                    for nb in neighbors
+                ]
                 neighbor_bw_avg.append(np.mean(bw_values))
             else:
                 neighbor_bw_avg.append(0.0)
         neighbor_bw_avg = np.array(neighbor_bw_avg, dtype=np.float32).reshape((-1, 1))
+        if max_bw > 0:
+            neighbor_bw_avg /= max_bw
 
-        # 7. Node utilization (average % of resources used)
-        node_utilization = self.obs_handler.get_node_utilization_obs(self.p_net)
+        # 5. Node utilization (converted from percentage to [0, 1])
+        node_utilization = self.obs_handler.get_node_utilization_obs(self.p_net) / 100.0
+
+        # 6. Average link utilization per node (also scaled to [0, 1])
+        p_avg_link_util = self.obs_handler.get_avg_link_utilization_obs(self.p_net) / 100.0
         
-        # 8. Average link utilization per node
-        p_avg_link_util = self.obs_handler.get_avg_link_utilization_obs(self.p_net)
-        
-        # 9 & 10. Global link features
-        link_variance, critical_links = self.obs_handler.get_link_utilization_global_obs(self.p_net)
-        link_variance_feature = np.full((self.p_net.num_nodes, 1), link_variance, dtype=np.float32)
-        critical_links_feature = np.full((self.p_net.num_nodes, 1), critical_links, dtype=np.float32)
-        
-        # Combine features
+         
+              
+        # Final node feature matrix
         p_net_x = np.hstack([
             resource_features,
             p_degrees,
-            p_total_capacity,
             p_bw_agg,
-            bc,
             neighbor_bw_avg,
             node_utilization,
-            p_avg_link_util,
-            link_variance_feature,
-            critical_links_feature
+            p_avg_link_util, 
         ])
-        
-        # Edge index for the physical network
+
+        # Graph connectivity (for GNN)
         edge_index = self.obs_handler.get_link_index_obs(self.p_net)
 
-        # Compute edge attributes; here we use the obs_handler function to get (normalized) link attributes. 
+        # Edge features: duplicated for bidirectional edges
         edge_attr_half = self.obs_handler.get_link_attrs_utils_obs(
             self.p_net,
-            link_attr_benchmarks=self.obs_handler.get_link_attr_benchmarks(self.p_net)
+            link_attr_benchmarks=link_benchmarks
         )
-        edge_attr = np.concatenate([edge_attr_half, edge_attr_half], axis=0)  # Duplicate for both directions
-
-
-          
-        # Normalize
-        p_net_x = p_net_x / self.norm_vector_p.cpu().numpy()
+        edge_attr = np.concatenate([edge_attr_half, edge_attr_half], axis=0)
 
         return {
             'x': p_net_x,
             'edge_index': edge_index,
             'edge_attr': edge_attr
         }
-
+        
     def get_history_actions(self):
         full_hist = self.global_history
         tail_hist = full_hist[-self.window_size:]
         
         # If too short, pad with dummy node id (like num_nodes)
         padded = [self.p_net.number_of_nodes()] * (self.window_size - len(tail_hist)) + tail_hist
-        # Expand to 8 rows (one for each v_node)
-        repeated = np.tile(np.array(padded, dtype=np.int64), (8, 1))  # shape (8, window_size)
         
-        return repeated
+        # repeated = np.tile(np.array(padded, dtype=np.int64), (8, 1))  # FIX THIS
+        repeated = np.tile(np.array(padded, dtype=np.int64), (self.v_net.num_nodes, 1))  # Correct
+
+        
+        # Add batch dimension → (1, 8, window_size)
+        return np.expand_dims(repeated, axis=0)
+
 

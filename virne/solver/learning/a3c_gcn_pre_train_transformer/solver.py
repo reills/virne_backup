@@ -20,6 +20,7 @@ from .instance_env import InstanceEnv
 from .net import ActorCritic 
 from virne.solver.learning.rl_base.shared_adam import SharedAdam, sync_gradients
 from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2CSolver, RolloutBuffer
+
 from ..utils import get_pyg_data
 
 
@@ -99,7 +100,8 @@ def transformer_policy_builder(slf, kwargs):
         p_dimension_features=kwargs.get("p_dimension_features"),
         v_dimension_features=kwargs.get("v_dimension_features"),
         is_revocable=kwargs.get("allow_revocable"),
-        is_rejection=kwargs.get("allow_rejection")
+        is_rejection=kwargs.get("allow_rejection"),
+        use_amp=kwargs.get("use_amp"),
     )
     
 # Pickle-safe policy builder
@@ -169,6 +171,51 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         #          pretrained_loaded = True
                  
     # Inside A3CGcnPreTrainTransformerSolver class
+    def solve(self, instance):
+        v_net, p_net = instance['v_net'], instance['p_net']
+
+        instance_env = self.InstanceEnv(
+            p_net, v_net,
+            self.controller, self.recorder, self.counter,
+            preprocess_obs_fn=self.preprocess_obs,  #   REQUIRED to support revoke()
+            **self.basic_config
+        )
+
+        encoder_obs = instance_env.get_observation()
+        encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
+        history_actions = [self.start_token]
+
+        done = False
+        while not done:
+            rtg = [0.0] * len(history_actions)
+
+            instance_obs = self.make_instance_obs(
+                history_actions, encoder_obs, encoder_outputs, instance_env, rtg=rtg
+            )
+
+            #   Cache for revoke() support
+            instance_env.prev_obs = {
+                **instance_obs,
+                'encoder_outputs': encoder_outputs.detach().cpu().numpy()
+            }
+
+            tensor_obs = self.preprocess_obs(instance_obs, device=self.device)
+            instance_env.prev_tensor_obs = {
+                k: v.cpu() if torch.is_tensor(v) else v
+                for k, v in tensor_obs.items()
+            }
+
+            action, action_logprob = self.select_action(tensor_obs, sample=False)
+            obs, reward, done, info = instance_env.step(action)
+            history_actions.append(action)
+
+            if not done:
+                encoder_obs = obs  # 🟢 Important for continuity
+
+        return instance_env.solution
+
+
+    
     def backward_loss(self, loss):
         if self.use_amp:
             self.scaler.scale(loss).backward()
@@ -209,6 +256,20 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             return None, 0.0, None, None, None
 
         micro_batch_size = buffer_size // grad_accum_steps
+
+        all_returns = torch.FloatTensor(self.buffer.returns).to(self.device)
+        all_values = self.policy.evaluate(self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)).squeeze(-1).detach()
+        all_advantages = all_returns - all_values
+
+        # 🟡 DEBUG: Check critic prediction quality
+        print("[debug] returns mean:", all_returns.mean().item(), "values mean:", all_values.mean().item())
+        print("[debug] raw advantages mean:", all_advantages.mean().item(), "std:", all_advantages.std().item())
+
+        if self.normalize_advantage and all_advantages.numel() > 0:
+            all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+
+        all_advantages = torch.clamp(all_advantages, -5.0, 5.0)
+
         grad_clipped_value = 0.0
         total_loss_value = 0.0
 
@@ -229,25 +290,27 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             amp_ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
             with amp_ctx:
-                print(f"Inside AMP context: enabled = {torch.is_autocast_enabled()}")
                 logits = self.policy.act(obs_tensors)
                 values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
+                logits = torch.clamp(logits, min=-10, max=10)
                 dist = torch.distributions.Categorical(logits=logits, validate_args=False)
                 action_logprobs = dist.log_prob(actions)
                 dist_entropy = dist.entropy()
 
-                advantages = returns - values.detach()
-
-                if self.normalize_advantage and advantages.numel() > 0:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                 
-                advantages = torch.clamp(advantages, -5.0, 5.0)
+                advantages = all_advantages[start_idx:end_idx]
 
                 actor_loss = -(action_logprobs * advantages).mean()
                 critic_loss = F.mse_loss(returns, values)
                 entropy_loss = dist_entropy.mean()
                 total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
+
+                # 🔴 DEBUG: Per-microbatch loss diagnostics
+                print(f"[update step {step}] actor_loss: {actor_loss.item():.4f}")
+                print(f"[update step {step}] mean logprob: {action_logprobs.mean().item():.4f}, std: {action_logprobs.std().item():.4f}")
+                print(f"[update step {step}] mean advantage: {advantages.mean().item():.4f}, std: {advantages.std().item():.4f}")
+                print(f"[update step {step}] entropy: {entropy_loss.item():.4f}")
+                print(f"[update step {step}] logits range: min={logits.min().item():.4f}, max={logits.max().item():.4f}")
 
                 # Track summed losses for averaging
                 actor_loss_val += actor_loss.item()
@@ -255,11 +318,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 entropy_val += entropy_loss.item()
                 total_loss_value += total_loss.item()
 
-            # Accumulate gradients
             scaled_loss = total_loss / grad_accum_steps
             self.backward_loss(scaled_loss)
 
-            # Free memory from current micro-batch
+            # Cleanup
             for var in ['obs_tensors', 'actions', 'returns', 'logits', 'values', 'dist',
                         'action_logprobs', 'dist_entropy', 'advantages', 'actor_loss',
                         'critic_loss', 'entropy_loss', 'total_loss']:
@@ -269,16 +331,16 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Average tracked values
         actor_loss_val /= grad_accum_steps
         critic_loss_val /= grad_accum_steps
         entropy_val /= grad_accum_steps
         avg_total_loss = total_loss_value / grad_accum_steps
 
-        # Optimizer step
+        # 🔵 DEBUG: Summary after all microbatches
+        print(f"\n[update summary] avg_actor_loss: {actor_loss_val:.4f}, avg_critic_loss: {critic_loss_val:.4f}, avg_entropy: {entropy_val:.4f}")
+
         grad_clipped_value = self.perform_accumulated_step_and_sync()
 
-        # Final cleanup
         self.buffer.clear()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -304,9 +366,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             with self.lock:
                 # 1. Sync accumulated grads to shared policy
                 sync_gradients(self.shared_policy, self.policy)
+                
+                # Average gradients by dividing by num_workers
+                for param in self.shared_policy.parameters():
+                    if param.grad is not None:
+                        param.grad.div_(self.num_workers)
 
                 # 2. Clip gradients on shared policy
-                grad_norm = self.clip_grads(self.policy, self.shared_optimizer)
+                grad_norm = self.clip_grads(self.shared_policy, self.shared_optimizer)
 
                 # 3. Step optimizer
                 self.optimizer_step(self.shared_optimizer) 
@@ -328,22 +395,6 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             return grad_norm.item()
         return float(grad_norm or 0.0)
     
-
-    def evaluate_actions(self, obs, actions, return_others=False):
-        """
-        Evaluate log-probabilities, value, and entropy for chosen actions.
-        """
-        logits = self.policy.act(obs)  # Shape: (B, p_net_num_nodes)
-        values = self.policy.evaluate(obs).squeeze(-1)
-        dist = torch.distributions.Categorical(logits=logits, validate_args=False)
-        action_logprobs = dist.log_prob(actions)
-        dist_entropy = dist.entropy()
-
-
-        if return_others:
-            return values, action_logprobs, dist_entropy, {}
-        else:
-            return values, action_logprobs, dist_entropy
         
         
     def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env, rtg=None):
@@ -374,45 +425,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         return obs
 
 
-
-    def solve(self, instance):
-        """Inference-only solve using a greedy or sampling approach."""
-        v_net, p_net = instance['v_net'], instance['p_net']
-        sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
-                                preprocess_obs_fn=self.preprocess_obs, **self.basic_config)
-
-        # Encode once
-        encoder_obs = sub_env.get_observation()
-        encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
-
-        # Start partial action sequence with <start_token>
-        history_actions = [self.start_token]
-        instance_done = False
-        
-        while not instance_done:
-            instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env)
-                        
-            tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
-            tensor_instance_obs_cpu = {
-                k: v.cpu() if torch.is_tensor(v) else v
-                for k, v in tensor_instance_obs.items()
-            }
-            sub_env.prev_tensor_obs = tensor_instance_obs_cpu
  
-            sub_env.prev_obs = {
-                **instance_obs,
-                'encoder_outputs': encoder_outputs.detach().cpu().numpy()
-            }  
-            action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
-            next_obs, reward, instance_done, info = sub_env.step(action) 
-            history_actions.append(action)
-            if instance_done:
-                break
-            
-            encoder_obs = next_obs  # Re-encode if needed
-            
-        return sub_env.solution
-
     def learn_with_instance(self, instance):
         """Collect one trajectory and store it in the buffer."""
         sub_buffer = RolloutBuffer()
@@ -475,7 +488,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         #print(f"Rewards: {sub_buffer.rewards}")
         #print(f"Values: {sub_buffer.values}")
 
-def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable, is_rejection, **kwargs):
+def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable, is_rejection,use_amp, **kwargs):
     """
     Create the ActorCritic policy with the same hyperparameters as used in pretraining.
     """
@@ -486,35 +499,42 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         p_net_num_nodes=action_dim,
         p_net_feature_dim=p_dimension_features,
         v_net_feature_dim=v_dimension_features,
-        embedding_dim=128,
+        embedding_dim=256,
         n_heads=8,
         n_layers=6,
-        dropout=0.2,
+        dropout=0.1,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection,
+        use_amp=use_amp,
         max_seq_len=max_seq_len
     ).to(agent.device) 
     
     return policy 
 
 
-
-def encoder_obs_to_tensor(obs, device):
-    """Process the v_net features for the Transformer Encoder."""
+def encoder_obs_to_tensor(obs, device, policy=None):
+    """
+    Processes the v_net_x for encoder, and injects encoder_outputs if policy is provided.
+    """
     if isinstance(obs, dict):
-        # If obs['v_net_x'] is already a tensor, move it; otherwise, create one on the desired device.
         if torch.is_tensor(obs['v_net_x']):
             obs_v_net_x = obs['v_net_x'].float().to(device)
         else:
             obs_v_net_x = torch.tensor(obs['v_net_x'], dtype=torch.float32, device=device)
-            
-        # Make sure it's [1, T, F] instead of [T, F]
+
         if obs_v_net_x.dim() == 2:
-            obs_v_net_x = obs_v_net_x.unsqueeze(0)  # Add batch dim
+            obs_v_net_x = obs_v_net_x.unsqueeze(0)
         elif obs_v_net_x.dim() != 3:
             raise ValueError(f"Expected 2D or 3D tensor, got {obs_v_net_x.dim()}D")
 
+        # ✅ Inject encoder_outputs if possible
+        if policy is not None and 'encoder_outputs' not in obs:
+            with torch.no_grad():
+                encoder_outputs = policy.encode({'v_net_x': obs_v_net_x})
+                obs['encoder_outputs'] = encoder_outputs.detach().cpu().numpy()
+
         return {'v_net_x': obs_v_net_x}
+
     elif isinstance(obs, list):
         obs_batch = [
             torch.tensor(o['v_net_x'], dtype=torch.float32, device=device)
@@ -524,6 +544,7 @@ def encoder_obs_to_tensor(obs, device):
         obs_batch_2d = [x if x.dim() == 2 else x.unsqueeze(0) for x in obs_batch]
         padded = pad_sequence(obs_batch_2d, batch_first=True)
         return {'v_net_x': padded}
+
     else:
         raise Exception(f"Unrecognized type of observation {type(obs)}")
 
