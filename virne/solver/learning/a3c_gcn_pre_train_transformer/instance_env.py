@@ -47,9 +47,6 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         return obs
 
  
- 
-
-    
     def compute_reward(self, solution, revoke=False):
         """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
 
