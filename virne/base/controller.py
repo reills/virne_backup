@@ -488,6 +488,7 @@ class Controller:
             else:
                 raise NotImplementedError
 
+    
         shortest_paths = self.find_shortest_paths(v_net, p_net, v_link, pl_pair, method=shortest_method, k=k)
         #print(f"Found {len(shortest_paths)} shortest paths for v_link {v_link} between physical nodes {pl_pair}")
         shortest_paths = rank_path_func(v_net, p_net, v_link, pl_pair, shortest_paths) if rank_path_func is not None else shortest_paths
@@ -1156,78 +1157,6 @@ class Controller:
         solution.reset()
         return True
 
-    def find_shortest_paths(
-            self, 
-            v_net: VirtualNetwork, 
-            p_net: PhysicalNetwork, 
-            v_link: tuple, 
-            p_pair: tuple, 
-            method: str = 'k_shortest', 
-            k: int = 10,
-            max_hop: float = 1e6
-        ) -> list:
-        """
-        Find the shortest paths between two nodes in the physical network.
-
-        Args:
-            v_net (VirtualNetwork): The virtual network.
-            p_net (PhysicalNetwork): The physical network.
-            v_link (tuple): The virtual link.
-            p_pair (tuple): The physical pair.
-            method (str, optional): The method to find the shortest paths. Defaults to 'k_shortest'.
-                Optional methods: ['first_shortest', 'k_shortest', 'all_shortest', 'bfs_shortest', 'available_shortest']
-            k (int, optional): The number of shortest paths to find. Defaults to 10.
-            max_hop (int, optional): The maximum number of hops. Defaults to 1e6.
-
-        Returns:
-            shortest_paths (list): The list of shortest paths.
-        """
-        source, target = p_pair
-        assert method in ['first_shortest', 'k_shortest', 'all_shortest', 'bfs_shortest', 'available_shortest']
-
-        # Get Latency Attribute
-        if self.link_latency_attrs:
-            weight = self.link_latency_attrs[0].name
-        else:
-            weight = None
-
-        try:
-            # these three methods do not check any link constraints
-            if method == 'first_shortest':
-                shortest_paths = [nx.dijkstra_path(p_net, source, target, weight=weight)]
-            elif method == 'k_shortest':
-                shortest_paths = list(islice(nx.shortest_simple_paths(p_net, source, target, weight=weight), k))
-            elif method == 'all_shortest':
-                shortest_paths = list(nx.all_shortest_paths(p_net, source, target, weight=weight))
-            # these two methods return a fessible path or empty by considering link constraints
-            elif method == 'bfs_shortest':
-                if weight is not None:
-                    raise NotImplementedError('BFS Shortest Path Method not supports seeking for weighted shorest path!')
-                shortest_path = self.find_bfs_shortest_path(v_net, p_net, v_link, source, target, weight=weight)
-                shortest_paths = [] if shortest_path is None else [shortest_path]
-            elif method == 'available_shortest':
-                temp_p_net = self.create_available_network(v_net, p_net, v_link)
-                shortest_paths = [nx.dijkstra_path(temp_p_net, source, target, weight=weight)]
-            elif method == 'available_k_shortest':
-                temp_p_net = self.create_available_network(v_net, p_net, v_link)
-                shortest_paths = list(islice(nx.shortest_simple_paths(p_net, source, target, weight=weight), k))
-        except NotImplementedError as e:
-            print(e)
-        except Exception as e:
-            shortest_paths = []
-        if len(shortest_paths) and len(shortest_paths[0]) > max_hop: 
-            shortest_paths = []
-        return shortest_paths
-
-    def create_available_network(self, v_net: VirtualNetwork, p_net: PhysicalNetwork, v_link_pair):
-        def available_link(n1, n2):
-            p_link = p_net.links[(n1, n2)]
-            result, info = self.check_link_constraints(v_net, p_net, v_link, p_link)
-            return result
-        v_link = v_net.links[v_link_pair]
-        sub_graph = nx.subgraph_view(p_net, filter_edge=available_link)
-        return sub_graph
-
     def create_pruned_network(self, v_net: VirtualNetwork, p_net: PhysicalNetwork, v_link_pair, ratio=1., div=0.):
         """
         Create a pruned network from the original network.
@@ -1424,37 +1353,55 @@ class Controller:
         else:
             return shortest_path
         
-    def find_candidate_nodes(
-            self, 
-            v_net: VirtualNetwork, 
-            p_net: PhysicalNetwork, 
-            v_node_id: int, 
-            filter: list = [], 
-            check_node_constraint: bool = True,
-            check_link_constraint: bool = True):
-        """
-        Find candidate nodes from physical network according to given virtual node. 
-        
-        Args:
-            v_net (VirtualNetwork): The virtual network object.
-            p_net (PhysicalNetwork): The physical network object.
-            v_node_id (int): The virtual node id.
-            filter (list, optional): The list of filtered nodes. Defaults to [].
-            check_node_constraint (bool, optional): Whether to check node constraints. Defaults to True.
-            check_link_constraint (bool, optional): Whether to check link constraints. Defaults to True.
+    
+    def has_feasible_path(self, graph, source, target, weight=None, max_hop=1e6):
+        try:
+            # Early exit Dijkstra-style check
+            lengths = nx.single_source_dijkstra_path_length(graph, source, cutoff=max_hop, weight=weight)
+            return target in lengths
+        except Exception:
+            return False
+    
+    
+    def create_available_network(self, v_net: VirtualNetwork, p_net: PhysicalNetwork, v_link_pair):
+        def available_link(n1, n2):
+            key = (n1, n2) if (n1, n2) in p_net.links else (n2, n1)
+            if key not in p_net.links:
+                return False
+            try:
+                result, _ = self.check_link_constraints(v_net, p_net, v_link_pair, key)
+                return result
+            except Exception:
+                return False
 
-        Returns:
-            candidate_nodes (list): The list of candidate nodes.
-        """
+        if v_link_pair not in v_net.links:
+            return nx.Graph()
+
+        # MATERIALIZE the filtered subgraph instead of lazy-view
+        edges = [(u, v) for (u, v) in p_net.edges if available_link(u, v)]
+        return p_net.edge_subgraph(edges).copy()  # Makes it static and fast for path queries
+
+        
+    def find_candidate_nodes(
+        self, 
+        v_net: VirtualNetwork, 
+        p_net: PhysicalNetwork, 
+        v_node_id: int, 
+        filter: list = [], 
+        check_node_constraint: bool = True,
+        check_link_constraint: bool = True,
+        p_node_prev: int = None,
+        solution: Solution = None
+    ):
         all_p_nodes = np.array(list(p_net.nodes))
         if check_node_constraint:
             suitable_nodes = [p_node_id for p_node_id in all_p_nodes if self.check_node_constraints(v_net, p_net, v_node_id, p_node_id)[0]]
             candidate_nodes = list(set(suitable_nodes).difference(set(filter)))
         else:
             candidate_nodes = []
+
         if check_link_constraint:
             aggr_method = 'sum' if self.shortest_method == 'mcf' else 'max'
-            # checked_nodes = candidate_nodes_with_node_constraint if check_node_constraint else list(p_net.nodes)
             v_node_degrees = np.array(list(dict(v_net.degree()).values()))
             p_node_degrees = np.array(list(dict(p_net.degree()).values()))
             v_link_aggr_resource = np.array(v_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
@@ -1462,11 +1409,99 @@ class Controller:
             degrees_comparison = p_node_degrees[:] >= v_node_degrees[v_node_id]
             resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
             suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
-            new_filter = set(all_p_nodes) - set(candidate_nodes)
-            candidate_nodes = list(set(candidate_nodes).difference(new_filter))
-        else:
-            candidate_nodes = candidate_nodes
+            candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
+
+        # === Efficient Path Feasibility Pruning ===
+        if p_node_prev is not None and solution is not None:
+            try:
+                ranked_list = [int(v) for v in v_net.ranked_nodes]
+                current_v_idx = ranked_list.index(v_node_id)
+                if current_v_idx > 0:
+                    prev_v_node_id = ranked_list[current_v_idx - 1]
+                    v_link_id = (int(min(prev_v_node_id, v_node_id)), int(max(prev_v_node_id, v_node_id)))
+                    temp_p_net = self.create_available_network(v_net, p_net, v_link_id)
+
+                    # Just check if a feasible path exists, not k of them
+                    weight = self.link_latency_attrs[0].name if self.link_latency_attrs else None
+                    candidate_nodes = [
+                        p_node for p_node in candidate_nodes
+                        if p_node != p_node_prev and self.has_feasible_path(temp_p_net, p_node_prev, p_node, weight=weight)
+                    ]
+
+            except Exception as e:
+                import traceback
+                print(f"[find_candidate_nodes] ERROR during path check: {e}")
+                traceback.print_exc()
+
         return candidate_nodes
+    
+    def find_shortest_paths(
+            self, 
+            v_net: VirtualNetwork, 
+            p_net: PhysicalNetwork, 
+            v_link: tuple, 
+            p_pair: tuple, 
+            method: str = 'k_shortest', 
+            k: int = 10,
+            max_hop: float = 1e6
+        ) -> list:
+        """
+        Find the shortest paths between two nodes in the physical network.
+
+        Args:
+            v_net (VirtualNetwork): The virtual network.
+            p_net (PhysicalNetwork): The physical network.
+            v_link (tuple): The virtual link.
+            p_pair (tuple): The physical pair.
+            method (str, optional): The method to find the shortest paths. Defaults to 'k_shortest'.
+                Optional methods: ['first_shortest', 'k_shortest', 'all_shortest', 'bfs_shortest', 'available_shortest']
+            k (int, optional): The number of shortest paths to find. Defaults to 10.
+            max_hop (int, optional): The maximum number of hops. Defaults to 1e6.
+
+        Returns:
+            shortest_paths (list): The list of shortest paths.
+        """
+        source, target = p_pair
+        assert method in ['first_shortest', 'k_shortest', 'all_shortest', 'bfs_shortest', 'available_shortest','available_k_shortest']
+
+        # Get Latency Attribute
+        if self.link_latency_attrs:
+            weight = self.link_latency_attrs[0].name
+        else:
+            weight = None
+
+        try:
+            # these three methods do not check any link constraints
+            if method == 'first_shortest':
+                shortest_paths = [nx.dijkstra_path(p_net, source, target, weight=weight)]
+            elif method == 'k_shortest':
+                shortest_paths = list(islice(nx.shortest_simple_paths(p_net, source, target, weight=weight), k))
+            elif method == 'all_shortest':
+                shortest_paths = list(nx.all_shortest_paths(p_net, source, target, weight=weight))
+            # these two methods return a fessible path or empty by considering link constraints
+            elif method == 'bfs_shortest':
+                if weight is not None:
+                    raise NotImplementedError('BFS Shortest Path Method not supports seeking for weighted shorest path!')
+                shortest_path = self.find_bfs_shortest_path(v_net, p_net, v_link, source, target, weight=weight)
+                shortest_paths = [] if shortest_path is None else [shortest_path]
+            elif method == 'available_shortest':
+                temp_p_net = self.create_available_network(v_net, p_net, v_link)
+                shortest_paths = [nx.dijkstra_path(temp_p_net, source, target, weight=weight)]
+            elif method == 'available_k_shortest':
+                try:
+                    temp_p_net = self.create_available_network(v_net, p_net, v_link)
+                    shortest_paths = list(islice(nx.shortest_simple_paths(temp_p_net, source, target, weight=weight), k))
+                except Exception as e: 
+                    print(f"[ERROR] While computing shortest paths from {source} to {target} with method {method}: {e}")
+                    shortest_paths = [] 
+    
+        except NotImplementedError as e:
+            print(e)
+        except Exception as e:
+            shortest_paths = []
+        if len(shortest_paths) and len(shortest_paths[0]) > max_hop: 
+            shortest_paths = []
+        return shortest_paths
 
     def find_feasible_nodes(self, v_net: VirtualNetwork, p_net: PhysicalNetwork, v_node_id, node_slots):
         """

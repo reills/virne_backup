@@ -21,8 +21,9 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.pad_token = kwargs.get("pad_token", None) 
         self.max_revokes=8
         self.calcuate_graph_metrics()
+        self.phase = kwargs.get("phase", 1) #for curriculum learning? 
 
-
+ 
     def get_observation(self ):
         """
         Returns the observation as a dictionary.
@@ -31,6 +32,16 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         p_net_obs = self._get_p_net_obs()
         v_net_obs = self._get_v_net_obs()
         history_actions = self.get_history_actions()
+        
+        if not hasattr(self, '_cached_candidates') or self._cached_candidates_vnode != self.curr_v_node_id:
+            p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
+            self._cached_candidates = self.controller.find_candidate_nodes(
+                self.v_net, self.p_net, self.curr_v_node_id,
+                filter=self.selected_p_net_nodes,
+                p_node_prev=p_node_prev,
+                solution=self.solution
+            )
+            self._cached_candidates_vnode = self.curr_v_node_id
 
         obs = {
             'p_net_x': p_net_obs['x'],
@@ -46,44 +57,74 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         return obs
 
+    def generate_action_mask(self):
+        """Generates a valid action mask based on placement feasibility and curriculum phase."""
+        #print(f"[PHASE] Phase = {self.phase} | Placed = {self.num_placed_v_net_nodes} | Interactions = {self.solution['num_interactions']}")
+
+        # Get candidates from controller (based on physical constraints and path feasibility)
+        p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
+        #print(f"{p_node_prev} was the previously placed node")
+        candidates = self._cached_candidates
+
+        # Remove previously revoked candidates
+        key = (str(self.solution.node_slots), self.curr_v_node_id)
+        revoked = self.revoked_actions_dict.get(key, [])
+        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
+        
+        #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
+        candidates = [p for p in candidates if p not in revoked and p not in failed]
+        
+        #print(f"[MASK] Revoked: {revoked} | Failed: {failed}")
+
+        # ---- Curriculum-aware Revoke / Reject Masking ----
+        threshold_ok = self.solution['revoke_times'] < self.max_revokes
+
+        # PHASE 2+: Allow revoke if we've placed any nodes and under max_revokes
+        if self.phase >= 2 and self.allow_revocable and self.num_placed_v_net_nodes > 0 and threshold_ok:
+            candidates.append(self.revocable_action)
+
+        # PHASE 3+: Allow reject once at least 1 action attempted
+        if self.phase >= 3 and self.allow_rejection and self.solution['num_interactions'] > 0:
+            candidates.append(self.rejection_action)
+
+        # ---- Build binary action mask ----
+        mask = np.zeros(self.num_actions, dtype=bool)
+        indices = [a for a in candidates if 0 <= a < self.num_actions]
+        mask[indices] = True
+
+        # ---- Fallback: allow reject if absolutely no other option ----
+        if not mask.any():
+            #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})")
+            if self.allow_rejection and 0 <= self.rejection_action < self.num_actions:
+                mask[self.rejection_action] = True
+                #print("[WARN] Fallback to REJECTION action.")
+            else:
+                print("[ERROR] No valid fallback. Agent is stuck.")
+
+        return mask
+
  
     def compute_reward(self, solution, revoke=False):
-        """Per-step reward to encourage full VNet acceptance and discourage poor routing or excessive revoke."""
-
-        vnodes = self.v_net.num_nodes            # Typically 8
-        self.max_revokes = vnodes * 8
-        value = solution['v_net_r2c_ratio'] * 5
-        completion_pct = (solution['num_placed_nodes'] or 0) / vnodes
-        revokes = solution['revoke_times']
-        revoke_pct = revokes / max(1, self.max_revokes)
-
-        # Case 1: Early rejection — should almost never happen, very bad
-        if solution['early_rejection']: 
-            reward = -4  # more punishing for not even trying to place
-        # Case 2: Revoke was taken — penalize each time it happens
-        elif revoke:
-            # maxes out at -11.72 after 81 revokes
-            reward =  -0.01 * revokes  # Increasing penalty per revoke step 
-        # Case 3: Final step of a full success — high reward, scaled with revoke penalty
+        if revoke:
+            # Small penalty for backtracking
+            reward = -0.2 / self.v_net.num_nodes
+        elif solution['early_rejection']:
+            # Harsh penalty for giving up
+            reward = -1.0
+        elif not solution['place_result'] or not solution['route_result']:
+            # Step failed
+            reward = -0.5 / self.v_net.num_nodes
         elif solution['result']:
-            # This will be called once at the last vnode placement step
-            bonus = max( 0, value - revoke_pct)
-            reward = value + bonus  # e.g., 8 + bonus
-        # Case 4: Routing partially succeeded — some virtual nodes got routed
-        elif solution['route_result']:
-            # Encourage partial progress in routing -- revoke and retry gets less reward
-            completion_reward = (completion_pct/vnodes)
-            penalty = completion_reward * revoke_pct
-            bonus = completion_reward - penalty
-            reward = .1
-        # Case 5: All nodes placed and routing failure or place failure
+            # Final success
+            reward = solution['v_net_r2c_ratio']
         else:
-            #technically if revoked is enabled this will never hit because revoke will just call reject (revoke=true) when it hits max revokes
-            reward = -1  # Large negative signal 
-    
+            # Intermediate success
+            reward = 1.0 / self.v_net.num_nodes
+
         self.solution['v_net_reward'] += reward
         return reward
-     
+ 
+    
     
     def _get_v_net_obs(self):
         """

@@ -3,6 +3,7 @@
 
 #datasets
 dataset/results*
+dataset/april15_results
 *.pth
 analysis.py
 pre-train

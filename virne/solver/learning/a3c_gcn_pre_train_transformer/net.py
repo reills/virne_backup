@@ -1,3 +1,4 @@
+
 # ==============================================================================
 # net.py  (Enhanced Transformer with Deeper GAT and Improved Aggregation)
 # ==============================================================================  
@@ -160,13 +161,14 @@ class AutoregressiveDecoder(nn.Module):
     """
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, is_actor=True,
-                 allow_revocable=False, allow_rejection=False,use_amp=False, max_seq_len=15):
+                 allow_revocable=False, allow_rejection=False, use_amp=False, max_seq_len=15):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.use_amp=use_amp
         
         # Define special tokens and vocabulary size
-        self.num_actions = p_net_num_nodes + int(allow_rejection) + int(allow_revocable)
+        #self.num_actions = p_net_num_nodes + int(allow_rejection) + int(allow_revocable)
+        self.num_actions = p_net_num_nodes + 1 + 1 #curriculum learning - these will be controlled by mask and allowed after 10 epochs... 
         self.start_token = self.num_actions
         self.pad_token = self.num_actions + 1
         self.vocab_size = self.num_actions + 2  # Includes start and pad tokens
@@ -187,7 +189,7 @@ class AutoregressiveDecoder(nn.Module):
                 in_dim=p_net_feature_dim if i == 0 else embedding_dim,
                 out_dim=embedding_dim
             )
-            for i in range(1)
+            for i in range(3)
         ])
         self.gat_projection = nn.Identity()  # Optional projection layer
 
@@ -201,18 +203,6 @@ class AutoregressiveDecoder(nn.Module):
             activation='gelu'
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
-        self.decoder_self_attention = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embedding_dim,
-                nhead=n_heads,
-                dim_feedforward=4 * embedding_dim,
-                dropout=dropout,
-                batch_first=True,
-                activation='gelu'
-            ),
-            num_layers=1
-        )
-
         self.norm = nn.LayerNorm(embedding_dim)
 
         # Output head for actor or critic
@@ -228,7 +218,7 @@ class AutoregressiveDecoder(nn.Module):
 
             # NEW: Output head for attention-based fusion
             self.output_head = nn.Sequential(
-                nn.Linear(2 * embedding_dim + 1 + 2, embedding_dim),  # 2 = edge_attr dim
+                nn.Linear(2 * embedding_dim + 3, embedding_dim),
                 nn.GELU(),
                 nn.Linear(embedding_dim, self.num_actions)
             )
@@ -279,11 +269,15 @@ class AutoregressiveDecoder(nn.Module):
             tgt_mask=causal_mask,
             tgt_key_padding_mask=padding_mask
         )  # (B, T, E)
-        
-        decoder_output = self.decoder_self_attention(decoder_output, src_key_padding_mask=padding_mask)
 
         last_decoder_output = decoder_output[:, -1, :]  # (B, E)
- 
+
+        # === Context Embedding: curr_v_node_id & vnfs_remaining ===
+        if 'curr_v_node_id' not in obs:
+            raise ValueError("Observation missing 'curr_v_node_id'")
+        if 'vnfs_remaining' not in obs:
+            raise ValueError("Observation missing 'vnfs_remaining'")
+
         curr_v_ids = torch.clamp(obs['curr_v_node_id'], 0, self.step_embedding.num_embeddings - 1)
         remaining_ids = torch.clamp(obs['vnfs_remaining'], 0, self.remaining_embedding.num_embeddings - 1)
 
@@ -321,29 +315,33 @@ class AutoregressiveDecoder(nn.Module):
 
         attn_context = attn_output.squeeze(0)  # (B, E)
 
-        # === Combine per-node embeddings with context ===
+         # === Combine per-node embeddings with context and physical stats ===
         attn_context_per_node = attn_context[node_batch]  # (TotalNodes, E)
 
+        # Add inductive bias terms (normalized)
         raw_resource_score = batch_p_net.x[:, :3].sum(dim=-1, keepdim=True)  # CPU+RAM+GPU
         raw_resource_score = (raw_resource_score - raw_resource_score.mean()) / (raw_resource_score.std() + 1e-5)
+
         bw_context = scatter(edge_attr, edge_index[0], dim=0, reduce='mean')  # (TotalNodes, edge_dim)
         bw_context = (bw_context - bw_context.mean(dim=0)) / (bw_context.std(dim=0) + 1e-5)
 
         combined = torch.cat([
-        F.normalize(graph_embedding, dim=-1),
-        F.normalize(final_context_embedding[node_batch], dim=-1),  # one copy of context
-        raw_resource_score,
-        bw_context
-    ], dim=-1)
+            F.normalize(graph_embedding, dim=-1),
+            F.normalize(attn_context_per_node, dim=-1),
+            raw_resource_score,
+            bw_context
+        ], dim=-1)  # (TotalNodes, 2E + 1 + 2)
 
-        logits_per_node = self.output_head(combined)
-        logits_per_node = logits_per_node + 1.0 * raw_resource_score   
-        logits = scatter(logits_per_node, node_batch, dim=0, reduce='mean')
-        
+        logits_per_node = self.output_head(combined)  # (TotalNodes, num_actions)
+
+        # Add greedy bias (optional but helpful for early success)
+        logits_per_node += 1.0 * raw_resource_score  # broadcasted to all actions per node
+
+        logits = scatter(logits_per_node, node_batch, dim=0, reduce='mean')  # (B, num_actions)
+
         # === Apply Action Mask ===
         action_mask = obs['action_mask']  # (B, num_actions)
-        #logits = logits.masked_fill(action_mask == 0, -1e9) if not using amp 
-        mask_value = -10.0 #if self.use_amp else -1e9  # Safe for AMP + allows sharp inference
+        mask_value = -10.0  # safe default for AMP
         logits = logits.masked_fill(action_mask == 0, mask_value)
 
         return logits

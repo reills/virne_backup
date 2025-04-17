@@ -43,14 +43,14 @@ class Config(ClassDict):
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
-    use_fixed_dataset: bool = True
-    dir_save_dataset: str = "dataset/results-sfc-trans"
+    use_fixed_dataset: bool = False
+    dir_save_dataset: str = "dataset/results-trans-sfc"
 
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
     #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
-    pretrained_model_path: str = ''
+    pretrained_model_path: str = ''#''/home/stephen-reilly/dev/virne/dataset/april15_results/output/model/model.pkl'
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
@@ -65,18 +65,19 @@ class Config(ClassDict):
     allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
 
     ### Training ###
-    num_epochs: int = 1
+    num_epochs: int = 10
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
     distributed_training: bool = True
     num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 10 #changed by me was 10
+    num_workers: int = 5 #changed by me was 10
     batch_size: int = 256 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
     eval_interval: int = 400 #changed was 10
+    curriculum_phase: int = 0
 
     ### Neural Network ###
     embedding_dim: int = 128   # Embedding dimension
@@ -88,7 +89,7 @@ class Config(ClassDict):
     l2reg_rate: float = 2.5e-4    # L2 regularization rate
     lr: float = 0.001          # Learning rate
     # lr_decay: float = 0.5      # Learning rate decay
-    pretrained_bc_path: str = "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
+    pretrained_bc_path: str = ""# "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
     pretrained_loaded: bool = False
     p_dimension_features: int = 9
     v_dimension_features: int = 4

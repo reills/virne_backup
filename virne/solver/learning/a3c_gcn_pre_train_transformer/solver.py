@@ -429,8 +429,17 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """Collect one trajectory and store it in the buffer."""
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
+        
+        # Curriculum logic: decide which phase we're in
+        if self.epoch_id < 10:
+            phase = 1
+        elif self.epoch_id < 20:
+            phase = 2
+        else:
+            phase = 3
+    
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
-                                preprocess_obs_fn=self.preprocess_obs, **self.basic_config)
+                                preprocess_obs_fn=self.preprocess_obs, phase=phase, **self.basic_config)
 
         encoder_obs = sub_env.get_observation()
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))

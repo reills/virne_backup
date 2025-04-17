@@ -50,6 +50,8 @@ class InstanceRLEnv(RLBaseEnv):
         
         self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
         self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}
+        self.solution['last_placement_failed'] = False 
+        self.attempt_blacklist = defaultdict(set)
 
         # set_sim_info_to_object(kwargs, self)
     def _get_normalized_distance_feature(self, source_p_node_id):
@@ -160,62 +162,70 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         p_node_id = int(action)
         self.solution.selected_actions.append(p_node_id)
 
-        if self.solution['revoke_times'] > 8 * self.v_net.num_nodes: 
-            self.solution['description'] = 'Too Many Revokable Actions'
-            self.solution['place_result'] = True
-            self.solution['route_result'] = False
-            return self.reject(is_early=False)
-        # Case: Reject
+       # Case: Reject
         if self.if_rejection(action): 
+            self.attempt_blacklist.clear()
+            self.solution['last_placement_failed'] = False
             return self.reject(is_early=True)
+        
         # Case: Revoke
         if self.if_revocable(action): 
+            last_v_node_id = self.placed_v_net_nodes[-1]
+            self.attempt_blacklist[last_v_node_id].clear()
+            self.solution['last_placement_failed'] = False
             return self.revoke()
-        # Case: reusable = False and place in one same node
-        elif not self.reusable and (p_node_id in self.selected_p_net_nodes): 
+        
+        # Case: reusable = False and place in one same node (not allowed currently)
+        if not self.reusable and (p_node_id in self.selected_p_net_nodes): 
             self.solution['place_result'] = False
-            solution_info = self.counter.count_solution(self.v_net, self.solution)
+            self.solution['route_result'] = False
+            self.solution['last_placement_failed'] = True 
             done = True 
-        # Case: Try to Place and Route
-        else:
-            assert p_node_id in list(self.p_net.nodes)
-             
-            place_and_route_result, place_and_route_info = self.controller.place_and_route(
-                                                                                self.v_net, 
-                                                                                self.p_net, 
-                                                                                self.curr_v_node_id, 
-                                                                                p_node_id,
-                                                                                self.solution, 
-                                                                                shortest_method=self.shortest_method, 
-                                                                                k=self.k_shortest,
-                                                                                check_feasibility=self.check_feasibility)
-            # Step Failure
-            if not place_and_route_result: 
-                if self.allow_revocable and self.solution['revoke_times'] <= self.v_net.num_nodes * 8:
-                    self.solution['selected_actions'].append(self.revocable_action)
-                    #print("[REVOCABLE] Retrying with a revocable action...")
-                    return self.revoke()
-                else:
-                    self.solution['description'] = 'Too Many Revokable Actions' 
-                    solution_info = self.counter.count_solution(self.v_net, self.solution)
-                    done = True
-                # solution_info = self.solution.to_dict()
-            else:  
-                # VN Success ?
-                if self.num_placed_v_net_nodes == self.v_net.num_nodes: 
+            solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
+            return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
 
-                    self.solution['result'] = True
-                    solution_info = self.counter.count_solution(self.v_net, self.solution)
-                    done = True
-                # Step Success
-                else:
-                    done = False
-                    solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-                    
-        if done:
-            pass
-         
+        # Case: Try to Place and Route
+        assert p_node_id in list(self.p_net.nodes)
+            
+        place_and_route_result, place_and_route_info = self.controller.place_and_route(
+                                                                            self.v_net, 
+                                                                            self.p_net, 
+                                                                            self.curr_v_node_id, 
+                                                                            p_node_id,
+                                                                            self.solution, 
+                                                                            shortest_method=self.shortest_method, 
+                                                                            k=self.k_shortest,
+                                                                            check_feasibility=self.check_feasibility)
+        # Step Failure
+        if not place_and_route_result:
+            # Placement failed — retryable
+            self.solution['place_result'] = False
+            self.solution['route_result'] = False
+            self.solution['last_placement_failed'] = True
+            self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
+            reward = self.compute_reward(self.solution)
+            done = False
+            solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
+            return self.get_observation(), reward, done, self.get_info(solution_info)
+
+        # Placement and Route Success
+        self.attempt_blacklist[self.curr_v_node_id].clear()
+        self.solution['last_placement_failed'] = False
+    
+        #finished placing and routing full SFC 
+        if self.num_placed_v_net_nodes == self.v_net.num_nodes:
+            self.solution['result'] = True  
+            done = True
+            solution_info = self.counter.count_solution(self.v_net, self.solution)
+        # still more chains to place
+        else: 
+            done = False
+            solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
+                     
+        self._cached_candidates = None
+        self._cached_candidates_vnode = None
         return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
+    
 
 class SolutionStepInstanceRLEnv(InstanceRLEnv):
     
@@ -261,8 +271,9 @@ class PlaceStepInstanceRLEnv(InstanceRLEnv):
         if self.if_rejection(action):
             return self.reject()
         # Case: Revoke
-        if self.if_revocable(action):
-            print('revoke')
+        if self.if_revocable(action) : 
+            if( self.solution['revoke_times'] > 10):
+                return self.reject(False)
             return self.revoke()
         # Case: Place in one same node
         elif not self.reusable and p_node_id in self.selected_p_net_nodes:
