@@ -45,6 +45,7 @@ class Config(ClassDict):
     sim_id: int = 0
     use_fixed_dataset: bool = False
     dir_save_dataset: str = "dataset/results-trans-sfc"
+    if_dynamic_v_nets: bool = True
 
     ### solver  ###
     solver_name: str = 'random_rank'
@@ -65,13 +66,13 @@ class Config(ClassDict):
     allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
 
     ### Training ###
-    num_epochs: int = 10
+    num_epochs: int = 2
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = True
-    num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 5 #changed by me was 10
+    distributed_training: bool = False
+    num_train_epochs: int = 0 #changed by me was 100
+    num_workers: int = 1 #changed by me was 10
     batch_size: int = 256 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10

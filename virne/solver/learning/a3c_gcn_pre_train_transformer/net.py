@@ -103,6 +103,7 @@ class Encoder(nn.Module):
     def forward(self, x):  # x: [B, T, F]
         B, T, _ = x.size()
         positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  # [B, T] 
+         
         x = self.token_embed(x) + self.position_embed(positions)               # [B, T, E]
         x = self.transformer_encoder(x)
         return self.norm(x)  # Optional final norm for stabilization

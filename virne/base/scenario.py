@@ -6,7 +6,7 @@
 import os
 import tqdm
 import pprint
-
+from virne.data.generator import Generator
 from .controller import Controller
 from .recorder import Recorder
 from .counter import Counter
@@ -116,6 +116,10 @@ class BasicScenario(Scenario):
             self.solver.epoch_id = epoch_id
 
             instance = self.env.reset()
+            if self.config.if_dynamic_v_nets:
+                self.env.v_net_simulator = Generator.generate_dynamic_v_nets_dataset_from_config(self.config, save=False)
+                print('\n', [v.num_nodes for v in self.env.v_net_simulator.v_nets])
+
 
             pbar = tqdm.tqdm(desc=f'Running with {self.config.solver_name} in epoch {epoch_id}', total=self.env.num_v_nets) if self.verbose <= 1 else None
 
