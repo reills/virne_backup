@@ -21,9 +21,9 @@ echo "Creating and activating Conda environment..."
 conda env create -f setup/nfv_env.yml
 conda activate nfv
  
-echo "Copying results-seq-sfc into dataset/results-sfc-trans..."
-mkdir -p dataset/results-sfc-trans
-cp -r results-seq-sfc/* dataset/results-sfc-trans/
+echo "Copying results-seq-sfc into dataset/garbage_1_trans..."
+mkdir -p dataset/garbage_1_trans
+cp -r garbage_1/* dataset/garbage_1_trans/
 
 pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric \
   -f https://data.pyg.org/whl/torch-2.5.1+cu118.html

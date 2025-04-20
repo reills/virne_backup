@@ -68,8 +68,9 @@ class ActorCritic(nn.Module):
     def encode(self, obs):
         return self.encoder(obs['v_net_x'])
 
-    def act(self, obs ):
-        return self.actor(obs)
+    def act(self, obs, training=False):
+        return self.actor(obs, training=training)
+
 
     def evaluate(self, obs):
         return self.critic(obs)
@@ -125,8 +126,9 @@ class Actor(nn.Module):
             **kwargs
         )
 
-    def forward(self, obs):
-        return self.decoder(obs)
+    def forward(self, obs, training=False):
+        return self.decoder(obs, training=training)
+
 
 # --- Critic Module ---
 class Critic(nn.Module):
@@ -151,7 +153,7 @@ class Critic(nn.Module):
         )
 
     def forward(self, obs):
-        last_emb = self.decoder(obs, return_last_embed=True)
+        last_emb = self.decoder(obs, return_last_embed=True, training=False)
         return self.value_head(last_emb)
 
 # --- Autoregressive Decoder ---
@@ -176,7 +178,6 @@ class AutoregressiveDecoder(nn.Module):
 
         # Embeddings
         self.rtg_embed = nn.Linear(1, embedding_dim)  # Embeds return-to-go scalar
-        self.token_embed = nn.Embedding(self.vocab_size, embedding_dim)  # Embeds action tokens
         
         # *** NEW: Context Embeddings ***
         # max_seq_len determines max curr_v_node_id (0 to max_seq_len-1)
@@ -227,10 +228,22 @@ class AutoregressiveDecoder(nn.Module):
             pass
         
         # --- Initialization --- 
-        nn.init.xavier_uniform_(self.step_embedding.weight)
-        nn.init.xavier_uniform_(self.remaining_embedding.weight)
+        # === For history feature input ===
+        self.history_feature_dim = p_net_feature_dim  # or whatever your full feature dim is
+        self.history_embed = nn.Linear(self.history_feature_dim, self.embedding_dim)
 
-    def forward(self, obs, return_last_embed=False):
+        # === Learnable revoke/reject embeddings (used in solver.py) ===
+        self.revoke_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
+        self.reject_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
+        self.start_embedding = nn.Parameter(torch.randn(self.history_feature_dim))  # learnable vector
+
+
+        # === Optional: init for stability
+        nn.init.xavier_uniform_(self.history_embed.weight)
+        nn.init.zeros_(self.history_embed.bias)
+
+    def forward(self, obs, return_last_embed=False, training=False):
+
         """Forward pass for the autoregressive decoder."""
         
         # === GAT: Physical Node Embedding ===
@@ -245,8 +258,9 @@ class AutoregressiveDecoder(nn.Module):
         graph_embedding = self.gat_projection(node_features)  # (TotalNodes, E)
 
         # === Sequence Embedding ===
-        history_actions = obs['history_actions']  # (B, T)
-        action_embeddings = self.token_embed(history_actions)  # (B, T, E)
+        history_features = obs['history_features']  # (B, T, D)
+
+        action_embeddings = self.history_embed(history_features)  # (B, T, E)
 
         if 'rtg' not in obs:
             raise ValueError("Observation missing 'rtg' key")
@@ -258,11 +272,9 @@ class AutoregressiveDecoder(nn.Module):
         combined_target = action_embeddings + rtg_embedding  # (B, T, E)
 
         # === Transformer Decoder ===
-        batch_size, seq_len = history_actions.shape
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=history_actions.device), diagonal=1
-        ).bool()
-        padding_mask = (history_actions == self.pad_token)
+        batch_size, seq_len, _ = history_features.shape
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=history_features.device), diagonal=1).bool()
+        padding_mask = torch.all(history_features == 0, dim=-1)  # (B, T) → padded rows are all-zero
 
         decoder_output = self.transformer_decoder(
             tgt=combined_target,
@@ -342,7 +354,13 @@ class AutoregressiveDecoder(nn.Module):
 
         # === Apply Action Mask ===
         action_mask = obs['action_mask']  # (B, num_actions)
-        mask_value = -10.0  # safe default for AMP
+        
+        # === Clamp logits before masking to prevent exploding logprobs ===
+        if not training:
+            logits = torch.clamp(logits, min=-15.0, max=10.0)
+
+
+        mask_value = -5 #if self.use_amp else -1e9
         logits = logits.masked_fill(action_mask == 0, mask_value)
 
         return logits

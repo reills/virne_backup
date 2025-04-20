@@ -21,7 +21,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.pad_token = kwargs.get("pad_token", None) 
         self.max_revokes=8
         self.calcuate_graph_metrics()
-        self.phase = kwargs.get("phase", 1) #for curriculum learning? 
+        self.phase = kwargs.get("phase", -1) #for curriculum learning? 
 
  
     def get_observation(self ):
@@ -31,15 +31,17 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         """
         p_net_obs = self._get_p_net_obs()
         v_net_obs = self._get_v_net_obs()
-        history_actions = self.get_history_actions()
+        history_features = self.get_history_features()
         
         if not hasattr(self, '_cached_candidates') or self._cached_candidates_vnode != self.curr_v_node_id:
             p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
+            
             self._cached_candidates = self.controller.find_candidate_nodes(
                 self.v_net, self.p_net, self.curr_v_node_id,
                 filter=self.selected_p_net_nodes,
                 p_node_prev=p_node_prev,
-                solution=self.solution
+                solution=self.solution,
+                phase=self.phase
             )
             self._cached_candidates_vnode = self.curr_v_node_id
 
@@ -50,7 +52,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             'v_net_x': v_net_obs['x'],
             'v_net_edge_index': v_net_obs['edge_index'],
             'action_mask': self.generate_action_mask(),
-            'history_actions': history_actions,
+            'history_features': history_features,
             'curr_v_node_id': self.curr_v_node_id,
             'vnfs_remaining': self.v_net.num_nodes - self.curr_v_node_id,
         }
@@ -80,11 +82,11 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
 
         # PHASE 2+: Allow revoke if we've placed any nodes and under max_revokes
-        if self.phase >= 2 and self.allow_revocable and self.num_placed_v_net_nodes > 0 and threshold_ok:
+        if ( self.phase >= 2 or self.phase == -1) and self.allow_revocable and self.num_placed_v_net_nodes > 0 and threshold_ok:
             candidates.append(self.revocable_action)
 
         # PHASE 3+: Allow reject once at least 1 action attempted
-        if self.phase >= 3 and self.allow_rejection and self.solution['num_interactions'] > 0:
+        if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
             candidates.append(self.rejection_action)
 
         # ---- Build binary action mask ----
@@ -102,24 +104,23 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                 print("[ERROR] No valid fallback. Agent is stuck.")
 
         return mask
-
  
     def compute_reward(self, solution, revoke=False):
         if revoke:
             # Small penalty for backtracking
-            reward = -0.2 / self.v_net.num_nodes
+            reward = -1.25
         elif solution['early_rejection']:
             # Harsh penalty for giving up
-            reward = -1.0
+            reward = -5
         elif not solution['place_result'] or not solution['route_result']:
             # Step failed
-            reward = -0.5 / self.v_net.num_nodes
+            return -1
         elif solution['result']:
             # Final success
-            reward = solution['v_net_r2c_ratio']
+            reward = solution['v_net_r2c_ratio'] * 12.0
         else:
             # Intermediate success
-            reward = 1.0 / self.v_net.num_nodes
+            reward = 1
 
         self.solution['v_net_reward'] += reward
         return reward
@@ -272,10 +273,14 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         }
 
 
-    def get_history_actions(self):
+    def get_history_features(self):
         """
-        Return the sequence of previously placed physical node IDs as int64 array.
-        This is used by the transformer decoder.
+        Return context vectors for selected physical nodes (instead of raw node indices).
+        Uses already-computed features from p_net_obs['x'].
         """
-        return np.array(self.selected_p_net_nodes, dtype=np.int64)
+        p_net_x = self._get_p_net_obs()['x']
+        selected_indices = self.selected_p_net_nodes
 
+        history_feats = [p_net_x[i] for i in selected_indices]  # shape: (T, D)
+        return np.array(history_feats, dtype=np.float32)
+ 

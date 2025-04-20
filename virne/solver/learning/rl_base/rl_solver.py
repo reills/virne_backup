@@ -244,7 +244,7 @@ class RLSolver(Solver):
 
     def get_action_prob_dist(self, observation):
         with torch.no_grad():
-            action_logits = self.policy.act(observation)
+            action_logits = self.policy.act(observation )
         if 'action_mask' in observation and self.mask_actions:
             mask = observation['action_mask']
             candicate_action_logits = apply_mask_to_logit(action_logits, mask) 
@@ -254,24 +254,30 @@ class RLSolver(Solver):
         return action_prob_dist, candicate_action_logits
 
 
-    def select_action(self, observation, sample=True, use_failure_aware=False):
+    def select_action(self, observation, sample=True):
         with torch.no_grad():
-            action_logits = self.policy.act(observation) 
-            if torch.isnan(action_logits).any(): 
+            action_logits = self.policy.act(observation, training=sample)
+            if torch.isnan(action_logits).any():
                 print(f"Rank {self.rank} - Raw action_logits from policy: {action_logits}")
                 print(f"Rank {self.rank} - !!! NaN DETECTED in raw action_logits !!!")
                 print(f"Rank {self.rank} - Observation leading to NaN: {observation}") 
                 
-            if use_failure_aware:
-                failure_scores = self.policy.actor.decoder(observation, return_last_embed="failure_score")
-                alpha = 2.0  # Tune this
-                action_logits = action_logits - alpha * failure_scores.squeeze()
-
+        # === Logit normalization and clamping ===
+        action_logits = action_logits - action_logits.mean(dim=-1, keepdim=True)
+        action_logits = torch.clamp(action_logits, min=-10.0, max=10.0)
         if 'action_mask' in observation and self.mask_actions:
             mask = observation['action_mask']
-            candicate_action_logits = apply_mask_to_logit(action_logits, mask) 
+            candicate_action_logits = apply_mask_to_logit(action_logits, mask)
         else:
             candicate_action_logits = action_logits
+
+        # === Temperature scaling ===
+        if sample:
+            epoch = getattr(self, "training_epoch_id", 0)
+            temp = self.initial_temperature * (self.temperature_decay ** epoch)
+            self.softmax_temp = max(1.0, min(temp, 10.0))
+        else:
+            self.softmax_temp = 1.0  # inference always uses T=1.0
 
         candicate_action_dist = Categorical(logits=candicate_action_logits / self.softmax_temp)
         raw_action_dist = Categorical(logits=action_logits / self.softmax_temp)
@@ -295,8 +301,7 @@ class RLSolver(Solver):
 
         return action, action_logprob.cpu().detach().numpy()
 
-
-
+ 
     def evaluate_actions(self, old_observations, old_actions, return_others=False):
         actions_logits = self.policy.act(old_observations)
         actions_probs = F.softmax(actions_logits / self.softmax_temp, dim=-1)

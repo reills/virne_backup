@@ -29,13 +29,13 @@ def obs_as_tensor(obs, device, pad_token=None):
     if isinstance(obs, dict):
         data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'], obs['edge_attr'])
         obs_p_net = Batch.from_data_list([data]).to(device)
-        history_actions = torch.LongTensor(obs['history_actions']).unsqueeze(0).to(device)
+        history_feats = torch.tensor(obs['history_features'], dtype=torch.float32).unsqueeze(0).to(device)
         obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
         obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
 
         result = {
             'p_net': obs_p_net,
-            'history_actions': history_actions,
+            'history_features': history_feats,
             'encoder_outputs': obs_encoder_outputs,
             'action_mask': obs_action_mask,
             'curr_v_node_id': torch.tensor([obs['curr_v_node_id']], dtype=torch.long, device=device),
@@ -51,14 +51,15 @@ def obs_as_tensor(obs, device, pad_token=None):
 
     elif isinstance(obs, list):
         p_net_data_list = [get_pyg_data(o['p_net_x'], o['p_net_edge_index'], o['edge_attr']) for o in obs]
-        history_actions_list = [torch.LongTensor(o['history_actions']) for o in obs]
+        history_feats_list = [torch.tensor(o['history_features'], dtype=torch.float32) for o in obs]
         encoder_outputs_list = [o['encoder_outputs'] for o in obs]
         action_mask_list = [o['action_mask'] for o in obs]
         curr_v_ids = [o['curr_v_node_id'] for o in obs]
         vnfs_remaining = [o['vnfs_remaining'] for o in obs]
 
         obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
-        hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=pad_token).to(device)
+        hist_padded = pad_sequence(history_feats_list, batch_first=True).to(device)
+
 
         batch_size = len(encoder_outputs_list)
         max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
@@ -74,7 +75,7 @@ def obs_as_tensor(obs, device, pad_token=None):
 
         result = {
             'p_net': obs_p_net,
-            'history_actions': hist_padded,
+            'history_features': hist_padded,
             'encoder_outputs': enc_padded,
             'action_mask': act_mask_t,
             'curr_v_node_id': torch.tensor(curr_v_ids, dtype=torch.long, device=device),
@@ -125,6 +126,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         self.policy_builder_args = kwargs 
         
         # Initialize parent classes
+        self.max_seq_len = kwargs.get("max_seq_len", 15)
         make_policy = kwargs.pop("make_policy", policy_builder)
         obs_as_tensor_func = kwargs.pop("obs_as_tensor", obs_as_tensor )
         self.v_dimension_features = kwargs.get("v_dimension_features", None)
@@ -140,6 +142,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         # New hyperparameters
         self.entropy_coef = kwargs.get("entropy_coef", 0.05)
         self.normalize_advantage = kwargs.get("normalize_advantage", True)
+        self.initial_temperature =    kwargs.get("initial_temperature", 2.0)
+        self.temperature_decay =   kwargs.get("temperature_decay", 0.97)
+        self.softmax_temp = 1.0 
  
         # Special start token (we use p_net.num_nodes as start token)
         self.start_token = self.policy.actor.decoder.start_token
@@ -150,28 +155,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         # # Retrieve pretrained RL model path (if any)
         self.rl_pretrained_path = kwargs.get("pretrained_model_path", None) 
         self.grad_accum_steps = 4  # or whatever you want
-        self._grad_step = 0
-        #if self.rl_pretrained_path is not None:
-        #    print(f"Pretrained model path specified: {self.rl_pretrained_path}")
-        #    self.load_model(self.rl_pretrained_path) # Call the inherited load_model method
-        #else:
-        #    print("No pretrained model path specified, starting from scratch.")
-            
-        # # Retrieve pretrained model path from kwargs
-        # self.behavioral_cloning_path = kwargs.get("pretrained_bc_path", None)   
-
-        # # # Load the behavioral cloning if it exisys and there is no RL pretraining 
-        # if (not self.rl_pretrained_path or not os.path.exists(self.rl_pretrained_path)) and os.path.exists(self.behavioral_cloning_path):
-        #      with warnings.catch_warnings():
-        #          warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-        #          checkpoint = torch.load(self.behavioral_cloning_path, map_location=self.device)
-
-        #          self.policy.load_state_dict(checkpoint['model_state_dict'])
-        #          #print(f"Loaded pretrained model from {checkpoint}")
-        #          pretrained_loaded = True
+        self._grad_step = 0 
                  
     # Inside A3CGcnPreTrainTransformerSolver class
     def solve(self, instance):
+        phase = -1
         v_net, p_net = instance['v_net'], instance['p_net']
 
         instance_env = self.InstanceEnv(
@@ -183,14 +171,16 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         encoder_obs = instance_env.get_observation()
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
-        history_actions = [self.start_token]
+        history_features = []
+        
+
 
         done = False
         while not done:
-            rtg = [0.0] * len(history_actions)
+            rtg = [0.0] * len(history_features)
 
             instance_obs = self.make_instance_obs(
-                history_actions, encoder_obs, encoder_outputs, instance_env, rtg=rtg
+                history_features, encoder_obs, encoder_outputs, instance_env, rtg=rtg
             )
 
             #   Cache for revoke() support
@@ -207,13 +197,19 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             action, action_logprob = self.select_action(tensor_obs, sample=False)
             obs, reward, done, info = instance_env.step(action)
-            history_actions.append(action)
+            
+            if action == self.policy.actor.decoder.num_actions - 2:
+                selected_node_feats = self.policy.actor.decoder.revoke_embedding.detach().cpu().numpy()
+            elif action == self.policy.actor.decoder.num_actions - 1:
+                selected_node_feats = self.policy.actor.decoder.reject_embedding.detach().cpu().numpy()
+            else:
+                selected_node_feats = encoder_obs['p_net_x'][action]
+            history_features.append(selected_node_feats)
 
             if not done:
-                encoder_obs = obs  # 🟢 Important for continuity
+                encoder_obs = obs   
 
-        return instance_env.solution
-
+        return instance_env.solution 
 
     
     def backward_loss(self, loss):
@@ -267,8 +263,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         if self.normalize_advantage and all_advantages.numel() > 0:
             all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
 
-        all_advantages = torch.clamp(all_advantages, -5.0, 5.0)
-
+        #all_advantages = torch.clamp(all_advantages, -5.0, 5.0) 
         grad_clipped_value = 0.0
         total_loss_value = 0.0
 
@@ -292,7 +287,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 logits = self.policy.act(obs_tensors)
                 values = self.policy.evaluate(obs_tensors).squeeze(-1)
 
-                logits = torch.clamp(logits, min=-10, max=10)
+                #logits = torch.clamp(logits, min=-10, max=10)
                 dist = torch.distributions.Categorical(logits=logits, validate_args=False)
                 action_logprobs = dist.log_prob(actions)
                 dist_entropy = dist.entropy()
@@ -304,7 +299,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 entropy_loss = dist_entropy.mean()
                 total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
 
-                # 🔴 DEBUG: Per-microbatch loss diagnostics
+                # Per-microbatch loss diagnostics
                 print(f"[update step {step}] actor_loss: {actor_loss.item():.4f}")
                 print(f"[update step {step}] mean logprob: {action_logprobs.mean().item():.4f}, std: {action_logprobs.std().item():.4f}")
                 print(f"[update step {step}] mean advantage: {advantages.mean().item():.4f}, std: {advantages.std().item():.4f}")
@@ -335,7 +330,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         entropy_val /= grad_accum_steps
         avg_total_loss = total_loss_value / grad_accum_steps
 
-        # 🔵 DEBUG: Summary after all microbatches
+        # DEBUG: Summary after all microbatches
         print(f"\n[update summary] avg_actor_loss: {actor_loss_val:.4f}, avg_critic_loss: {critic_loss_val:.4f}, avg_entropy: {entropy_val:.4f}")
 
         grad_clipped_value = self.perform_accumulated_step_and_sync()
@@ -362,32 +357,23 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             if self.shared_optimizer is None or self.shared_policy is None or self.lock is None:
                 raise RuntimeError(f"[Rank {self.rank}] Missing shared components in distributed mode.")
 
-            with self.lock:
-                # 1. Sync accumulated grads to shared policy
+            with self.lock: # 1. Sync accumulated grads to shared policy 
                 sync_gradients(self.shared_policy, self.policy)
                 
                 # Average gradients by dividing by num_workers
                 for param in self.shared_policy.parameters():
                     if param.grad is not None:
-                        param.grad.div_(self.num_workers)
-
-                # 2. Clip gradients on shared policy
-                grad_norm = self.clip_grads(self.shared_policy, self.shared_optimizer)
-
-                # 3. Step optimizer
-                self.optimizer_step(self.shared_optimizer) 
-
-                # 4. Clear grads
-                self.zero_grads(self.policy, self.shared_optimizer)
+                        param.grad.div_(self.num_workers) 
+                grad_norm = self.clip_grads(self.shared_policy, self.shared_optimizer)  # 2. Clip gradients on shared policy
+                self.optimizer_step(self.shared_optimizer)   # 3. Step optimizer
+                self.zero_grads(self.policy, self.shared_optimizer) # 4. Clear grads
 
         else:
             if self.optimizer is None:
                 raise RuntimeError(f"[Rank {self.rank}] Missing local optimizer in non-distributed mode.")
 
             grad_norm = self.clip_grads(self.policy, self.optimizer)
-
             self.optimizer_step(self.optimizer)
-            
             self.zero_grads(self.policy, self.optimizer)
 
         if isinstance(grad_norm, torch.Tensor):
@@ -396,34 +382,45 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
     
         
         
-    def make_instance_obs(self, history_actions, encoder_obs, encoder_outputs, sub_env, rtg=None):
-        # Step 1: Remove invalid actions (e.g., 100 = pad, 101 = revoke)
-        filtered = [a for a in history_actions if a not in [100, 101]]
-        final_history_actions = [self.start_token] + filtered[:25]
+    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env, rtg=None):
+        """
+        Constructs an observation dict using the given history of physical node feature vectors.
+        """
+        # Step 1: Truncate or pad history to max length (25 used as a cap here)
+        max_len = self.max_seq_len
+        trimmed_history = history_features[:max_len]
 
-        # Step 2: Fix RTG length to match final_history_actions
+        # Step 2: Pad with zeros if shorter than max_len
+        if not trimmed_history:
+            # Use learnable start token
+            start_token = self.policy.actor.decoder.start_embedding.detach().cpu().numpy()
+            trimmed_history = [start_token]
+
+        dim = len(trimmed_history[0])
+        if len(trimmed_history) < max_len:
+            pad = np.zeros((max_len - len(trimmed_history), dim), dtype=np.float32)
+            trimmed_history = np.vstack([trimmed_history, pad])
+
+        # Step 3: Adjust RTG to match history length
         if rtg is not None:
-            if len(rtg) > len(final_history_actions):
-                rtg = rtg[:len(final_history_actions)]
-            elif len(rtg) < len(final_history_actions):
-                rtg = list(rtg) + [0.0] * (len(final_history_actions) - len(rtg))
+            rtg = rtg[:max_len] + [0.0] * (max_len - len(rtg))
         else:
-            rtg = [0.0] * len(final_history_actions)
+            rtg = [0.0] * max_len
 
         obs = {
             'p_net_x': encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
             'edge_attr': encoder_obs['edge_attr'],
-            'history_actions': np.array(final_history_actions, dtype=np.int64),
+            'history_features': np.array(trimmed_history, dtype=np.float32),  # 🔁 new key
             'encoder_outputs': encoder_outputs,
             'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0),
             'rtg': np.array(rtg, dtype=np.float32).reshape(1, -1),
             'curr_v_node_id': encoder_obs['curr_v_node_id'],
             'vnfs_remaining': encoder_obs['vnfs_remaining'],
         }
+
         return obs
-
-
+ 
  
     def learn_with_instance(self, instance):
         """Collect one trajectory and store it in the buffer."""
@@ -431,10 +428,12 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         v_net, p_net = instance['v_net'], instance['p_net']
         
         # Curriculum logic: decide which phase we're in
-        if self.epoch_id < 10:
-            phase = 1
-        elif self.epoch_id < 20:
-            phase = 2
+        if self.training_epoch_id < 10:
+            phase = 1 #include no special actions
+        elif self.training_epoch_id < 20:
+            phase = 2 #include revoke
+        elif self.training_epoch_id < 20:
+            phase = 3 #include reject
         else:
             phase = 3
     
@@ -443,13 +442,13 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         encoder_obs = sub_env.get_observation()
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
-        history_actions = [self.start_token]
+        history_features = []  # List of [D] feature vectors
         instance_done = False
          
         while not instance_done:
             #dummy first pass
-            rtg_slice = [0.0] * len(history_actions)
-            instance_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
+            rtg_slice = [0.0] * len(history_features)
+            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
 
             sub_env.prev_obs = {
                 **instance_obs,
@@ -464,11 +463,20 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             }
             sub_env.prev_tensor_obs = tensor_instance_obs_cpu 
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
+            # --- Determine which embedding to insert ---
+            if action == self.policy.actor.decoder.num_actions - 2:  # revoke
+                selected_node_feats = self.policy.actor.decoder.revoke_embedding.detach().cpu().numpy()
+            elif action == self.policy.actor.decoder.num_actions - 1:  # reject
+                selected_node_feats = self.policy.actor.decoder.reject_embedding.detach().cpu().numpy()
+            else:
+                selected_node_feats = encoder_obs['p_net_x'][action]
+
+            history_features.append(selected_node_feats)
+
             value = self.estimate_value(tensor_instance_obs) if hasattr(self.policy, 'evaluate') else None
             
             next_obs, reward, instance_done, info = sub_env.step(action)  
-            sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value)
-            history_actions.append(action)
+            sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value) 
             
             if not instance_done:
                 encoder_obs = next_obs
@@ -478,15 +486,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         # Inject correct RTG values into buffer observations
         for i, obs in enumerate(sub_buffer.observations):
-            rtg_slice = rtg[:len(obs['history_actions'])]  # ← add +1 if rtg is one shorter than history
-            if len(rtg_slice) < len(obs['history_actions']):
+            rtg_slice = rtg[:len(obs['history_features'])]
+            if len(rtg_slice) < len(obs['history_features']):
                 rtg_slice = np.pad(rtg_slice, (0, 1), constant_values=0.0)
-
             obs['rtg'] = np.array(rtg_slice, dtype=np.float32)
                 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_actions, encoder_obs, encoder_outputs, sub_env, rtg=[0.0]*len(history_actions))
+            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=[0.0]*len(history_features))
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
          
@@ -507,7 +514,7 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         p_net_num_nodes=action_dim,
         p_net_feature_dim=p_dimension_features,
         v_net_feature_dim=v_dimension_features,
-        embedding_dim=256,
+        embedding_dim=128,
         n_heads=8,
         n_layers=6,
         dropout=0.1,

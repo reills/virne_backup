@@ -58,7 +58,7 @@ class RolloutBuffer:
     def is_full(self):
         if self.max_size is None:
             return False
-        return self.curr_id == self.max_size
+        return self.curr_idx == self.max_size
 
     def add(self, obs, action, reward, done, logprob, value=None):
         def move_to_cpu(x):

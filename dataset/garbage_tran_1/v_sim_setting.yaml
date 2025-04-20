@@ -1,0 +1,56 @@
+arrival_rate:
+  distribution: lognormal
+  dtype: float
+  mean: 2.0
+  sigma: 1.5
+events_file_name: events.yaml
+lifetime:
+  distribution: exponential
+  dtype: float
+  scale: 1000
+link_attrs_setting:
+- distribution: uniform
+  dtype: int
+  generative: true
+  high: 50
+  low: 0
+  name: bw
+  owner: link
+  type: resource
+node_attrs_setting:
+- distribution: uniform
+  dtype: int
+  generative: true
+  high: 50
+  low: 0
+  name: cpu
+  owner: node
+  type: resource
+- distribution: uniform
+  dtype: int
+  generative: true
+  high: 50
+  low: 0
+  name: gpu
+  owner: node
+  type: resource
+- distribution: uniform
+  dtype: int
+  generative: true
+  high: 50
+  low: 0
+  name: rom
+  owner: node
+  type: resource
+num_v_nets: 2000
+save_dir: dataset/garbage
+setting_file_name: v_sim_setting.yaml
+topology:
+  type: path
+v_net_size:
+  distribution: uniform
+  dtype: int
+  high: 15
+  low: 2
+v_nets_file_name: v_net.gml
+v_nets_save_dir: v_nets

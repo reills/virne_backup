@@ -1353,15 +1353,7 @@ class Controller:
         else:
             return shortest_path
         
-    
-    def has_feasible_path(self, graph, source, target, weight=None, max_hop=1e6):
-        try:
-            # Early exit Dijkstra-style check
-            lengths = nx.single_source_dijkstra_path_length(graph, source, cutoff=max_hop, weight=weight)
-            return target in lengths
-        except Exception:
-            return False
-    
+     
     
     def create_available_network(self, v_net: VirtualNetwork, p_net: PhysicalNetwork, v_link_pair):
         def available_link(n1, n2):
@@ -1391,8 +1383,10 @@ class Controller:
         check_node_constraint: bool = True,
         check_link_constraint: bool = True,
         p_node_prev: int = None,
-        solution: Solution = None
-    ):
+        solution: Solution = None,
+        phase: int = -1
+    ): 
+        
         all_p_nodes = np.array(list(p_net.nodes))
         if check_node_constraint:
             suitable_nodes = [p_node_id for p_node_id in all_p_nodes if self.check_node_constraints(v_net, p_net, v_node_id, p_node_id)[0]]
@@ -1411,27 +1405,28 @@ class Controller:
             suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
             candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
 
-        # === Efficient Path Feasibility Pruning ===
-        if p_node_prev is not None and solution is not None:
-            try:
-                ranked_list = [int(v) for v in v_net.ranked_nodes]
-                current_v_idx = ranked_list.index(v_node_id)
-                if current_v_idx > 0:
-                    prev_v_node_id = ranked_list[current_v_idx - 1]
-                    v_link_id = (int(min(prev_v_node_id, v_node_id)), int(max(prev_v_node_id, v_node_id)))
-                    temp_p_net = self.create_available_network(v_net, p_net, v_link_id)
+        if phase != -1:
+            # === Bandwidth-Aware Path Pruning via available_k_shortest ===
+            if p_node_prev is not None and solution is not None:
+                try:
+                    ranked_list = [int(v) for v in v_net.ranked_nodes]
+                    current_v_idx = ranked_list.index(v_node_id)
+                    if current_v_idx > 0:
+                        prev_v_node_id = ranked_list[current_v_idx - 1]
+                        v_link_id = (prev_v_node_id, v_node_id)  # Keep direction if links are directional
 
-                    # Just check if a feasible path exists, not k of them
-                    weight = self.link_latency_attrs[0].name if self.link_latency_attrs else None
-                    candidate_nodes = [
-                        p_node for p_node in candidate_nodes
-                        if p_node != p_node_prev and self.has_feasible_path(temp_p_net, p_node_prev, p_node, weight=weight)
-                    ]
+                        candidate_nodes = [
+                            p_node for p_node in candidate_nodes
+                            if p_node != p_node_prev and len(self.find_shortest_paths(
+                                v_net, p_net, v_link_id, (p_node_prev, p_node),
+                                method='available_k_shortest', k=3
+                            )) > 0
+                        ]
+                except Exception as e:
+                    import traceback
+                    print(f"[find_candidate_nodes] ERROR during k-shortest path check: {e}")
+                    traceback.print_exc()
 
-            except Exception as e:
-                import traceback
-                print(f"[find_candidate_nodes] ERROR during path check: {e}")
-                traceback.print_exc()
 
         return candidate_nodes
     

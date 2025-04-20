@@ -43,15 +43,15 @@ class Config(ClassDict):
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
-    use_fixed_dataset: bool = False
-    dir_save_dataset: str = "dataset/results-trans-sfc"
+    use_fixed_dataset: bool = True
+    dir_save_dataset: str = "dataset/garbage"
     if_dynamic_v_nets: bool = True
 
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
     #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
-    pretrained_model_path: str = ''#''/home/stephen-reilly/dev/virne/dataset/april15_results/output/model/model.pkl'
+    pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/garbage/output/model/model.pkl'#''/home/stephen-reilly/dev/virne/dataset/april15_results/output/model/model.pkl'
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
@@ -66,19 +66,20 @@ class Config(ClassDict):
     allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
 
     ### Training ###
-    num_epochs: int = 2
+    num_epochs: int = 1
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
     distributed_training: bool = False
     num_train_epochs: int = 0 #changed by me was 100
     num_workers: int = 1 #changed by me was 10
-    batch_size: int = 256 # changed by me was 128
+    batch_size: int = 128 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
-    eval_interval: int = 400 #changed was 10
+    eval_interval: int = 10 #changed was 10
     curriculum_phase: int = 0
+    
 
     ### Neural Network ###
     embedding_dim: int = 128   # Embedding dimension
@@ -96,21 +97,22 @@ class Config(ClassDict):
     v_dimension_features: int = 4
     use_amp: bool= False
 
-
     ### Reinforcement Learning ###
+    initial_temperature: float = 2.0
+    temperature_decay: float = 0.97
     rl_gamma: float = 0.99
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
     lr_actor: float = 5e-5
-    lr_critic: float = 5e-5
+    lr_critic: float = 5e-4
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 
     ### Loss ###
     coef_critic_loss: float = 0.5
-    coef_entropy_loss: float = 0.01
-    coef_mask_loss: float = 0.01
-    reward_weight: float = 0.5
+    coef_entropy_loss: float = 0.1
+    coef_mask_loss: float = 0.05
+    reward_weight: float = 0.1
 
     lr_penalty_params: float = 1e-3
     lr_cost_critic: float = 1e-3

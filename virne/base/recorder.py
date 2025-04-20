@@ -233,9 +233,12 @@ class Recorder:
 
     def get_record(self, event_id: int = None, v_net_id: int = None):
         """Get the record of the service function chain `v_net_id`."""
+        
         if event_id is not None: event_id = event_id
         elif v_net_id is not None: event_id = self.v_net_event_dict[v_net_id]
         else: event_id = self.state['event_id']
+         
+
         return self.memory[int(event_id)]
 
     def display_record(
