@@ -18,12 +18,30 @@ from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
 from .instance_env import InstanceEnv
 from .net import ActorCritic 
+
+from torch.amp import autocast, GradScaler
 from virne.solver.learning.rl_base.shared_adam import SharedAdam, sync_gradients
 from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2CSolver, RolloutBuffer
 
 from ..utils import get_pyg_data
 
-
+def apply_mask_to_logit(logit, mask=None):
+        """
+        Apply a mask to a given logits tensor.  Returns: masked_logit (tensor): the masked logits tensor
+        """
+        if mask is None:
+            return logit
+        # mask = torch.IntTensor(mask).to(logit.device).expand_as(logit)
+        # masked_logit = logit + mask.log()
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.BoolTensor(mask)
+        
+        NEG_TENSER = torch.tensor(-1e8).float()
+        mask = mask.bool().to(logit.device).reshape(logit.size())
+        mask_value_tensor = NEG_TENSER.type_as(logit).to(logit.device)
+        masked_logit = torch.where(mask, logit, mask_value_tensor)
+        return masked_logit
+    
 def obs_as_tensor(obs, device, pad_token=None):
     """Preprocess the entire observation into tensor form."""
     if isinstance(obs, dict):
@@ -84,8 +102,8 @@ def obs_as_tensor(obs, device, pad_token=None):
         }
 
         if 'rtg' in obs[0]:
-            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32) for o in obs]
-            padded_rtg = pad_sequence(rtg_list, batch_first=True).to(device)
+            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32).squeeze(0) for o in obs]  # shape (T,)
+            padded_rtg = pad_sequence(rtg_list, batch_first=True).unsqueeze(-1).to(device)     # (B, T, 1)
             result['rtg'] = padded_rtg
 
         return result
@@ -156,7 +174,50 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         self.rl_pretrained_path = kwargs.get("pretrained_model_path", None) 
         self.grad_accum_steps = 4  # or whatever you want
         self._grad_step = 0 
+        self.num_workers
+        
+        
+        self.use_amp = kwargs.get('use_amp', False) 
+        self.scaler = GradScaler() if self.use_amp else None 
                  
+    
+    def select_action(self, observation, sample: bool = True):
+        """
+        Policy evaluation wrapper.
+        Expects policy.act() to return logits that are already:
+        • masked with –∞  (or the closest representable number)
+        • clamped to [‑15, 15] for *valid* actions
+        No further masking or clamping is performed here.
+        """
+        with torch.no_grad():
+            raw_logits = self.policy.act(observation, training=False)  # May be float16 if AMP is on
+
+        # === Sanity check for NaNs ===
+        if not torch.isfinite(raw_logits).all():
+            minus_inf = -torch.finfo(raw_logits.dtype).max
+            raw_logits = torch.nan_to_num(raw_logits, nan=minus_inf, posinf=15.0, neginf=minus_inf)
+
+        # === Apply temperature and Categorical in FP32 ===
+        T = 1.0
+        if sample:
+            epoch = getattr(self, "training_epoch_id", 0)
+            T_raw = self.initial_temperature * (self.temperature_decay ** epoch)
+            T = max(0.5, min(T_raw, 10.0))
+
+        with torch.amp.autocast(device_type="cuda",enabled=False):  # Force FP32 for this part
+            logits_f32 = (raw_logits / T).float()
+            dist = Categorical(logits=logits_f32)
+            action = dist.sample() if sample else dist.probs.argmax(dim=-1)
+            logp = dist.log_prob(action)
+
+        # Final checks and return
+        if not torch.isfinite(logp).all():
+            logp = torch.nan_to_num(logp, nan=-20.0, neginf=-20.0, posinf=-20.0)
+
+        if action.numel() == 1:
+            return action.item(), logp.item()
+        return action.cpu().numpy(), logp.cpu().numpy()
+     
     # Inside A3CGcnPreTrainTransformerSolver class
     def solve(self, instance):
         phase = -1
@@ -239,12 +300,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         optimizer.zero_grad(set_to_none=True)
         model.zero_grad(set_to_none=True)
     
-    def update(self):
-        """
-        Performs memory-efficient policy update using gradient accumulation.
-        Slices self.buffer into micro-batches to reduce peak GPU memory usage.
-        Returns averaged loss values for logging.
-        """
+    def update(self, print_logs=False):
+        """Performs memory-efficient policy update using gradient accumulation."""
         grad_accum_steps = self.grad_accum_steps
         buffer_size = self.buffer.size()
 
@@ -256,21 +313,15 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         all_values = self.policy.evaluate(self.preprocess_obs(self.buffer.observations, self.device, pad_token=self.pad_token)).squeeze(-1).detach()
         all_advantages = all_returns - all_values
 
-        # 🟡 DEBUG: Check critic prediction quality
-        print("[debug] returns mean:", all_returns.mean().item(), "values mean:", all_values.mean().item())
-        print("[debug] raw advantages mean:", all_advantages.mean().item(), "std:", all_advantages.std().item())
+        if print_logs:
+            print("[debug] returns mean:", all_returns.mean().item(), "values mean:", all_values.mean().item())
+            print("[debug] raw advantages mean:", all_advantages.mean().item(), "std:", all_advantages.std().item())
 
         if self.normalize_advantage and all_advantages.numel() > 0:
             all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
 
-        #all_advantages = torch.clamp(all_advantages, -5.0, 5.0) 
-        grad_clipped_value = 0.0
+        actor_loss_val, critic_loss_val, entropy_val = 0.0, 0.0, 0.0
         total_loss_value = 0.0
-
-        # Initialize accumulators for loss tracking
-        actor_loss_val = 0.0
-        critic_loss_val = 0.0
-        entropy_val = 0.0
 
         for step in range(grad_accum_steps):
             start_idx = step * micro_batch_size
@@ -282,56 +333,59 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             obs_tensors = self.preprocess_obs(obs_slice, self.device, pad_token=self.pad_token)
 
+            # Step 1: Network Forward Pass in AMP
             amp_ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
             with amp_ctx:
-                logits = self.policy.act(obs_tensors)
-                values = self.policy.evaluate(obs_tensors).squeeze(-1)
+                logits_raw = self.policy.act(obs_tensors)
+                values_raw = self.policy.evaluate(obs_tensors).squeeze(-1)
 
-                #logits = torch.clamp(logits, min=-10, max=10)
-                dist = torch.distributions.Categorical(logits=logits, validate_args=False)
+            # Step 2: Distribution & Loss Calculation in FP32
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                logits_f32 = logits_raw.float()
+                values_f32 = values_raw.float()
+                advantages_f32 = all_advantages[start_idx:end_idx].float()
+                returns_f32 = returns.float()
+
+                dist = torch.distributions.Categorical(logits=logits_f32, validate_args=False)
                 action_logprobs = dist.log_prob(actions)
                 dist_entropy = dist.entropy()
 
-                advantages = all_advantages[start_idx:end_idx]
-
-                actor_loss = -(action_logprobs * advantages).mean()
-                critic_loss = F.mse_loss(returns, values)
+                actor_loss = -(action_logprobs * advantages_f32).mean()
+                critic_loss = F.mse_loss(returns_f32, values_f32)
                 entropy_loss = dist_entropy.mean()
                 total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
 
-                # Per-microbatch loss diagnostics
+            # Logging
+            if print_logs:
                 print(f"[update step {step}] actor_loss: {actor_loss.item():.4f}")
+                print(f"[update step {step}] critic_loss: {critic_loss.item():.4f}")
                 print(f"[update step {step}] mean logprob: {action_logprobs.mean().item():.4f}, std: {action_logprobs.std().item():.4f}")
-                print(f"[update step {step}] mean advantage: {advantages.mean().item():.4f}, std: {advantages.std().item():.4f}")
+                print(f"[update step {step}] mean advantage: {advantages_f32.mean().item():.4f}, std: {advantages_f32.std().item():.4f}")
                 print(f"[update step {step}] entropy: {entropy_loss.item():.4f}")
-                print(f"[update step {step}] logits range: min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+                print(f"[update step {step}] raw logits range: min={logits_raw.min().item():.4f}, max={logits_raw.max().item():.4f}")
 
-                # Track summed losses for averaging
-                actor_loss_val += actor_loss.item()
-                critic_loss_val += critic_loss.item()
-                entropy_val += entropy_loss.item()
-                total_loss_value += total_loss.item()
+            # Accumulate losses
+            actor_loss_val += actor_loss.item()
+            critic_loss_val += critic_loss.item()
+            entropy_val += entropy_loss.item()
+            total_loss_value += total_loss.item()
 
+            # Step 3: Backpropagation
             scaled_loss = total_loss / grad_accum_steps
             self.backward_loss(scaled_loss)
 
             # Cleanup
-            for var in ['obs_tensors', 'actions', 'returns', 'logits', 'values', 'dist',
-                        'action_logprobs', 'dist_entropy', 'advantages', 'actor_loss',
-                        'critic_loss', 'entropy_loss', 'total_loss']:
-                try: del locals()[var]
-                except KeyError: pass
-
             gc.collect()
             torch.cuda.empty_cache()
 
+        # Average losses
         actor_loss_val /= grad_accum_steps
         critic_loss_val /= grad_accum_steps
         entropy_val /= grad_accum_steps
         avg_total_loss = total_loss_value / grad_accum_steps
 
-        # DEBUG: Summary after all microbatches
-        print(f"\n[update summary] avg_actor_loss: {actor_loss_val:.4f}, avg_critic_loss: {critic_loss_val:.4f}, avg_entropy: {entropy_val:.4f}")
+        if print_logs:
+            print(f"\n[update summary] avg_actor_loss: {actor_loss_val:.4f}, avg_critic_loss: {critic_loss_val:.4f}, avg_entropy: {entropy_val:.4f}")
 
         grad_clipped_value = self.perform_accumulated_step_and_sync()
 
@@ -382,30 +436,35 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
     
         
         
+    
     def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env, rtg=None):
         """
         Constructs an observation dict using the given history of physical node feature vectors.
         """
-        # Step 1: Truncate or pad history to max length (25 used as a cap here)
         max_len = self.max_seq_len
-        trimmed_history = history_features[:max_len]
 
-        # Step 2: Pad with zeros if shorter than max_len
-        if not trimmed_history:
-            # Use learnable start token
-            start_token = self.policy.actor.decoder.start_embedding.detach().cpu().numpy()
-            trimmed_history = [start_token]
+        # Step 1: Prepend start token to history
+        start_token = self.policy.actor.decoder.start_embedding.detach().cpu().numpy()
+        trimmed_history = [start_token] + history_features[:max_len - 1]  # total length will be <= max_len
 
+        # Step 2: Pad history to max_len
         dim = len(trimmed_history[0])
         if len(trimmed_history) < max_len:
             pad = np.zeros((max_len - len(trimmed_history), dim), dtype=np.float32)
             trimmed_history = np.vstack([trimmed_history, pad])
-
-        # Step 3: Adjust RTG to match history length
-        if rtg is not None:
-            rtg = rtg[:max_len] + [0.0] * (max_len - len(rtg))
         else:
-            rtg = [0.0] * max_len
+            trimmed_history = np.vstack(trimmed_history[:max_len])
+
+        # Step 3: Match RTG to history length
+        if rtg is not None:
+            rtg = [0.0] + rtg[:max_len - 1]  # same logic as history
+        else:
+            rtg = [0.0]
+
+        # Pad or trim RTG to max_len
+        rtg = rtg + [0.0] * (max_len - len(rtg))
+        rtg = np.array(rtg, dtype=np.float32).reshape(1, -1)
+    
 
         obs = {
             'p_net_x': encoder_obs['p_net_x'],
@@ -422,17 +481,18 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         return obs
  
  
+    
     def learn_with_instance(self, instance):
         """Collect one trajectory and store it in the buffer."""
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
         
-        # Curriculum logic: decide which phase we're in
-        if self.training_epoch_id < 10:
+        # Curriculum logic: decide which phase we're in (5 workers = 5*5epochs = 25th epoch)
+        if self.training_epoch_id < (20 / self.num_workers) :
             phase = 1 #include no special actions
-        elif self.training_epoch_id < 20:
+        elif self.training_epoch_id < (60/ self.num_workers):
             phase = 2 #include revoke
-        elif self.training_epoch_id < 20:
+        elif self.training_epoch_id < (80 / self.num_workers):
             phase = 3 #include reject
         else:
             phase = 3
@@ -486,10 +546,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         # Inject correct RTG values into buffer observations
         for i, obs in enumerate(sub_buffer.observations):
-            rtg_slice = rtg[:len(obs['history_features'])]
-            if len(rtg_slice) < len(obs['history_features']):
-                rtg_slice = np.pad(rtg_slice, (0, 1), constant_values=0.0)
-            obs['rtg'] = np.array(rtg_slice, dtype=np.float32)
+            hist_len = obs['history_features'].shape[0]  # should be 15
+            rtg_slice = rtg[:hist_len]
+            if len(rtg_slice) < hist_len:
+                rtg_slice = np.pad(rtg_slice, (0, hist_len - len(rtg_slice)), constant_values=0.0)
+            else:
+                rtg_slice = rtg_slice[:hist_len]
+            obs['rtg'] = np.array(rtg_slice, dtype=np.float32).reshape(1, -1)  # (1, T)
+
                 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
@@ -499,9 +563,6 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
          
 
         return sub_env.solution, sub_buffer, last_value
-        #print(f"Last Value: {last_value}")
-        #print(f"Rewards: {sub_buffer.rewards}")
-        #print(f"Values: {sub_buffer.values}")
 
 def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable, is_rejection,use_amp, **kwargs):
     """
@@ -517,7 +578,7 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         embedding_dim=128,
         n_heads=8,
         n_layers=6,
-        dropout=0.1,
+        dropout=0.2,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection,
         use_amp=use_amp,

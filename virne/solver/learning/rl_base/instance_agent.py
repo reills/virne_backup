@@ -123,7 +123,11 @@ class InstanceAgent(object):
             pass
         return self.buffer
 
+    
+    
     def learn_singly(self, env, num_epochs=1, **kwargs): 
+        
+
         for epoch_id in range(num_epochs):
             if self.verbose > 0:
                 print(f'=============== Training Epoch: {epoch_id} ===================')
@@ -139,6 +143,9 @@ class InstanceAgent(object):
             actor_loss_val = 0.0
             critic_loss_val = 0.0
             entropy_val = 0.0
+            updates_this_epoch = 0 
+            update_log_indices = set()  # ← define here
+
 
             while True:
                 solution, instance_buffer, last_value = self.learn_with_instance(instance)
@@ -149,16 +156,32 @@ class InstanceAgent(object):
                     success_count += 1
                     revenue2cost_list.append(solution['v_net_r2c_ratio'])
 
-                # Update when buffer is full
+                # Update when buffer is full 
                 if self.buffer.size() >= self.target_steps:
-                    _, _, actor_loss_val, critic_loss_val, entropy_val = self.update()
+                    updates_this_epoch += 1
+                    
+                    # Now that we know how many updates happened, compute the logging steps
+                    if updates_this_epoch == 3:
+                        update_log_indices = {
+                            1,
+                            updates_this_epoch // 2,
+                            updates_this_epoch
+                        }
+
+                    # Schedule logging on the 1st, middle, and last update
+                    print_logs_now = updates_this_epoch in update_log_indices or updates_this_epoch <= 2
+                    _, _, actor_loss_val, critic_loss_val, entropy_val = self.update(print_logs_now)
 
                 instance, reward, done, info = env.step(solution)
                 torch.cuda.empty_cache()
 
                 if done:
                     break
-
+            
+            
+                
+            # Fix for 0D logprobs: wrap scalars into 1D arrays
+            epoch_logprobs = [lp if isinstance(lp, np.ndarray) and lp.ndim > 0 else np.array([lp]) for lp in epoch_logprobs]
             epoch_logprobs_tensor = np.concatenate(epoch_logprobs, axis=0)
 
             if self.verbose > 0:
@@ -176,3 +199,4 @@ class InstanceAgent(object):
                     self.save_model(f'model-worker{self.rank}-epoch{epoch_id}.pkl')
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)
+

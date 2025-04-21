@@ -2,6 +2,7 @@
 .vscode
 
 #datasets
+dataset/garbage*
 dataset/results*
 dataset/april15_results
 *.pth

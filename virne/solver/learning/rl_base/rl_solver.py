@@ -21,7 +21,6 @@ from torch.utils.tensorboard import SummaryWriter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from abc import abstractmethod
 
-from torch.amp import autocast, GradScaler
 from contextlib import nullcontext
 
 
@@ -150,7 +149,6 @@ class RLSolver(Solver):
         self.clip_reward = kwargs.get('clip_reward', False)
         self.clip_reward = kwargs.get('max_reward', 1.0)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.)
-        self.use_amp = kwargs.get('use_amp', False)
         self.softmax_temp = 1.
 
         print(f'save_dir: {self.save_dir}')
@@ -184,7 +182,6 @@ class RLSolver(Solver):
         
         self.preprocess_obs = obs_as_tensor
         
-        self.scaler = GradScaler() if self.use_amp else None 
 
 
      
@@ -252,94 +249,6 @@ class RLSolver(Solver):
             candicate_action_logits = action_logits
         action_prob_dist = F.softmax(candicate_action_logits / self.softmax_temp, dim=-1)
         return action_prob_dist, candicate_action_logits
-
-
-    def select_action(self, observation, sample=True):
-        with torch.no_grad():
-            action_logits = self.policy.act(observation, training=sample)
-            if torch.isnan(action_logits).any():
-                print(f"Rank {self.rank} - Raw action_logits from policy: {action_logits}")
-                print(f"Rank {self.rank} - !!! NaN DETECTED in raw action_logits !!!")
-                print(f"Rank {self.rank} - Observation leading to NaN: {observation}") 
-                
-        # === Logit normalization and clamping ===
-        action_logits = action_logits - action_logits.mean(dim=-1, keepdim=True)
-        action_logits = torch.clamp(action_logits, min=-10.0, max=10.0)
-        if 'action_mask' in observation and self.mask_actions:
-            mask = observation['action_mask']
-            candicate_action_logits = apply_mask_to_logit(action_logits, mask)
-        else:
-            candicate_action_logits = action_logits
-
-        # === Temperature scaling ===
-        if sample:
-            epoch = getattr(self, "training_epoch_id", 0)
-            temp = self.initial_temperature * (self.temperature_decay ** epoch)
-            self.softmax_temp = max(1.0, min(temp, 10.0))
-        else:
-            self.softmax_temp = 1.0  # inference always uses T=1.0
-
-        candicate_action_dist = Categorical(logits=candicate_action_logits / self.softmax_temp)
-        raw_action_dist = Categorical(logits=action_logits / self.softmax_temp)
-
-        if self.mask_actions and self.maskable_policy:
-            action_dist_for_log_prob = candicate_action_dist
-        else:
-            action_dist_for_log_prob = raw_action_dist
-
-        if sample:
-            action = candicate_action_dist.sample()
-        else:
-            action = candicate_action_logits.argmax(-1)
-
-        action_logprob = action_dist_for_log_prob.log_prob(action)
-
-        if torch.numel(action) == 1:
-            action = action.item()
-        else:
-            action = action.reshape(-1, ).cpu().detach().numpy()
-
-        return action, action_logprob.cpu().detach().numpy()
-
- 
-    def evaluate_actions(self, old_observations, old_actions, return_others=False):
-        actions_logits = self.policy.act(old_observations)
-        actions_probs = F.softmax(actions_logits / self.softmax_temp, dim=-1)
-        if 'action_mask' in old_observations:
-            masks = old_observations['action_mask']
-            candicate_actions_logits = apply_mask_to_logit(actions_logits, masks)
-        else:
-            masks = None
-            candicate_actions_logits = actions_logits
-
-        candicate_actions_probs = F.softmax(candicate_actions_logits, dim=-1)
-
-        dist = Categorical(actions_probs)
-        candicate_dist = Categorical(candicate_actions_probs)
-        policy_dist = candicate_dist if self.mask_actions and self.maskable_policy else dist
-
-        action_logprobs = policy_dist.log_prob(old_actions)
-        dist_entropy = policy_dist.entropy()
-
-        values = self.policy.evaluate(old_observations).squeeze(-1) if hasattr(self.policy, 'evaluate') else None
-
-        if return_others:
-            other = {}
-            if masks is not None:
-                mask_actions_probs = actions_probs * (~masks.bool())
-                other['mask_actions_probs'] = mask_actions_probs.sum(-1).mean()
-                if hasattr(self.policy, 'predictor'):
-                    predicted_masks_logits = self.policy.predict(old_observations)
-                    print(predicted_masks_logits)
-                    prediction_loss = F.binary_cross_entropy(predicted_masks_logits, masks.float())
-                    other['prediction_loss'] = prediction_loss
-                    predicted_masks = torch.where(predicted_masks_logits > 0.5, 1., 0.)
-                    correct_count = torch.eq(predicted_masks.bool(), masks.bool()).sum(-1).float().mean(0)
-                    acc = correct_count / predicted_masks.shape[-1]
-                    print(prediction_loss, correct_count, acc)
-            return values, action_logprobs, dist_entropy, other
-
-        return values, action_logprobs, dist_entropy
 
     def estimate_value(self, observation):
         """

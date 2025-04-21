@@ -44,14 +44,14 @@ class Config(ClassDict):
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
     use_fixed_dataset: bool = True
-    dir_save_dataset: str = "dataset/garbage"
+    dir_save_dataset: str = "dataset/results-1"
     if_dynamic_v_nets: bool = True
 
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
     #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
-    pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/garbage/output/model/model.pkl'#''/home/stephen-reilly/dev/virne/dataset/april15_results/output/model/model.pkl'
+    pretrained_model_path: str = ''
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
@@ -70,14 +70,14 @@ class Config(ClassDict):
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = False
-    num_train_epochs: int = 0 #changed by me was 100
-    num_workers: int = 1 #changed by me was 10
+    distributed_training: bool = True
+    num_train_epochs: int = 100 #changed by me was 100
+    num_workers: int = 2 #changed by me was 10
     batch_size: int = 128 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
-    eval_interval: int = 10 #changed was 10
+    eval_interval: int = 120 #changed was 10
     curriculum_phase: int = 0
     
 
@@ -95,7 +95,7 @@ class Config(ClassDict):
     pretrained_loaded: bool = False
     p_dimension_features: int = 9
     v_dimension_features: int = 4
-    use_amp: bool= False
+    use_amp: bool= True
 
     ### Reinforcement Learning ###
     initial_temperature: float = 2.0

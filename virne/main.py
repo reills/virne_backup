@@ -33,8 +33,8 @@ if __name__ == '__main__':
         p_net=True,
         v_nets=True,
         save=True,
-        reuse_existing_p=False,  
-        reuse_existing_v=False
+        reuse_existing_p=True,  
+        reuse_existing_v=True
     )
 
     run(config) 

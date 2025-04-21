@@ -21,7 +21,7 @@ echo "Creating and activating Conda environment..."
 conda env create -f setup/nfv_env.yml
 conda activate nfv
  
-echo "Copying results-seq-sfc into dataset/garbage_1_trans..."
+echo "Copying garbage_1 into dataset/garbage_1_trans..."
 mkdir -p dataset/garbage_1_trans
 cp -r garbage_1/* dataset/garbage_1_trans/
 
