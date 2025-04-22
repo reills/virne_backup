@@ -2,7 +2,7 @@
 .vscode
 
 #datasets
-dataset/garbage*
+dataset/
 dataset/results*
 dataset/april15_results
 *.pth
@@ -12,7 +12,6 @@ temp_data
 dataset/training-data
 dataset/merged_training_data.pt
 p_net
-v_nets
 
 
 # build
