@@ -19,7 +19,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         num_p_net_link_attrs = len(self.p_net.get_link_attrs(['resource', 'extrema']))
         num_p_net_features = num_p_net_node_attrs + 1
         self.pad_token = kwargs.get("pad_token", None) 
-        self.max_revokes=8
+        self.max_revokes = self.v_net.num_nodes * 3
         self.calcuate_graph_metrics()
         self.phase = kwargs.get("phase", -1) #for curriculum learning? 
 
@@ -71,10 +71,10 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Remove previously revoked candidates
         key = (str(self.solution.node_slots), self.curr_v_node_id)
         revoked = self.revoked_actions_dict.get(key, [])
-        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
+        #failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
         
         #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
-        candidates = [p for p in candidates if p not in revoked and p not in failed]
+        candidates = [p for p in candidates if p not in revoked]# and p not in failed]
         
         #print(f"[MASK] Revoked: {revoked} | Failed: {failed}")
 
@@ -235,7 +235,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             prev_v_node_id = self.v_net.ranked_nodes[current_v_idx - 1]
             # Ensure solution and node_slots exist
             if prev_v_node_id in self.solution['node_slots']:
-                 p_prev = prev_v_node_id 
+                #  physical node that the *previous* VNF ended up on  
+                p_prev = self.solution['node_slots'][prev_v_node_id]
 
         # Step 3: Compute using the instance method or fallback to zeros
         distance_feature = self._get_normalized_distance_feature(p_prev) # <<< CORRECTED CALL

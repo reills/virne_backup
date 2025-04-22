@@ -333,7 +333,7 @@ class AutoregressiveDecoder(nn.Module):
         special_action_scores = self.special_action_head(final_context_embedding)  # (B, 2)
 
         # Assemble final logits
-        final_logits = torch.full((B, self.num_actions), -20.0, device=node_scores.device, dtype=node_scores.dtype)
+        raw_logits = torch.full((B, self.num_actions), -20.0, device=node_scores.device, dtype=node_scores.dtype)
         padded_node_scores = torch.full((B, self.p_net_num_nodes), -20.0, device=node_scores.device)
 
         current_node_idx = 0
@@ -344,13 +344,18 @@ class AutoregressiveDecoder(nn.Module):
                 padded_node_scores[i, :nodes_to_consider] = node_scores[current_node_idx:current_node_idx + nodes_to_consider]
             current_node_idx += num_nodes
 
-        final_logits[:, :self.p_net_num_nodes] = padded_node_scores
-        final_logits[:, self.revoke_action_idx:self.reject_action_idx + 1] = special_action_scores
+        raw_logits[:, :self.p_net_num_nodes] = padded_node_scores
+        raw_logits[:, self.revoke_action_idx:self.reject_action_idx + 1] = special_action_scores
 
-        # Apply action mask and clamp
+        # Apply action mask and clamp 
+        
+        # Clamp logits first (for numerical stability)
+        clamped_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
+
+        # Apply mask after clamp
         mask = obs['action_mask'].bool()
-        final_logits = final_logits.masked_fill(~mask, -20.0)
-        final_logits = torch.where(mask, torch.clamp(final_logits, min=-15.0, max=15.0), final_logits)
-        final_logits = torch.nan_to_num(final_logits, nan=-20.0)
+        invalid_val = -20.0  # For AMP safety, not -inf
+        final_logits = clamped_logits.masked_fill(~mask, invalid_val) 
+
 
         return final_logits

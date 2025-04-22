@@ -233,8 +233,6 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         encoder_obs = instance_env.get_observation()
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
         history_features = []
-        
-
 
         done = False
         while not done:
@@ -490,9 +488,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         # Curriculum logic: decide which phase we're in (5 workers = 5*5epochs = 25th epoch)
         if self.training_epoch_id < (20 / self.num_workers) :
             phase = 1 #include no special actions
-        elif self.training_epoch_id < (60/ self.num_workers):
+        elif self.training_epoch_id < (40/ self.num_workers):
             phase = 2 #include revoke
-        elif self.training_epoch_id < (80 / self.num_workers):
+        elif self.training_epoch_id < (60 / self.num_workers):
             phase = 3 #include reject
         else:
             phase = 3

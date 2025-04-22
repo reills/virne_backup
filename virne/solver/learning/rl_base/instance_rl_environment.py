@@ -51,7 +51,7 @@ class InstanceRLEnv(RLBaseEnv):
         self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
         self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}
         self.solution['last_placement_failed'] = False 
-        self.attempt_blacklist = defaultdict(set)
+        #self.attempt_blacklist = defaultdict(set)
 
         # set_sim_info_to_object(kwargs, self)
     def _get_normalized_distance_feature(self, source_p_node_id):
@@ -124,25 +124,28 @@ class InstanceRLEnv(RLBaseEnv):
         self.solution['place_result'] = True
         self.solution['route_result'] = True
         self.solution['revoke_times'] += 1
+
         last_v_node_id = self.placed_v_net_nodes[-1]
         paired_p_node_id = self.selected_p_net_nodes[-1]
-        self.controller.undo_place_and_route(self.v_net, self.p_net, last_v_node_id, paired_p_node_id, self.solution)
+
+        # ── Invalidate candidate cache ──
+        self._cached_candidates = None
+        self._cached_candidates_vnode = None
+
+        # ── Undo placement and routing ──
+        self.controller.undo_place_and_route(
+            self.v_net, self.p_net,
+            last_v_node_id, paired_p_node_id,
+            self.solution
+        )
+
         solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-        self.revoked_actions_dict[str(self.solution.node_slots), last_v_node_id].append(paired_p_node_id)
-        
-        # Update the cached observation's action mask
-        if self.prev_obs is not None:
-            self.prev_obs['action_mask'] = np.expand_dims(self.generate_action_mask(), axis=0)
-        else:
-            self.prev_obs = self.get_observation()
+        self.revoked_actions_dict[(str(self.solution.node_slots), last_v_node_id)].append(paired_p_node_id)
 
-        # Also update the tensor version
-        self.prev_tensor_obs = self.preprocess_obs_fn(self.prev_obs, device=self.device, pad_token=self.pad_token)
+        # ── Return raw observation (agent will re-inject encoder_outputs and preprocess externally) ──
+        obs = self.get_observation()
+        return obs, self.compute_reward(self.solution, revoke=True), False, self.get_info(solution_info)
 
-
-        return self.prev_obs, self.compute_reward(self.solution, revoke=True), False, self.get_info(solution_info)
-
- 
 
 class JointPRStepInstanceRLEnv(InstanceRLEnv):
     
@@ -164,14 +167,14 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
 
        # Case: Reject
         if self.if_rejection(action): 
-            self.attempt_blacklist.clear()
+            #self.attempt_blacklist.clear()
             self.solution['last_placement_failed'] = False
             return self.reject(is_early=True)
         
         # Case: Revoke
         if self.if_revocable(action): 
             last_v_node_id = self.placed_v_net_nodes[-1]
-            self.attempt_blacklist[last_v_node_id].clear()
+            #self.attempt_blacklist[last_v_node_id].clear()
             self.solution['last_placement_failed'] = False
             return self.revoke()
         
@@ -202,14 +205,14 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
             self.solution['place_result'] = False
             self.solution['route_result'] = False
             self.solution['last_placement_failed'] = True
-            self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
+            #self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
             reward = self.compute_reward(self.solution)
             done = False
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
             return self.get_observation(), reward, done, self.get_info(solution_info)
 
         # Placement and Route Success
-        self.attempt_blacklist[self.curr_v_node_id].clear()
+        #self.attempt_blacklist[self.curr_v_node_id].clear()
         self.solution['last_placement_failed'] = False
     
         #finished placing and routing full SFC 

@@ -44,7 +44,7 @@ class Config(ClassDict):
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
     use_fixed_dataset: bool = True
-    dir_save_dataset: str = "dataset/results-1"
+    dir_save_dataset: str = "dataset/garbage_1_trans"
     if_dynamic_v_nets: bool = True
 
     ### solver  ###
@@ -70,10 +70,10 @@ class Config(ClassDict):
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = True
+    distributed_training: bool = False
     num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 2 #changed by me was 10
-    batch_size: int = 128 # changed by me was 128
+    num_workers: int = 5 #changed by me was 10
+    batch_size: int = 256 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
