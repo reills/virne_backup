@@ -1413,7 +1413,7 @@ class Controller:
             candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
 
         # === Efficient Path Feasibility Pruning ===
-        if phase == -1:
+        if phase == -1 or phase >=3:
             if p_node_prev is not None and solution is not None:
                 try:
                     ranked_list = [int(v) for v in v_net.ranked_nodes]

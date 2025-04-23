@@ -158,7 +158,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         InstanceAgent.__init__(self, InstanceEnv)
         
         # New hyperparameters
-        self.entropy_coef = kwargs.get("entropy_coef", 0.05)
+        self.coef_entropy_loss = kwargs.get("coef_entropy_loss", 0.1)
+        self.coef_critic_loss = kwargs.get("coef_critic_loss", 0.5)
         self.normalize_advantage = kwargs.get("normalize_advantage", True)
         self.initial_temperature =    kwargs.get("initial_temperature", 2.0)
         self.temperature_decay =   kwargs.get("temperature_decay", 0.97)
@@ -206,9 +207,18 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         with torch.amp.autocast(device_type="cuda",enabled=False):  # Force FP32 for this part
             logits_f32 = (raw_logits / T).float()
-            dist = Categorical(logits=logits_f32)
-            action = dist.sample() if sample else dist.probs.argmax(dim=-1)
-            logp = dist.log_prob(action)
+            logits_last = logits_f32  # Already shape [B, A]
+            log_probs_all = F.log_softmax(logits_last, dim=-1)  # [B, A]
+
+            # Use softmax for stable probabilities
+            probs = torch.exp(log_probs_all)
+
+            # Sample from valid probs
+            dist = Categorical(probs=probs)
+            action = dist.sample() if sample else probs.argmax(dim=-1)
+
+            # Get log-prob of chosen action
+            logp = log_probs_all.gather(dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
 
         # Final checks and return
         if not torch.isfinite(logp).all():
@@ -335,6 +345,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             amp_ctx = torch.amp.autocast("cuda") if self.use_amp else nullcontext()
             with amp_ctx:
                 logits_raw = self.policy.act(obs_tensors)
+                #print("logits_raw shape before reshape:", logits_raw.shape)
                 values_raw = self.policy.evaluate(obs_tensors).squeeze(-1)
 
             # Step 2: Distribution & Loss Calculation in FP32
@@ -344,14 +355,28 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 advantages_f32 = all_advantages[start_idx:end_idx].float()
                 returns_f32 = returns.float()
 
-                dist = torch.distributions.Categorical(logits=logits_f32, validate_args=False)
-                action_logprobs = dist.log_prob(actions)
-                dist_entropy = dist.entropy()
+                # --- Manual Log Probability and Entropy Calculation ---
+                logits_last = logits_f32[:, -1, :]  #[batch_size, num_actions]
+                log_probs_all = F.log_softmax(logits_last, dim=-1)  # [B, A]
+
+                #print("log_probs_all.shape =", log_probs_all.shape)
+                #print("actions.shape =", actions.shape)
+
+                # Log probs for the chosen actions
+                action_logprobs = log_probs_all.gather(dim=-1, index=actions.unsqueeze(-1)).squeeze(-1)
+
+                # Probabilities for entropy
+                probs = torch.exp(log_probs_all)
+
+                # Entropy: -sum(p * log(p)) but guarded against 0 * -inf
+                entropy_term = torch.where(probs > 0, probs * log_probs_all, torch.zeros_like(probs))
+                dist_entropy = -entropy_term.sum(dim=-1)
+                
 
                 actor_loss = -(action_logprobs * advantages_f32).mean()
                 critic_loss = F.mse_loss(returns_f32, values_f32)
                 entropy_loss = dist_entropy.mean()
-                total_loss = actor_loss + critic_loss - self.entropy_coef * entropy_loss
+                total_loss = actor_loss + self.coef_critic_loss * critic_loss - self.coef_entropy_loss * entropy_loss
 
             # Logging
             if print_logs:
@@ -488,12 +513,16 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         # Curriculum logic: decide which phase we're in (5 workers = 5*5epochs = 25th epoch)
         if self.training_epoch_id < (20 / self.num_workers) :
             phase = 1 #include no special actions
-        elif self.training_epoch_id < (40/ self.num_workers):
+            self.coef_entropy_loss = 0.2
+        elif self.training_epoch_id < (40 / self.num_workers):
             phase = 2 #include revoke
+            self.coef_entropy_loss = 0.1
         elif self.training_epoch_id < (60 / self.num_workers):
             phase = 3 #include reject
+            self.coef_entropy_loss = 0.01
         else:
-            phase = 3
+            phase = 4 #include pruning-- very slow
+            self.coef_entropy_loss = 0.005
     
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
                                 preprocess_obs_fn=self.preprocess_obs, phase=phase, **self.basic_config)
@@ -504,6 +533,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         instance_done = False
          
         while not instance_done:
+            
             #dummy first pass
             rtg_slice = [0.0] * len(history_features)
             instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
@@ -521,6 +551,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             }
             sub_env.prev_tensor_obs = tensor_instance_obs_cpu 
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
+            #print(f"[Loop] v_nodes placed: {len(sub_env.placed_v_net_nodes)}, action={action}, instance_done={instance_done}")
+
             # --- Determine which embedding to insert ---
             if action == self.policy.actor.decoder.num_actions - 2:  # revoke
                 selected_node_feats = self.policy.actor.decoder.revoke_embedding.detach().cpu().numpy()
@@ -533,7 +565,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             value = self.estimate_value(tensor_instance_obs) if hasattr(self.policy, 'evaluate') else None
             
+            #print(f"[Worker {self.rank}] Step begin: action={action}, num_placed={len(sub_env.placed_v_net_nodes)}")
             next_obs, reward, instance_done, info = sub_env.step(action)  
+            #print(f"[Worker {self.rank}] Step done: reward={reward}, done={instance_done}")
+            
             sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value) 
             
             if not instance_done:

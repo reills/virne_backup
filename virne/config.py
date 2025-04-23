@@ -51,7 +51,7 @@ class Config(ClassDict):
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
     #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
-    pretrained_model_path: str = ''
+    pretrained_model_path: str = ''#'/home/stephen-reilly/dev/virne/dataset/garbage_tran_1/model-worker8-epoch3.pkl'
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
@@ -70,14 +70,14 @@ class Config(ClassDict):
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = False
+    distributed_training: bool = True
     num_train_epochs: int = 100 #changed by me was 100
-    num_workers: int = 5 #changed by me was 10
+    num_workers: int = 10 #changed by me was 10
     batch_size: int = 256 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
-    save_interval: int = 10
-    eval_interval: int = 120 #changed was 10
+    save_interval: int = 2
+    eval_interval: int = 2 #changed was 10
     curriculum_phase: int = 0
     
 
@@ -110,7 +110,7 @@ class Config(ClassDict):
 
     ### Loss ###
     coef_critic_loss: float = 0.5
-    coef_entropy_loss: float = 0.1
+    coef_entropy_loss: float = 0.01
     coef_mask_loss: float = 0.05
     reward_weight: float = 0.1
 

@@ -350,12 +350,9 @@ class AutoregressiveDecoder(nn.Module):
         # Apply action mask and clamp 
         
         # Clamp logits first (for numerical stability)
-        clamped_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
-
-        # Apply mask after clamp
         mask = obs['action_mask'].bool()
-        invalid_val = -20.0  # For AMP safety, not -inf
-        final_logits = clamped_logits.masked_fill(~mask, invalid_val) 
-
+        clamped_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
+        minus_inf = -torch.finfo(raw_logits.dtype).max  # safe for AMP (fp16 = -65504, fp32 = -3.4e38)
+        final_logits = torch.where(mask, clamped_logits, minus_inf)
 
         return final_logits

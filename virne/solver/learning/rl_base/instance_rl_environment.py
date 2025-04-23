@@ -51,7 +51,7 @@ class InstanceRLEnv(RLBaseEnv):
         self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
         self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}
         self.solution['last_placement_failed'] = False 
-        #self.attempt_blacklist = defaultdict(set)
+        self.attempt_blacklist = defaultdict(set)
 
         # set_sim_info_to_object(kwargs, self)
     def _get_normalized_distance_feature(self, source_p_node_id):
@@ -109,7 +109,7 @@ class InstanceRLEnv(RLBaseEnv):
         self.p_net = copy.deepcopy(self.p_net_backup)
         
         self._distance_cache.clear()
-        self._normalized_distance_vector_cache.clear()
+        self._normalized_distance_vector_cache.clear()  
         
         return super().reset()
 
@@ -167,15 +167,20 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
 
        # Case: Reject
         if self.if_rejection(action): 
-            #self.attempt_blacklist.clear()
+            self.attempt_blacklist.clear()
             self.solution['last_placement_failed'] = False
             return self.reject(is_early=True)
         
-        # Case: Revoke
-        if self.if_revocable(action): 
-            last_v_node_id = self.placed_v_net_nodes[-1]
-            #self.attempt_blacklist[last_v_node_id].clear()
+        # Case: Revoke 
+        if self.if_revocable(action):  
+            last_v_node_id = self.placed_v_net_nodes[-1] if self.placed_v_net_nodes else None 
             self.solution['last_placement_failed'] = False
+
+            if not self.placed_v_net_nodes:
+                print(f"[WARN] Called step() but no placements made yet. Placevnetnodes:{self.placed_v_net_nodes},Action={action},selectedpnodes:{self.selected_p_net_nodes}")
+                return self.reject(is_early=True)     
+          
+            self.attempt_blacklist[last_v_node_id].clear()
             return self.revoke()
         
         # Case: reusable = False and place in one same node (not allowed currently)
@@ -205,14 +210,14 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
             self.solution['place_result'] = False
             self.solution['route_result'] = False
             self.solution['last_placement_failed'] = True
-            #self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
+            self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
             reward = self.compute_reward(self.solution)
             done = False
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
             return self.get_observation(), reward, done, self.get_info(solution_info)
 
         # Placement and Route Success
-        #self.attempt_blacklist[self.curr_v_node_id].clear()
+        self.attempt_blacklist[self.curr_v_node_id].clear()
         self.solution['last_placement_failed'] = False
     
         #finished placing and routing full SFC 

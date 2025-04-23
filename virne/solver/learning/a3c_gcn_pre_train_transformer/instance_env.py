@@ -22,6 +22,10 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.max_revokes = self.v_net.num_nodes * 3
         self.calcuate_graph_metrics()
         self.phase = kwargs.get("phase", -1) #for curriculum learning? 
+        # ---- Candidate Cache ----
+        self._cached_candidates = None
+        self._cached_candidates_vnode = None
+        self._cached_candidates_num_placed = None
 
  
     def get_observation(self ):
@@ -31,11 +35,14 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         """
         p_net_obs = self._get_p_net_obs()
         v_net_obs = self._get_v_net_obs()
-        history_features = self.get_history_features()
+        history_features = self.get_history_features() 
         
-        if not hasattr(self, '_cached_candidates') or self._cached_candidates_vnode != self.curr_v_node_id:
+        if (
+            self._cached_candidates is None or
+            self._cached_candidates_vnode != self.curr_v_node_id or
+            self._cached_candidates_num_placed != self.num_placed_v_net_nodes
+        ):
             p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
-            
             self._cached_candidates = self.controller.find_candidate_nodes(
                 self.v_net, self.p_net, self.curr_v_node_id,
                 filter=self.selected_p_net_nodes,
@@ -44,6 +51,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                 phase=self.phase
             )
             self._cached_candidates_vnode = self.curr_v_node_id
+            self._cached_candidates_num_placed = self.num_placed_v_net_nodes
 
         obs = {
             'p_net_x': p_net_obs['x'],
@@ -71,13 +79,11 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # Remove previously revoked candidates
         key = (str(self.solution.node_slots), self.curr_v_node_id)
         revoked = self.revoked_actions_dict.get(key, [])
-        #failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
+        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
         
         #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
-        candidates = [p for p in candidates if p not in revoked]# and p not in failed]
-        
-        #print(f"[MASK] Revoked: {revoked} | Failed: {failed}")
-
+        candidates = [p for p in candidates if p not in revoked and p not in failed]
+         
         # ---- Curriculum-aware Revoke / Reject Masking ----
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
 
@@ -88,7 +94,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # PHASE 3+: Allow reject once at least 1 action attempted
         if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
             candidates.append(self.rejection_action)
-
+            
         # ---- Build binary action mask ----
         mask = np.zeros(self.num_actions, dtype=bool)
         indices = [a for a in candidates if 0 <= a < self.num_actions]
@@ -101,6 +107,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                 mask[self.rejection_action] = True
                 #print("[WARN] Fallback to REJECTION action.")
             else:
+                candidates.append(self.rejection_action)
+                mask[self.rejection_action] = True
                 print("[ERROR] No valid fallback. Agent is stuck.")
 
         return mask
