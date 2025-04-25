@@ -51,7 +51,10 @@ class InstanceRLEnv(RLBaseEnv):
         self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
         self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}
         self.solution['last_placement_failed'] = False 
-        self.attempt_blacklist = defaultdict(set)
+        self.attempt_blacklist = defaultdict(set) # each v node gets a few retry chances -- do not repeat the physical node-- not allowed- stupid to do that
+        self.retry_budget = defaultdict(int)  # Tracks how many retries have been used for each vnode
+        self.max_retry_budget = defaultdict(lambda: 3)  # how many it is allowed to have.
+
 
         # set_sim_info_to_object(kwargs, self)
     def _get_normalized_distance_feature(self, source_p_node_id):
@@ -111,6 +114,10 @@ class InstanceRLEnv(RLBaseEnv):
         self._distance_cache.clear()
         self._normalized_distance_vector_cache.clear()  
         
+        self.attempt_blacklist.clear()
+        self.retry_budget.clear()
+        self.max_retry_budget.clear()
+        
         return super().reset()
 
     def reject(self, is_early=True):
@@ -130,8 +137,8 @@ class InstanceRLEnv(RLBaseEnv):
 
         # ── Invalidate candidate cache ──
         self._cached_candidates = None
-        self._cached_candidates_vnode = None
-
+        self._cached_candidates_vnode = None 
+ 
         # ── Undo placement and routing ──
         self.controller.undo_place_and_route(
             self.v_net, self.p_net,
@@ -151,6 +158,26 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
     
     def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
         super(JointPRStepInstanceRLEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
+
+    def try_special_action_recovery(self):
+        """Returns a (obs, reward, done, info) tuple if no valid actions are left and the request should terminate."""
+        retry_used = self.retry_budget[self.curr_v_node_id]
+        retry_cap = self.max_retry_budget[self.curr_v_node_id]
+        no_revoke_available = not (
+            self.allow_revocable and 
+            self.num_placed_v_net_nodes > 0 and 
+            self.solution['revoke_times'] < self.max_revokes
+        )
+
+        if retry_used >= retry_cap and no_revoke_available:
+            self.solution['result'] = False
+            self.solution['early_rejection'] = True
+            self.solution['failure_reason'] = "exhausted_retries_and_revokes"
+            solution_info = self.counter.count_solution(self.v_net, self.solution)
+            done = True
+            return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
+        
+        return None  # No early termination yet
 
     def step(self, action):
         """
@@ -180,17 +207,10 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                 print(f"[WARN] Called step() but no placements made yet. Placevnetnodes:{self.placed_v_net_nodes},Action={action},selectedpnodes:{self.selected_p_net_nodes}")
                 return self.reject(is_early=True)     
           
-            self.attempt_blacklist[last_v_node_id].clear()
-            return self.revoke()
-        
-        # Case: reusable = False and place in one same node (not allowed currently)
-        if not self.reusable and (p_node_id in self.selected_p_net_nodes): 
-            self.solution['place_result'] = False
-            self.solution['route_result'] = False
-            self.solution['last_placement_failed'] = True 
-            done = True 
-            solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-            return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
+            self.attempt_blacklist[last_v_node_id].clear() 
+            self.retry_budget[last_v_node_id] = 0
+            self.max_retry_budget[last_v_node_id] = 3  # Optional: reset default
+            return self.revoke() 
 
         # Case: Try to Place and Route
         assert p_node_id in list(self.p_net.nodes)
@@ -204,22 +224,27 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                             shortest_method=self.shortest_method, 
                                                                             k=self.k_shortest,
                                                                             check_feasibility=self.check_feasibility)
-        # Step Failure
+        # Step Failure-- basically agent can try place again on same virtual node (capped), try to revoke the virtual node (capped), or early reject
         if not place_and_route_result:
-            # Placement failed — retryable
-            self.solution['place_result'] = False
-            self.solution['route_result'] = False
             self.solution['last_placement_failed'] = True
             self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
-            reward = self.compute_reward(self.solution)
-            done = False
+            self.retry_budget[self.curr_v_node_id] += 1
+
+            recovery_result = self.try_special_action_recovery()
+            if recovery_result is not None:
+                return recovery_result  # returns obs, reward, done, info
+            
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-            return self.get_observation(), reward, done, self.get_info(solution_info)
+            done = False 
+            return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
+
 
         # Placement and Route Success
         self.attempt_blacklist[self.curr_v_node_id].clear()
         self.solution['last_placement_failed'] = False
-    
+        self.retry_budget[self.curr_v_node_id] = 0
+        self.max_retry_budget[self.curr_v_node_id] = 3  # Optional: reset to default, or keep if dynamic
+
         #finished placing and routing full SFC 
         if self.num_placed_v_net_nodes == self.v_net.num_nodes:
             self.solution['result'] = True  

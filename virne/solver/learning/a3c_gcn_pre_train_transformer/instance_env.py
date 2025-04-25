@@ -69,8 +69,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
     def generate_action_mask(self):
         """Generates a valid action mask based on placement feasibility and curriculum phase."""
-        #print(f"[PHASE] Phase = {self.phase} | Placed = {self.num_placed_v_net_nodes} | Interactions = {self.solution['num_interactions']}")
-
+        
         # Get candidates from controller (based on physical constraints and path feasibility)
         p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
         #print(f"{p_node_prev} was the previously placed node")
@@ -80,10 +79,17 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         key = (str(self.solution.node_slots), self.curr_v_node_id)
         revoked = self.revoked_actions_dict.get(key, [])
         failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
-        
-        #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
-        candidates = [p for p in candidates if p not in revoked and p not in failed]
          
+        retry_used = self.retry_budget[self.curr_v_node_id]
+        retry_cap = self.max_retry_budget[self.curr_v_node_id]
+
+        if retry_used >= retry_cap:
+            # Retry budget exceeded → only allow revoke/reject later
+            candidates = []
+        else:
+            # Filter out previously failed placements
+            candidates = [p for p in candidates if p not in revoked and p not in failed]
+
         # ---- Curriculum-aware Revoke / Reject Masking ----
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
 
@@ -116,23 +122,24 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
     def compute_reward(self, solution, revoke=False):
         if revoke:
             # Small penalty for backtracking
-            reward = -1.25
+            reward = -.25
         elif solution['early_rejection']:
             # Harsh penalty for giving up
-            reward = -5
+            reward = -2.5
         elif not solution['place_result'] or not solution['route_result']:
             # Step failed
-            return -1
+            reward = -.25
         elif solution['result']:
             # Final success
-            reward = solution['v_net_r2c_ratio'] * 12.0
+            reward = 2.5
         else:
             # Intermediate success
-            reward = 1
+            reward = .25
+
 
         self.solution['v_net_reward'] += reward
         return reward
- 
+    
     
     
     def _get_v_net_obs(self):

@@ -283,30 +283,29 @@ class RLSolver(Solver):
         }, checkpoint_fname)
         print(f'Save model to {checkpoint_fname}\n') if self.verbose >= 0 else None
 
+    
     def load_model(self, checkpoint_path):
         print('Attempting to load the pretrained model')
         try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*") 
-                checkpoint = torch.load(checkpoint_path)
-            if 'policy' not in checkpoint:
-                self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
-            else:
-                self.policy.load_state_dict(checkpoint['policy'])
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
-                # Rebuild optimizer to reset weight decay
-                print("Resetting optimizer with new weight_decay=0.0")
-                self.optimizer = torch.optim.Adam([
-                    {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor},
-                    {'params': self.policy.actor.parameters(),   'lr': self.lr_actor},
-                    {'params': self.policy.critic.parameters(),  'lr': self.lr_critic}
-                ], weight_decay=0.0)  # ← your new value here
-            print(f'Loaded pretrained model from {checkpoint_path}') if self.verbose >= 0 else None
-        except Exception as e:
-            print(f'error {e}')
-            print(f'Load failed from {checkpoint_path}\nInitilized with random parameters') if self.verbose >= 0 else None
+            checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
 
- 
+            if 'policy' in checkpoint:
+                self.policy.load_state_dict(checkpoint['policy'])
+            else:
+                self.policy.load_state_dict(checkpoint)
+
+            # Always rebuild optimizer cleanly
+            print("Resetting optimizer with new weight_decay=0.0 and current learning rates")
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor},
+                {'params': self.policy.actor.parameters(),   'lr': self.lr_actor},
+                {'params': self.policy.critic.parameters(),  'lr': self.lr_critic}
+            ], weight_decay=0.0)
+
+            print(f'  Model loaded from {checkpoint_path}')
+        except Exception as e:
+            print(f' Error loading model: {e}')
+
     def train(self):
         """Set the mode to train"""
         self.policy.train()

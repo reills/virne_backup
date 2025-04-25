@@ -59,12 +59,8 @@ def obs_as_tensor(obs, device, pad_token=None):
             'curr_v_node_id': torch.tensor([obs['curr_v_node_id']], dtype=torch.long, device=device),
             'vnfs_remaining': torch.tensor([obs['vnfs_remaining']], dtype=torch.long, device=device),
             'mask': None
-        }
-
-        if 'rtg' in obs:
-            rtg = torch.tensor(obs['rtg'], dtype=torch.float32, device=device)
-            result['rtg'] = rtg
-
+        } 
+        
         return result
 
     elif isinstance(obs, list):
@@ -99,12 +95,7 @@ def obs_as_tensor(obs, device, pad_token=None):
             'curr_v_node_id': torch.tensor(curr_v_ids, dtype=torch.long, device=device),
             'vnfs_remaining': torch.tensor(vnfs_remaining, dtype=torch.long, device=device),
             'mask': None
-        }
-
-        if 'rtg' in obs[0]:
-            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32).squeeze(0) for o in obs]  # shape (T,)
-            padded_rtg = pad_sequence(rtg_list, batch_first=True).unsqueeze(-1).to(device)     # (B, T, 1)
-            result['rtg'] = padded_rtg
+        } 
 
         return result
 
@@ -192,12 +183,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """
         with torch.no_grad():
             raw_logits = self.policy.act(observation, training=False)  # May be float16 if AMP is on
-
-        # === Sanity check for NaNs ===
-        if not torch.isfinite(raw_logits).all():
-            minus_inf = -torch.finfo(raw_logits.dtype).max
-            raw_logits = torch.nan_to_num(raw_logits, nan=minus_inf, posinf=15.0, neginf=minus_inf)
-
+            
+        assert torch.isfinite(raw_logits).all(), "NaN or Inf detected in logits from policy.act()"
+ 
         # === Apply temperature and Categorical in FP32 ===
         T = 1.0
         if sample:
@@ -245,12 +233,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         history_features = []
 
         done = False
-        while not done:
-            rtg = [0.0] * len(history_features)
-
-            instance_obs = self.make_instance_obs(
-                history_features, encoder_obs, encoder_outputs, instance_env, rtg=rtg
-            )
+        while not done:  
+            instance_obs = self.make_instance_obs(  history_features, encoder_obs, encoder_outputs, instance_env)
 
             #   Cache for revoke() support
             instance_env.prev_obs = {
@@ -357,6 +341,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
                 # --- Manual Log Probability and Entropy Calculation ---
                 logits_last = logits_f32[:, -1, :]  #[batch_size, num_actions]
+                #logits_last = logits_last.clamp(min=-10.0, max=8.0)  # prevent sharp choices dominating
                 log_probs_all = F.log_softmax(logits_last, dim=-1)  # [B, A]
 
                 #print("log_probs_all.shape =", log_probs_all.shape)
@@ -373,8 +358,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 dist_entropy = -entropy_term.sum(dim=-1)
                 
 
-                actor_loss = -(action_logprobs * advantages_f32).mean()
+                actor_loss = -(action_logprobs * advantages_f32).mean() 
+                # Normalize returns to have zero mean and unit variance (optional but recommended)
+                returns_f32 = (returns_f32 - returns_f32.mean()) / (returns_f32.std() + 1e-8)
                 critic_loss = F.mse_loss(returns_f32, values_f32)
+
                 entropy_loss = dist_entropy.mean()
                 total_loss = actor_loss + self.coef_critic_loss * critic_loss - self.coef_entropy_loss * entropy_loss
 
@@ -460,7 +448,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         
     
-    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env, rtg=None):
+    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env ):
         """
         Constructs an observation dict using the given history of physical node feature vectors.
         """
@@ -477,26 +465,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             trimmed_history = np.vstack([trimmed_history, pad])
         else:
             trimmed_history = np.vstack(trimmed_history[:max_len])
-
-        # Step 3: Match RTG to history length
-        if rtg is not None:
-            rtg = [0.0] + rtg[:max_len - 1]  # same logic as history
-        else:
-            rtg = [0.0]
-
-        # Pad or trim RTG to max_len
-        rtg = rtg + [0.0] * (max_len - len(rtg))
-        rtg = np.array(rtg, dtype=np.float32).reshape(1, -1)
-    
-
+ 
         obs = {
             'p_net_x': encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
             'edge_attr': encoder_obs['edge_attr'],
             'history_features': np.array(trimmed_history, dtype=np.float32),  # 🔁 new key
             'encoder_outputs': encoder_outputs,
-            'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0),
-            'rtg': np.array(rtg, dtype=np.float32).reshape(1, -1),
+            'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0), 
             'curr_v_node_id': encoder_obs['curr_v_node_id'],
             'vnfs_remaining': encoder_obs['vnfs_remaining'],
         }
@@ -523,6 +499,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         else:
             phase = 4 #include pruning-- very slow
             self.coef_entropy_loss = 0.005
+        phase = 4 #include pruning-- very slow
+        self.coef_entropy_loss = 0.05
     
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
                                 preprocess_obs_fn=self.preprocess_obs, phase=phase, **self.basic_config)
@@ -534,9 +512,8 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
          
         while not instance_done:
             
-            #dummy first pass
-            rtg_slice = [0.0] * len(history_features)
-            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
+            #dummy first pass 
+            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env )
 
             sub_env.prev_obs = {
                 **instance_obs,
@@ -573,24 +550,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             
             if not instance_done:
                 encoder_obs = next_obs
-
-        # Now compute RTG
-        rtg = np.cumsum(sub_buffer.rewards[::-1])[::-1]
-
-        # Inject correct RTG values into buffer observations
-        for i, obs in enumerate(sub_buffer.observations):
-            hist_len = obs['history_features'].shape[0]  # should be 15
-            rtg_slice = rtg[:hist_len]
-            if len(rtg_slice) < hist_len:
-                rtg_slice = np.pad(rtg_slice, (0, hist_len - len(rtg_slice)), constant_values=0.0)
-            else:
-                rtg_slice = rtg_slice[:hist_len]
-            obs['rtg'] = np.array(rtg_slice, dtype=np.float32).reshape(1, -1)  # (1, T)
-
-                
+ 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=[0.0]*len(history_features))
+            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env )
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
          
