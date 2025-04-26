@@ -6,6 +6,7 @@ import networkx as nx
 import os
 import warnings
 import torch
+import random
 from gym import spaces
 from virne.solver.learning.rl_base import JointPRStepInstanceRLEnv, PlaceStepInstanceRLEnv 
 from pathlib import Path
@@ -68,67 +69,80 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         return obs
 
     def generate_action_mask(self):
-        """Generates a valid action mask based on placement feasibility and curriculum phase."""
-        #print(f"[PHASE] Phase = {self.phase} | Placed = {self.num_placed_v_net_nodes} | Interactions = {self.solution['num_interactions']}")
+        """
+        Generates a valid action mask using PREVIOUSLY CACHED candidate nodes.
+        Assumes self._cached_candidates is valid and up-to-date.
+        If all standard valid actions are masked, attempts to unmask a
+        random physical node from the cache that hasn't failed.
+        """
+        # --- Step 1: Use the pre-validated cache ---
+        # Assume self._cached_candidates was updated by get_observation
+        current_candidates = list(self._cached_candidates) if self._cached_candidates is not None else []
 
-        # Get candidates from controller (based on physical constraints and path feasibility)
-        p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
-        #print(f"{p_node_prev} was the previously placed node")
-        candidates = self._cached_candidates
-
-        # Remove previously revoked candidates
-        key = (str(self.solution.node_slots), self.curr_v_node_id)
-        revoked = self.revoked_actions_dict.get(key, [])
+        # --- Step 2: Filter based on runtime state (revoke/failed lists) ---
+        revoked = self.revoked_actions_dict.get(self.curr_v_node_id, [])
         failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
-        
-        #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
-        candidates = [p for p in candidates if p not in revoked and p not in failed]
-         
-        # ---- Curriculum-aware Revoke / Reject Masking ----
+        valid_candidates = [p for p in current_candidates if p not in revoked and p not in failed]
+
+        # --- Step 3: Add Revoke action if applicable ---
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
+        can_revoke = ( (self.phase >= 2 or self.phase == -1) and
+                       self.allow_revocable and
+                       self.num_placed_v_net_nodes > 0 and
+                       threshold_ok )
+        if can_revoke:
+            valid_candidates.append(self.revocable_action)
 
-        # PHASE 2+: Allow revoke if we've placed any nodes and under max_revokes
-        if ( self.phase >= 2 or self.phase == -1) and self.allow_revocable and self.num_placed_v_net_nodes > 0 and threshold_ok:
-            candidates.append(self.revocable_action)
-
-        # PHASE 3+: Allow reject once at least 1 action attempted
-        if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
-            candidates.append(self.rejection_action)
-            
-        # ---- Build binary action mask ----
+        # --- Step 4: Build the initial mask ---
         mask = np.zeros(self.num_actions, dtype=bool)
-        indices = [a for a in candidates if 0 <= a < self.num_actions]
-        mask[indices] = True
+        indices = [a for a in valid_candidates if 0 <= a < self.num_actions]
+        if indices:
+            mask[indices] = True
 
-        # ---- Fallback: allow reject if absolutely no other option ----
+        # --- Step 5: Fallback Logic (if mask is empty) ---
         if not mask.any():
-            #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})")
-            if self.allow_rejection and 0 <= self.rejection_action < self.num_actions:
-                mask[self.rejection_action] = True
-                #print("[WARN] Fallback to REJECTION action.")
+            # Fallback uses the original cached list
+            original_cached_nodes = list(self._cached_candidates) if self._cached_candidates is not None else []
+            failed_set_for_vnode = self.attempt_blacklist.get(self.curr_v_node_id, set())
+            potential_fallback_nodes = [
+                p for p in original_cached_nodes
+                if 0 <= p < self.p_net.num_nodes and p not in failed_set_for_vnode
+            ]
+
+            if potential_fallback_nodes:
+                chosen_node = random.choice(potential_fallback_nodes)
+                mask[chosen_node] = True
             else:
-                candidates.append(self.rejection_action)
-                mask[self.rejection_action] = True
-                print("[ERROR] No valid fallback. Agent is stuck.")
+                if can_revoke:
+                     mask[self.revocable_action] = True
+                else:
+                     #print(f"[Mask Fallback WARNING] VNode {self.curr_v_node_id}: All cached nodes failed, cannot revoke. Unmasking ALL cached nodes.")
+                     cached_indices = [p for p in original_cached_nodes if 0 <= p < self.p_net.num_nodes]
+                     if cached_indices:
+                         mask[cached_indices] = True
+                     else:
+                        #print(f"[Mask Fallback ERROR] Original cache empty. Defaulting to node 0.") 
+                        # ---- Fallback: allow reject if absolutely no other option ---- 
+                        mask[self.rejection_action] = True 
 
         return mask
  
     def compute_reward(self, solution, revoke=False):
         if revoke:
             # Small penalty for backtracking
-            reward = -1.25
+            reward = -.25
         elif solution['early_rejection']:
             # Harsh penalty for giving up
             reward = -5
         elif not solution['place_result'] or not solution['route_result']:
             # Step failed
-            return -1
+            return -.25
         elif solution['result']:
             # Final success
-            reward = solution['v_net_r2c_ratio'] * 12.0
+            reward = 4
         else:
             # Intermediate success
-            reward = 1
+            reward = .25
 
         self.solution['v_net_reward'] += reward
         return reward

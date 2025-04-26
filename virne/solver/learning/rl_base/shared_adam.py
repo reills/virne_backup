@@ -44,9 +44,9 @@ class SharedAdam(torch.optim.Adam):
                 'weight_decay': optim_group['weight_decay'],
             })
         return SharedAdam(param_groups_list)
+ 
 
-
-def sync_gradients(shared_model, local_model):
+def sync_gradients(shared_model, local_model): 
     for (shared_name, shared_param), (local_name, local_param) in zip(
         shared_model.named_parameters(), local_model.named_parameters()
     ):

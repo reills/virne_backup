@@ -34,7 +34,7 @@ from ..utils import apply_mask_to_logit, get_observations_sample, RunningMeanStd
 from virne.utils import test_running_time
 
 
-def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interval, eval_interval, lock, shared_policy, shared_optimizer):
+def run_worker_process(cls_type, config_dict, rank, env, num_epochs,sync_counter,  save_interval, eval_interval, lock, shared_policy, shared_optimizer):
     """Target function for each spawned training worker process."""
 
     print(f"[Worker {rank}] Process started. Initializing solver...")
@@ -59,6 +59,7 @@ def run_worker_process(cls_type, config_dict, rank, env, num_epochs, save_interv
     solver.device = worker_device
     solver.rank = rank
     solver.verbose = config_dict['verbose']
+    solver.sync_counter = sync_counter      # <-- add this line
 
     print(f"[Worker {rank}] Solver instantiated on device: {solver.device}")
 
@@ -328,9 +329,18 @@ class RLSolver(Solver):
   
 
     def sync_parameters(self):
-        assert self.distributed_training, 'distributed_training should be True'
-        with self.lock:
-            self.policy.load_state_dict(self.shared_policy.state_dict())
+        # Ensure this function is robust even if called when not distributed
+        if not self.distributed_training:
+            return
+        if self.shared_policy is None or self.lock is None:
+            print(f"[Worker {self.rank}] Warning: Tried to sync parameters without shared components.")
+            return # Or raise error depending on desired strictness
+        try:
+            with self.lock:
+                self.policy.load_state_dict(self.shared_policy.state_dict())
+        except Exception as e:
+            print(f"[Worker {self.rank}] ERROR during sync_parameters: {e}")
+            # Potentially re-raise or handle
 
     def learn(self, env, num_epochs=1, **kwargs):
         if self.verbose >= 0: 
@@ -371,7 +381,8 @@ class RLSolver(Solver):
         assert self.distributed_training, 'distributed_training should be True'
         # Optional: Uncomment if your logic requires splitting epochs evenly
         # assert num_epochs % self.num_workers == 0, 'num_epochs should be divisible by num_workers'
-
+        
+        sync_counter = mp.Value('i', 0, lock=False)   # create once, share across workers
         mp.set_start_method('spawn', force=True)
         lock = mp.Lock()
         self.lock = lock  # Store the lock for use in update and sync methods
@@ -397,7 +408,7 @@ class RLSolver(Solver):
             job = mp.Process(
                 target=run_worker_process,
                 args=(self.__class__, config_dict, worker_rank, env_copy,
-                    worker_num_epochs, worker_save_interval, worker_eval_interval,
+                    worker_num_epochs,sync_counter, worker_save_interval, worker_eval_interval,
                     lock, self.policy, self.optimizer)  # Shared policy and optimizer
             )
 

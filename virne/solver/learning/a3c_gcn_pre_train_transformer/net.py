@@ -178,8 +178,7 @@ class AutoregressiveDecoder(nn.Module):
         self.pad_token = self.num_actions + 1  # Used for sequence padding
 
 
-        # Input embeddings
-        self.rtg_embed = nn.Linear(1, embedding_dim)
+        # Input embeddings 
         self.step_embedding = nn.Embedding(max_seq_len, embedding_dim)
         self.remaining_embedding = nn.Embedding(max_seq_len + 1, embedding_dim)
 
@@ -222,7 +221,8 @@ class AutoregressiveDecoder(nn.Module):
 
             # Predict 1 score per physical node
             self.node_score_head = nn.Sequential(
-                nn.Linear(2 * embedding_dim + 3, embedding_dim),
+                #nn.Linear(2 * embedding_dim + 3, embedding_dim), # if adding extra heuristic like resources 
+                nn.Linear(2 * embedding_dim, embedding_dim),
                 nn.GELU(),
                 nn.Linear(embedding_dim, 1)
             )
@@ -262,14 +262,10 @@ class AutoregressiveDecoder(nn.Module):
             node_features, _ = gat_layer(node_features, edge_index, edge_attr)
         graph_embedding = self.gat_projection(node_features)
 
-        # Embed history and RTG
+        # Embed history  
         history_features = obs['history_features']
-        action_embeddings = self.history_embed(history_features)
-        rtg = obs['rtg']
-        if rtg.dim() == 2:
-            rtg = rtg.unsqueeze(-1)
-        rtg_embedding = self.rtg_embed(rtg)
-        combined_target = action_embeddings + rtg_embedding
+        action_embeddings = self.history_embed(history_features) 
+        combined_target = action_embeddings  
 
         # Transformer decoder
         batch_size, seq_len, _ = combined_target.shape
@@ -315,19 +311,19 @@ class AutoregressiveDecoder(nn.Module):
         attn_context_per_node = attn_context[node_batch]
 
         # Compute node scores
-        resource_sum = node_features[:, :3].sum(dim=-1, keepdim=True)
-        raw_resource_score = (resource_sum - resource_sum.mean()) / (resource_sum.std() + 1e-5)
-        norm_edge_attr = (edge_attr - edge_attr.mean(dim=0)) / (edge_attr.std(dim=0) + 1e-5)
-        bw_context = scatter(norm_edge_attr, edge_index[0], dim=0, reduce='mean', dim_size=graph_embedding.size(0))
+        #resource_sum = node_features[:, :3].sum(dim=-1, keepdim=True)
+        #raw_resource_score = (resource_sum - resource_sum.mean()) / (resource_sum.std() + 1e-5)
+        #norm_edge_attr = (edge_attr - edge_attr.mean(dim=0)) / (edge_attr.std(dim=0) + 1e-5)
+        #bw_context = scatter(norm_edge_attr, edge_index[0], dim=0, reduce='mean', dim_size=graph_embedding.size(0))
 
         combined = torch.cat([
             F.normalize(graph_embedding, dim=-1),
             F.normalize(attn_context_per_node, dim=-1),
-            raw_resource_score,
-            bw_context
+            #raw_resource_score,
+            #bw_context
         ], dim=-1)
-
-        node_scores = self.node_score_head(combined).squeeze(-1) + 1.0 * raw_resource_score.squeeze(-1)
+        node_scores = self.node_score_head(combined).squeeze(-1)
+        #node_scores = self.node_score_head(combined).squeeze(-1) + 1.0 * raw_resource_score.squeeze(-1)
 
         # Compute special action scores
         special_action_scores = self.special_action_head(final_context_embedding)  # (B, 2)
@@ -348,11 +344,19 @@ class AutoregressiveDecoder(nn.Module):
         raw_logits[:, self.revoke_action_idx:self.reject_action_idx + 1] = special_action_scores
 
         # Apply action mask and clamp 
-        
-        # Clamp logits first (for numerical stability)
-        mask = obs['action_mask'].bool()
-        clamped_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
-        minus_inf = -torch.finfo(raw_logits.dtype).max  # safe for AMP (fp16 = -65504, fp32 = -3.4e38)
-        final_logits = torch.where(mask, clamped_logits, minus_inf)
+        # ── 1. **Clamp valid logits** (prevents FP16 overflow) ──────
+        safe_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)   # ← added
 
-        return final_logits
+        # ── 2. Mask invalid actions ─────────────────────────────────
+        mask      = obs['action_mask'].bool()
+        minus_inf = -torch.finfo(raw_logits.dtype).max               # –65504 for fp16
+        final_logits = torch.where(mask, safe_logits, minus_inf)
+
+        # ── 3. Optional temperature scaling (valid entries only) ────
+        T = getattr(self, "temperature", 1.0)
+        if T != 1.0:
+            valid = final_logits > minus_inf / 2                     # True only on allowed actions
+            final_logits = final_logits.clone()                      # avoid in-place on view
+            final_logits[valid] = final_logits[valid] / T
+        
+        return final_logits 

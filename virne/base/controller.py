@@ -1401,17 +1401,6 @@ class Controller:
         else:
             candidate_nodes = []
 
-        if check_link_constraint:
-            aggr_method = 'sum' if self.shortest_method == 'mcf' else 'max'
-            v_node_degrees = np.array(list(dict(v_net.degree()).values()))
-            p_node_degrees = np.array(list(dict(p_net.degree()).values()))
-            v_link_aggr_resource = np.array(v_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
-            p_link_aggr_resource = np.array(p_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
-            degrees_comparison = p_node_degrees[:] >= v_node_degrees[v_node_id]
-            resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
-            suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
-            candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
-
         # === Efficient Path Feasibility Pruning ===
         if phase == -1 or phase >=3:
             if p_node_prev is not None and solution is not None:
@@ -1434,6 +1423,17 @@ class Controller:
                     import traceback
                     print(f"[find_candidate_nodes] ERROR during path check: {e}")
                     traceback.print_exc()
+        elif check_link_constraint:
+            aggr_method = 'sum' if self.shortest_method == 'mcf' else 'max'
+            v_node_degrees = np.array(list(dict(v_net.degree()).values()))
+            p_node_degrees = np.array(list(dict(p_net.degree()).values()))
+            v_link_aggr_resource = np.array(v_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
+            p_link_aggr_resource = np.array(p_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
+            degrees_comparison = p_node_degrees[:] >= v_node_degrees[v_node_id]
+            resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
+            suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
+            candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
+
 
         return candidate_nodes
     
