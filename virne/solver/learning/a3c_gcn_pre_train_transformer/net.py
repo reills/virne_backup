@@ -177,8 +177,8 @@ class AutoregressiveDecoder(nn.Module):
         self.start_token = self.num_actions  # Used for history embeddings (start of sequence)
         self.pad_token = self.num_actions + 1  # Used for sequence padding
 
-
-        # Input embeddings 
+ 
+        # Input embeddings  
         self.step_embedding = nn.Embedding(max_seq_len, embedding_dim)
         self.remaining_embedding = nn.Embedding(max_seq_len + 1, embedding_dim)
 
@@ -204,7 +204,7 @@ class AutoregressiveDecoder(nn.Module):
         # History embeddings
         self.history_feature_dim = p_net_feature_dim
         self.history_embed = nn.Linear(self.history_feature_dim, self.embedding_dim)
-
+    
         # Learnable embeddings
         self.revoke_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
         self.reject_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
@@ -265,8 +265,8 @@ class AutoregressiveDecoder(nn.Module):
         # Embed history  
         history_features = obs['history_features']
         action_embeddings = self.history_embed(history_features) 
-        combined_target = action_embeddings  
-
+        combined_target = action_embeddings   
+        
         # Transformer decoder
         batch_size, seq_len, _ = combined_target.shape
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=combined_target.device), diagonal=1).bool()

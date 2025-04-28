@@ -60,8 +60,7 @@ def obs_as_tensor(obs, device, pad_token=None):
             'curr_v_node_id': torch.tensor([obs['curr_v_node_id']], dtype=torch.long, device=device),
             'vnfs_remaining': torch.tensor([obs['vnfs_remaining']], dtype=torch.long, device=device),
             'mask': None
-        } 
-        
+        }
         return result
 
     elif isinstance(obs, list):
@@ -96,7 +95,7 @@ def obs_as_tensor(obs, device, pad_token=None):
             'curr_v_node_id': torch.tensor(curr_v_ids, dtype=torch.long, device=device),
             'vnfs_remaining': torch.tensor(vnfs_remaining, dtype=torch.long, device=device),
             'mask': None
-        } 
+        }
 
         return result
 
@@ -225,11 +224,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
         history_features = []
 
-        done = False
+        done = False 
         while not done:  
             instance_obs = self.make_instance_obs(  history_features, encoder_obs, encoder_outputs, instance_env)
   
-            tensor_obs = self.preprocess_obs(instance_obs, device=self.device) 
+            tensor_obs = self.preprocess_obs(instance_obs, device=self.device)  
             action, action_logprob = self.select_action(tensor_obs, sample=False)
             obs, reward, done, info = instance_env.step(action)
             
@@ -440,27 +439,27 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """
         Constructs an observation dict using the given history of physical node feature vectors.
         """
-        max_len = self.max_seq_len
+        max_len = 30 # self.max_seq_len
 
         # Step 1: Prepend start token to history
         start_token = self.policy.actor.decoder.start_embedding.detach().cpu().numpy()
-        trimmed_history = [start_token] + history_features[:max_len - 1]  # total length will be <= max_len
-
+        recent_history = history_features[-(max_len - 1):] # want the most recent placements over the older ones
+        trimmed_history = [start_token] + recent_history
+        
         # Step 2: Pad history to max_len
         dim = len(trimmed_history[0])
         if len(trimmed_history) < max_len:
             pad = np.zeros((max_len - len(trimmed_history), dim), dtype=np.float32)
             trimmed_history = np.vstack([trimmed_history, pad])
         else:
-            trimmed_history = np.vstack(trimmed_history[:max_len])
- 
+            trimmed_history = np.vstack(trimmed_history[:max_len]) 
         obs = {
             'p_net_x': encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
             'edge_attr': encoder_obs['edge_attr'],
             'history_features': np.array(trimmed_history, dtype=np.float32),  # 🔁 new key
-            'encoder_outputs': encoder_outputs,
-            'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0), 
+            'encoder_outputs': encoder_outputs, 
+            'action_mask': np.expand_dims(encoder_obs['action_mask'], axis=0), 
             'curr_v_node_id': encoder_obs['curr_v_node_id'],
             'vnfs_remaining': encoder_obs['vnfs_remaining'],
         }
@@ -498,11 +497,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         history_features = []  # List of [D] feature vectors
         instance_done = False
          
-        while not instance_done:
-            
+        while not instance_done: 
             #dummy first pass 
-            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env )
-  
+            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env ) 
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device) 
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
             #print(f"[Loop] v_nodes placed: {len(sub_env.placed_v_net_nodes)}, action={action}, instance_done={instance_done}")
@@ -526,17 +523,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value) 
             
             if not instance_done:
-                encoder_obs = next_obs
-                encoder_outputs = self.policy.encode(
-                    self.preprocess_encoder_obs(encoder_obs, device=self.device)
-                )
- 
+                encoder_obs = next_obs 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_features,
-                                       encoder_obs,  # latest obs
-                                       encoder_outputs,  # latest enc
-                                       sub_env)
+            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env) 
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
          

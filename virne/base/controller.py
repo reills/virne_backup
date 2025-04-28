@@ -1398,8 +1398,8 @@ class Controller:
         if check_node_constraint:
             suitable_nodes = [p_node_id for p_node_id in all_p_nodes if self.check_node_constraints(v_net, p_net, v_node_id, p_node_id)[0]]
             candidate_nodes = list(set(suitable_nodes).difference(set(filter)))
-        else:
-            candidate_nodes = []
+        else: 
+            candidate_nodes = []  
 
         # === Efficient Path Feasibility Pruning ===
         if phase == -1 or phase >=3:
@@ -1433,8 +1433,7 @@ class Controller:
             resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
             suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
             candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
-
-
+ 
         return candidate_nodes
     
     

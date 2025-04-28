@@ -115,7 +115,7 @@ class BasicScenario(Scenario):
             self.env.epoch_id = epoch_id
             self.solver.epoch_id = epoch_id
 
-            instance = self.env.reset()
+            instance = self.env.reset(self.config.dir_save_dataset)
             if self.config.if_dynamic_v_nets:
                 self.env.v_net_simulator = Generator.generate_dynamic_v_nets_dataset_from_config(self.config, save=False)
                 #print('\n', [v.num_nodes for v in self.env.v_net_simulator.v_nets])

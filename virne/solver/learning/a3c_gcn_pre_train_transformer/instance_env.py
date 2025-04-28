@@ -81,8 +81,11 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         # --- Step 2: Filter based on runtime state (revoke/failed lists) ---
         revoked = self.revoked_actions_dict.get(self.curr_v_node_id, [])
-        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
-        valid_candidates = [p for p in current_candidates if p not in revoked and p not in failed]
+        failed = self.attempt_blacklist.get(self.curr_v_node_id, set()) 
+        
+        #print(f"BEFORE [MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {current_candidates}") 
+        valid_candidates = [p for p in current_candidates if p not in revoked and p not in failed] 
+        #print(f"AFTER [MASK] VNode {self.curr_v_node_id} candidates AFTER mask: {valid_candidates}")
 
         # --- Step 3: Add Revoke action if applicable ---
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
@@ -92,48 +95,35 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
                        threshold_ok )
         if can_revoke:
             valid_candidates.append(self.revocable_action)
-
-        # --- Step 4: Build the initial mask ---
+ 
+        # PHASE 3+: Allow reject once at least 1 action attempted
+        #if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
+        #    candidates.append(self.rejection_action)
+             
         mask = np.zeros(self.num_actions, dtype=bool)
         indices = [a for a in valid_candidates if 0 <= a < self.num_actions]
         if indices:
             mask[indices] = True
 
         # --- Step 5: Fallback Logic (if mask is empty) ---
-        if not mask.any():
-            # Fallback uses the original cached list
-            original_cached_nodes = list(self._cached_candidates) if self._cached_candidates is not None else []
-            failed_set_for_vnode = self.attempt_blacklist.get(self.curr_v_node_id, set())
-            potential_fallback_nodes = [
-                p for p in original_cached_nodes
-                if 0 <= p < self.p_net.num_nodes and p not in failed_set_for_vnode
-            ]
-
-            if potential_fallback_nodes:
-                chosen_node = random.choice(potential_fallback_nodes)
-                mask[chosen_node] = True
-            else:
-                if can_revoke:
-                     mask[self.revocable_action] = True
-                else:
-                     #print(f"[Mask Fallback WARNING] VNode {self.curr_v_node_id}: All cached nodes failed, cannot revoke. Unmasking ALL cached nodes.")
-                     cached_indices = [p for p in original_cached_nodes if 0 <= p < self.p_net.num_nodes]
-                     if cached_indices:
-                         mask[cached_indices] = True
-                     else:
-                        #print(f"[Mask Fallback ERROR] Original cache empty. Defaulting to node 0.") 
-                        # ---- Fallback: allow reject if absolutely no other option ---- 
-                        mask[self.rejection_action] = True 
+        if not mask.any(): 
+            #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})") 
+            candidates.append(self.rejection_action)
+            mask[self.rejection_action] = True 
 
         return mask
  
     def compute_reward(self, solution, revoke=False):
-        if revoke:
-            # Small penalty for backtracking
-            reward = -.25
+        
+        if self.solution['failed']:
+            #failed to place entire SFC but at least tried
+            reward = -2
+        elif revoke:
+            # Small penalty for backtracking 
+            reward = -.3
         elif solution['early_rejection']:
-            # Harsh penalty for giving up
-            reward = -5
+            # Harsh penalty for giving up entirely 
+            reward = -6
         elif not solution['place_result'] or not solution['route_result']:
             # Step failed
             return -.25
@@ -147,8 +137,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.solution['v_net_reward'] += reward
         return reward
  
-    
-    
+     
     def _get_v_net_obs(self):
         """
         Construct virtual network observation matrix with:
@@ -295,7 +284,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             'edge_attr': edge_attr
         }
 
-
+    
     def get_history_features(self):
         """
         Return context vectors for selected physical nodes (instead of raw node indices).
