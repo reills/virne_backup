@@ -40,17 +40,13 @@ class InstanceRLEnv(RLBaseEnv):
         # self.node_ranking_method = 'nps'
         self.ranked_v_net_nodes = rank_nodes(self.v_net, self.node_ranking_method)
         self.solution['v_net_reward'] = 0
-        self.solution['num_interactions'] = 0
-        self.prev_obs = None  # Initialize to None
-        self.prev_tensor_obs = None  # Initialize to None
-        self.preprocess_obs_fn = kwargs.pop("preprocess_obs_fn", None)
-        #if self.preprocess_obs_fn is None:
-        #    raise ValueError("Missing required 'preprocess_obs_fn'")
+        self.solution['num_interactions'] = 0  
+        self.solution['failed'] = False 
+        
         self.device = kwargs.get("device", torch.device("cpu"))
         
         self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
         self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}
-        self.solution['last_placement_failed'] = False 
         self.attempt_blacklist = defaultdict(set)
 
         # set_sim_info_to_object(kwargs, self)
@@ -152,6 +148,20 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
     def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
         super(JointPRStepInstanceRLEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
 
+    def check_last_chance(self ):
+        candidates = self._cached_candidates
+
+        # Remove previously revoked candidates
+        key = (str(self.solution.node_slots), self.curr_v_node_id)
+        revoked = self.revoked_actions_dict.get(key, [])
+        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
+        
+        #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
+        candidates = [p for p in candidates if p not in revoked and p not in failed]
+        
+        #print(f' still available {len(candidates)}: {candidates}')
+        return len(candidates) == 0
+    
     def step(self, action):
         """
         Joint Place and Route with action p_net node.
@@ -167,14 +177,12 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
 
        # Case: Reject
         if self.if_rejection(action): 
-            self.attempt_blacklist.clear()
-            self.solution['last_placement_failed'] = False
+            self.attempt_blacklist.clear() 
             return self.reject(is_early=True)
         
         # Case: Revoke 
         if self.if_revocable(action):  
-            last_v_node_id = self.placed_v_net_nodes[-1] if self.placed_v_net_nodes else None 
-            self.solution['last_placement_failed'] = False
+            last_v_node_id = self.placed_v_net_nodes[-1] if self.placed_v_net_nodes else None  
 
             if not self.placed_v_net_nodes:
                 print(f"[WARN] Called step() but no placements made yet. Placevnetnodes:{self.placed_v_net_nodes},Action={action},selectedpnodes:{self.selected_p_net_nodes}")
@@ -182,16 +190,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
           
             self.attempt_blacklist[last_v_node_id].clear()
             return self.revoke()
-        
-        # Case: reusable = False and place in one same node (not allowed currently)
-        if not self.reusable and (p_node_id in self.selected_p_net_nodes): 
-            self.solution['place_result'] = False
-            self.solution['route_result'] = False
-            self.solution['last_placement_failed'] = True 
-            done = True 
-            solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-            return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
-
+         
         # Case: Try to Place and Route
         assert p_node_id in list(self.p_net.nodes)
             
@@ -206,19 +205,17 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                             check_feasibility=self.check_feasibility)
         # Step Failure
         if not place_and_route_result:
-            # Placement failed — retryable
-            self.solution['place_result'] = False
-            self.solution['route_result'] = False
-            self.solution['last_placement_failed'] = True
+            # Placement failed — retryable 
             self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
-            reward = self.compute_reward(self.solution)
-            done = False
+            reward = self.compute_reward(self.solution) 
+            done = self.check_last_chance()  
+            #print(f"PLACE FAILED [CHECK LAST CHANCE] FAILED = {done}  ")
+            self.solution['failed'] = done
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
             return self.get_observation(), reward, done, self.get_info(solution_info)
 
         # Placement and Route Success
-        self.attempt_blacklist[self.curr_v_node_id].clear()
-        self.solution['last_placement_failed'] = False
+        self.attempt_blacklist[self.curr_v_node_id].clear() 
     
         #finished placing and routing full SFC 
         if self.num_placed_v_net_nodes == self.v_net.num_nodes:

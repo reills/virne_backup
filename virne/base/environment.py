@@ -79,7 +79,7 @@ class Environment:
             print(f"\nEvent: id={event_id}, type={self.curr_event['type']}")
             print(f"{'-' * 30}")
 
-    def reset(self, seed: int = None):
+    def reset(self, vnet_path: str, seed: int = None):
         """
         Reset the environment.
 
@@ -98,6 +98,7 @@ class Environment:
         #print(f'reset vnet yeah it is actually trying to generating them from: {self.v_nets_dataset_dir }')
         #self.v_nets_dataset_dir =
         self.v_nets_dataset_dir = self.v_net_simulator.v_sim_setting.get('save_dir')
+        self.v_nets_dataset_dir = vnet_path
         if self.renew_v_net_simulator:
             self.v_net_simulator.renew(v_nets=True, events=True, seed=seed)
             print(f'Generate virtual networks with seed {seed}') if self.verbose >= 1 else None

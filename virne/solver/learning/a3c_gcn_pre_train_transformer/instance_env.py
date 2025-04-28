@@ -81,9 +81,10 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         revoked = self.revoked_actions_dict.get(key, [])
         failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
         
-        #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
+        #print(f"BEFORE [MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
         candidates = [p for p in candidates if p not in revoked and p not in failed]
-         
+        
+        #print(f"AFTER [MASK] VNode {self.curr_v_node_id} candidates AFTER mask: {candidates}")
         # ---- Curriculum-aware Revoke / Reject Masking ----
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
 
@@ -92,8 +93,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             candidates.append(self.revocable_action)
 
         # PHASE 3+: Allow reject once at least 1 action attempted
-        if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
-            candidates.append(self.rejection_action)
+        #if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
+        #    candidates.append(self.rejection_action)
             
         # ---- Build binary action mask ----
         mask = np.zeros(self.num_actions, dtype=bool)
@@ -102,24 +103,24 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
 
         # ---- Fallback: allow reject if absolutely no other option ----
         if not mask.any():
-            #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})")
-            if self.allow_rejection and 0 <= self.rejection_action < self.num_actions:
-                mask[self.rejection_action] = True
-                #print("[WARN] Fallback to REJECTION action.")
-            else:
-                candidates.append(self.rejection_action)
-                mask[self.rejection_action] = True
-                print("[ERROR] No valid fallback. Agent is stuck.")
+            #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})") 
+            candidates.append(self.rejection_action)
+            mask[self.rejection_action] = True
+            #print("[ERROR] No valid fallback. Agent is stuck.")
 
         return mask
  
     def compute_reward(self, solution, revoke=False):
-        if revoke:
+        
+        if self.solution['failed']:
+            #failed to place entire SFC but at least tried
+            reward = -2
+        elif revoke:
             # Small penalty for backtracking
-            reward = -1.25
+            reward = -1
         elif solution['early_rejection']:
-            # Harsh penalty for giving up
-            reward = -5
+            # Harsh penalty for giving up entirely 
+            reward = -6
         elif not solution['place_result'] or not solution['route_result']:
             # Step failed
             return -1
@@ -133,8 +134,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self.solution['v_net_reward'] += reward
         return reward
  
-    
-    
+     
     def _get_v_net_obs(self):
         """
         Construct virtual network observation matrix with:
@@ -281,7 +281,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             'edge_attr': edge_attr
         }
 
-
+    
     def get_history_features(self):
         """
         Return context vectors for selected physical nodes (instead of raw node indices).

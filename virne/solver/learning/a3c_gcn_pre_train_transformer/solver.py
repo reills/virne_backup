@@ -61,10 +61,6 @@ def obs_as_tensor(obs, device, pad_token=None):
             'mask': None
         }
 
-        if 'rtg' in obs:
-            rtg = torch.tensor(obs['rtg'], dtype=torch.float32, device=device)
-            result['rtg'] = rtg
-
         return result
 
     elif isinstance(obs, list):
@@ -100,11 +96,6 @@ def obs_as_tensor(obs, device, pad_token=None):
             'vnfs_remaining': torch.tensor(vnfs_remaining, dtype=torch.long, device=device),
             'mask': None
         }
-
-        if 'rtg' in obs[0]:
-            rtg_list = [torch.tensor(o['rtg'], dtype=torch.float32).squeeze(0) for o in obs]  # shape (T,)
-            padded_rtg = pad_sequence(rtg_list, batch_first=True).unsqueeze(-1).to(device)     # (B, T, 1)
-            result['rtg'] = padded_rtg
 
         return result
 
@@ -246,23 +237,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         done = False
         while not done:
-            rtg = [0.0] * len(history_features)
 
             instance_obs = self.make_instance_obs(
-                history_features, encoder_obs, encoder_outputs, instance_env, rtg=rtg
-            )
-
-            #   Cache for revoke() support
-            instance_env.prev_obs = {
-                **instance_obs,
-                'encoder_outputs': encoder_outputs.detach().cpu().numpy()
-            }
-
-            tensor_obs = self.preprocess_obs(instance_obs, device=self.device)
-            instance_env.prev_tensor_obs = {
-                k: v.cpu() if torch.is_tensor(v) else v
-                for k, v in tensor_obs.items()
-            }
+                history_features, encoder_obs, encoder_outputs, instance_env 
+            ) 
+            tensor_obs = self.preprocess_obs(instance_obs, device=self.device) 
 
             action, action_logprob = self.select_action(tensor_obs, sample=False)
             obs, reward, done, info = instance_env.step(action)
@@ -277,6 +256,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             if not done:
                 encoder_obs = obs   
+                encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device)) 
 
         return instance_env.solution 
 
@@ -358,10 +338,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 # --- Manual Log Probability and Entropy Calculation ---
                 logits_last = logits_f32[:, -1, :]  #[batch_size, num_actions]
                 log_probs_all = F.log_softmax(logits_last, dim=-1)  # [B, A]
-
-                #print("log_probs_all.shape =", log_probs_all.shape)
-                #print("actions.shape =", actions.shape)
-
+ 
                 # Log probs for the chosen actions
                 action_logprobs = log_probs_all.gather(dim=-1, index=actions.unsqueeze(-1)).squeeze(-1)
 
@@ -460,16 +437,17 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         
     
-    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env, rtg=None):
+    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env ):
         """
         Constructs an observation dict using the given history of physical node feature vectors.
         """
-        max_len = self.max_seq_len
+        max_len = 30 # self.max_seq_len
 
         # Step 1: Prepend start token to history
         start_token = self.policy.actor.decoder.start_embedding.detach().cpu().numpy()
-        trimmed_history = [start_token] + history_features[:max_len - 1]  # total length will be <= max_len
-
+        recent_history = history_features[-(max_len - 1):] # want the most recent placements over the older ones
+        trimmed_history = [start_token] + recent_history
+        
         # Step 2: Pad history to max_len
         dim = len(trimmed_history[0])
         if len(trimmed_history) < max_len:
@@ -478,25 +456,13 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         else:
             trimmed_history = np.vstack(trimmed_history[:max_len])
 
-        # Step 3: Match RTG to history length
-        if rtg is not None:
-            rtg = [0.0] + rtg[:max_len - 1]  # same logic as history
-        else:
-            rtg = [0.0]
-
-        # Pad or trim RTG to max_len
-        rtg = rtg + [0.0] * (max_len - len(rtg))
-        rtg = np.array(rtg, dtype=np.float32).reshape(1, -1)
-    
-
         obs = {
             'p_net_x': encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
             'edge_attr': encoder_obs['edge_attr'],
             'history_features': np.array(trimmed_history, dtype=np.float32),  # 🔁 new key
             'encoder_outputs': encoder_outputs,
-            'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0),
-            'rtg': np.array(rtg, dtype=np.float32).reshape(1, -1),
+            'action_mask': np.expand_dims(encoder_obs['action_mask'], axis=0),
             'curr_v_node_id': encoder_obs['curr_v_node_id'],
             'vnfs_remaining': encoder_obs['vnfs_remaining'],
         }
@@ -535,21 +501,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         while not instance_done:
             
             #dummy first pass
-            rtg_slice = [0.0] * len(history_features)
-            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=rtg_slice)
-
-            sub_env.prev_obs = {
-                **instance_obs,
-                'encoder_outputs': encoder_outputs.detach().cpu().numpy()
-            }
-              
+            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env)
+ 
             # Accessing InstanceRLEnv attribute -- save for when revoke -- less recalculating..
-            tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
-            tensor_instance_obs_cpu = {
-                k: v.cpu() if torch.is_tensor(v) else v
-                for k, v in tensor_instance_obs.items()
-            }
-            sub_env.prev_tensor_obs = tensor_instance_obs_cpu 
+            tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device) 
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
             #print(f"[Loop] v_nodes placed: {len(sub_env.placed_v_net_nodes)}, action={action}, instance_done={instance_done}")
 
@@ -573,24 +528,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             
             if not instance_done:
                 encoder_obs = next_obs
-
-        # Now compute RTG
-        rtg = np.cumsum(sub_buffer.rewards[::-1])[::-1]
-
-        # Inject correct RTG values into buffer observations
-        for i, obs in enumerate(sub_buffer.observations):
-            hist_len = obs['history_features'].shape[0]  # should be 15
-            rtg_slice = rtg[:hist_len]
-            if len(rtg_slice) < hist_len:
-                rtg_slice = np.pad(rtg_slice, (0, hist_len - len(rtg_slice)), constant_values=0.0)
-            else:
-                rtg_slice = rtg_slice[:hist_len]
-            obs['rtg'] = np.array(rtg_slice, dtype=np.float32).reshape(1, -1)  # (1, T)
-
-                
+                encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device)) 
+            
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env, rtg=[0.0]*len(history_features))
+            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env)
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
          
@@ -636,7 +578,7 @@ def encoder_obs_to_tensor(obs, device, policy=None):
         elif obs_v_net_x.dim() != 3:
             raise ValueError(f"Expected 2D or 3D tensor, got {obs_v_net_x.dim()}D")
 
-        # ✅ Inject encoder_outputs if possible
+        # Inject encoder_outputs if possible
         if policy is not None and 'encoder_outputs' not in obs:
             with torch.no_grad():
                 encoder_outputs = policy.encode({'v_net_x': obs_v_net_x})

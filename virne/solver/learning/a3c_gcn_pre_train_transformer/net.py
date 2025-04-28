@@ -179,7 +179,6 @@ class AutoregressiveDecoder(nn.Module):
 
 
         # Input embeddings
-        self.rtg_embed = nn.Linear(1, embedding_dim)
         self.step_embedding = nn.Embedding(max_seq_len, embedding_dim)
         self.remaining_embedding = nn.Embedding(max_seq_len + 1, embedding_dim)
 
@@ -205,7 +204,7 @@ class AutoregressiveDecoder(nn.Module):
         # History embeddings
         self.history_feature_dim = p_net_feature_dim
         self.history_embed = nn.Linear(self.history_feature_dim, self.embedding_dim)
-
+    
         # Learnable embeddings
         self.revoke_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
         self.reject_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
@@ -262,15 +261,11 @@ class AutoregressiveDecoder(nn.Module):
             node_features, _ = gat_layer(node_features, edge_index, edge_attr)
         graph_embedding = self.gat_projection(node_features)
 
-        # Embed history and RTG
+        # Embed history  
         history_features = obs['history_features']
-        action_embeddings = self.history_embed(history_features)
-        rtg = obs['rtg']
-        if rtg.dim() == 2:
-            rtg = rtg.unsqueeze(-1)
-        rtg_embedding = self.rtg_embed(rtg)
-        combined_target = action_embeddings + rtg_embedding
-
+        action_embeddings = self.history_embed(history_features) 
+        combined_target = action_embeddings  
+        
         # Transformer decoder
         batch_size, seq_len, _ = combined_target.shape
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=combined_target.device), diagonal=1).bool()
