@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# instance_rl_environment.py
 # ==============================================================================
 
 
@@ -39,15 +39,17 @@ class InstanceRLEnv(RLBaseEnv):
         # calcuate graph metrics
         # self.node_ranking_method = 'nps'
         self.ranked_v_net_nodes = rank_nodes(self.v_net, self.node_ranking_method)
-        self.solution['v_net_reward'] = 0
+        self.solution['v_net_reward'] = 0 
         self.solution['num_interactions'] = 0  
-        self.solution['failed'] = False 
-        
+        self.solution['failed'] = False  
         self.device = kwargs.get("device", torch.device("cpu"))
         
         self._distance_cache = {} # Stores {p_node_id: full_distance_dict}
         self._normalized_distance_vector_cache = {} # Stores {p_node_id: np.array}
         self.attempt_blacklist = defaultdict(set)
+        self.retry_budget = defaultdict(int)  # Tracks how many retries have been used for each vnode
+        self.max_retry_budget = defaultdict(lambda: 6)  # You can change 3 to anything or set dynamically later
+
 
         # set_sim_info_to_object(kwargs, self)
     def _get_normalized_distance_feature(self, source_p_node_id):
@@ -107,6 +109,10 @@ class InstanceRLEnv(RLBaseEnv):
         self._distance_cache.clear()
         self._normalized_distance_vector_cache.clear()  
         
+        self.attempt_blacklist.clear()
+        self.retry_budget.clear()
+        self.max_retry_budget.clear()
+        
         return super().reset()
 
     def reject(self, is_early=True):
@@ -136,7 +142,7 @@ class InstanceRLEnv(RLBaseEnv):
         )
 
         solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-        self.revoked_actions_dict[(str(self.solution.node_slots), last_v_node_id)].append(paired_p_node_id)
+        self.revoked_actions_dict[last_v_node_id].append(paired_p_node_id)
 
         # ── Return raw observation (agent will re-inject encoder_outputs and preprocess externally) ──
         obs = self.get_observation()
@@ -147,7 +153,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
     
     def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
         super(JointPRStepInstanceRLEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
-
+ 
     def check_last_chance(self ):
         candidates = self._cached_candidates
 
@@ -160,7 +166,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         candidates = [p for p in candidates if p not in revoked and p not in failed]
         
         #print(f' still available {len(candidates)}: {candidates}')
-        return len(candidates) == 0
+        return len(candidates) == 0 
     
     def step(self, action):
         """
@@ -174,7 +180,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
         self.solution['num_interactions'] += 1
         p_node_id = int(action)
         self.solution.selected_actions.append(p_node_id)
-
+ 
        # Case: Reject
         if self.if_rejection(action): 
             self.attempt_blacklist.clear() 
@@ -189,6 +195,7 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                 return self.reject(is_early=True)     
           
             self.attempt_blacklist[last_v_node_id].clear()
+            self.retry_budget[last_v_node_id] = 0
             return self.revoke()
          
         # Case: Try to Place and Route
@@ -204,19 +211,25 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                             k=self.k_shortest,
                                                                             check_feasibility=self.check_feasibility)
         # Step Failure
-        if not place_and_route_result:
+        if not place_and_route_result: 
             # Placement failed — retryable 
             self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
-            reward = self.compute_reward(self.solution) 
+            reward = self.compute_reward(self.solution)  
+            self.retry_budget[self.curr_v_node_id] += 1
+            retry_used = self.retry_budget[self.curr_v_node_id]
+            retry_cap = self.max_retry_budget[self.curr_v_node_id]
             done = self.check_last_chance()  
             #print(f"PLACE FAILED [CHECK LAST CHANCE] FAILED = {done}  ")
             self.solution['failed'] = done
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-            return self.get_observation(), reward, done, self.get_info(solution_info)
-
+            return self.get_observation(), reward, done, self.get_info(solution_info) 
+ 
         # Placement and Route Success
-        self.attempt_blacklist[self.curr_v_node_id].clear() 
-    
+        self.attempt_blacklist[self.curr_v_node_id].clear()
+        self.solution['last_placement_failed'] = False
+        self.retry_budget[self.curr_v_node_id] = 0
+        self.max_retry_budget[self.curr_v_node_id] = 3  # Optional: reset to default, or keep if dynamic
+  
         #finished placing and routing full SFC 
         if self.num_placed_v_net_nodes == self.v_net.num_nodes:
             self.solution['result'] = True  

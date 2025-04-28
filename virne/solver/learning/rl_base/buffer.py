@@ -70,15 +70,28 @@ class RolloutBuffer:
                 return [move_to_cpu(v) for v in x]
             return x
 
+        # --- Fix action shape first ---
+        if isinstance(action, int):
+            action_tensor = torch.tensor([action], dtype=torch.long)
+        elif isinstance(action, torch.Tensor):
+            if action.dim() == 0:
+                action_tensor = action.unsqueeze(0)
+            elif action.dim() == 1:
+                action_tensor = action
+            else:
+                raise ValueError(f"Unexpected action shape: {action.shape}")
+        else:
+            raise ValueError(f"Unexpected action type: {type(action)}")
+
+        # --- Then move everything to CPU ---
         self.observations.append(move_to_cpu(obs))
-        self.actions.append(move_to_cpu(action))
+        self.actions.append(move_to_cpu(action_tensor))
         self.rewards.append(float(reward))
         self.dones.append(bool(done))
         self.logprobs.append(move_to_cpu(logprob))
         self.values.append(move_to_cpu(value))
         self.curr_idx += 1
 
-    
     def merge(self, buffer):
         for item in self.all_items:
             main_item_list = getattr(self, item)

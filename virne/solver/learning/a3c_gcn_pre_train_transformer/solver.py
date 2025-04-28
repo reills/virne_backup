@@ -1,3 +1,4 @@
+
 # ==============================================================================
 # solver.py (Refactored for Autoregressive Transformer to Match Pretrainer)
 # ==============================================================================
@@ -60,7 +61,6 @@ def obs_as_tensor(obs, device, pad_token=None):
             'vnfs_remaining': torch.tensor([obs['vnfs_remaining']], dtype=torch.long, device=device),
             'mask': None
         }
-
         return result
 
     elif isinstance(obs, list):
@@ -183,22 +183,12 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """
         with torch.no_grad():
             raw_logits = self.policy.act(observation, training=False)  # May be float16 if AMP is on
-
-        # === Sanity check for NaNs ===
-        if not torch.isfinite(raw_logits).all():
-            minus_inf = -torch.finfo(raw_logits.dtype).max
-            raw_logits = torch.nan_to_num(raw_logits, nan=minus_inf, posinf=15.0, neginf=minus_inf)
-
-        # === Apply temperature and Categorical in FP32 ===
-        T = 1.0
-        if sample:
-            epoch = getattr(self, "training_epoch_id", 0)
-            T_raw = self.initial_temperature * (self.temperature_decay ** epoch)
-            T = max(0.5, min(T_raw, 10.0))
+            
+        assert torch.isfinite(raw_logits).all(), "NaN or Inf detected in logits from policy.act()"
 
         with torch.amp.autocast(device_type="cuda",enabled=False):  # Force FP32 for this part
-            logits_f32 = (raw_logits / T).float()
-            logits_last = logits_f32  # Already shape [B, A]
+            logits_f32 = raw_logits.float()
+            logits_last = logits_f32                # shape (B, num_actions)
             log_probs_all = F.log_softmax(logits_last, dim=-1)  # [B, A]
 
             # Use softmax for stable probabilities
@@ -226,8 +216,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         instance_env = self.InstanceEnv(
             p_net, v_net,
-            self.controller, self.recorder, self.counter,
-            preprocess_obs_fn=self.preprocess_obs,  #   REQUIRED to support revoke()
+            self.controller, self.recorder, self.counter, 
             **self.basic_config
         )
 
@@ -235,14 +224,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
         history_features = []
 
-        done = False
-        while not done:
-
-            instance_obs = self.make_instance_obs(
-                history_features, encoder_obs, encoder_outputs, instance_env 
-            ) 
-            tensor_obs = self.preprocess_obs(instance_obs, device=self.device) 
-
+        done = False 
+        while not done:  
+            instance_obs = self.make_instance_obs(  history_features, encoder_obs, encoder_outputs, instance_env)
+  
+            tensor_obs = self.preprocess_obs(instance_obs, device=self.device)  
             action, action_logprob = self.select_action(tensor_obs, sample=False)
             obs, reward, done, info = instance_env.step(action)
             
@@ -292,6 +278,13 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         """Performs memory-efficient policy update using gradient accumulation."""
         grad_accum_steps = self.grad_accum_steps
         buffer_size = self.buffer.size()
+        # === Update temperature for this epoch ===
+        epoch = getattr(self, "training_epoch_id", 0)
+        T_raw = self.initial_temperature * (self.temperature_decay ** epoch)
+        T = max(0.5, min(T_raw, 10.0))  # clamp to [0.5, 10.0] for safety
+
+        self.policy.actor.decoder.temperature = T
+        self.policy.critic.decoder.temperature = T
 
         if buffer_size == 0:
             return None, 0.0, None, None, None
@@ -316,7 +309,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             end_idx = (step + 1) * micro_batch_size if step < grad_accum_steps - 1 else buffer_size
 
             obs_slice = self.buffer.observations[start_idx:end_idx]
-            actions = torch.LongTensor(self.buffer.actions[start_idx:end_idx]).to(self.device)
+            actions = torch.stack(self.buffer.actions[start_idx:end_idx]).to(self.device)
             returns = torch.FloatTensor(self.buffer.returns[start_idx:end_idx]).to(self.device)
 
             obs_tensors = self.preprocess_obs(obs_slice, self.device, pad_token=self.pad_token)
@@ -330,13 +323,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
             # Step 2: Distribution & Loss Calculation in FP32
             with torch.amp.autocast(device_type="cuda", enabled=False):
-                logits_f32 = logits_raw.float()
+                logits_f32 = logits_raw.float() #raw_logits are already temperature-scaled and masked.
                 values_f32 = values_raw.float()
                 advantages_f32 = all_advantages[start_idx:end_idx].float()
                 returns_f32 = returns.float()
 
                 # --- Manual Log Probability and Entropy Calculation ---
-                logits_last = logits_f32[:, -1, :]  #[batch_size, num_actions]
+                logits_last = logits_f32                # shape (B, num_actions)
+                #logits_last = logits_last.clamp(min=-10.0, max=8.0)  # prevent sharp choices dominating
                 log_probs_all = F.log_softmax(logits_last, dim=-1)  # [B, A]
  
                 # Log probs for the chosen actions
@@ -350,8 +344,11 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 dist_entropy = -entropy_term.sum(dim=-1)
                 
 
-                actor_loss = -(action_logprobs * advantages_f32).mean()
+                actor_loss = -(action_logprobs * advantages_f32).mean() 
+                # Normalize returns to have zero mean and unit variance (optional but recommended)
+                #returns_f32 = (returns_f32 - returns_f32.mean()) / (returns_f32.std() + 1e-8)
                 critic_loss = F.mse_loss(returns_f32, values_f32)
+
                 entropy_loss = dist_entropy.mean()
                 total_loss = actor_loss + self.coef_critic_loss * critic_loss - self.coef_entropy_loss * entropy_loss
 
@@ -410,17 +407,18 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         if self.distributed_training:
             if self.shared_optimizer is None or self.shared_policy is None or self.lock is None:
                 raise RuntimeError(f"[Rank {self.rank}] Missing shared components in distributed mode.")
-
-            with self.lock: # 1. Sync accumulated grads to shared policy 
+            
+            with self.lock:
                 sync_gradients(self.shared_policy, self.policy)
-                
-                # Average gradients by dividing by num_workers
-                for param in self.shared_policy.parameters():
-                    if param.grad is not None:
-                        param.grad.div_(self.num_workers) 
-                grad_norm = self.clip_grads(self.shared_policy, self.shared_optimizer)  # 2. Clip gradients on shared policy
-                self.optimizer_step(self.shared_optimizer)   # 3. Step optimizer
-                self.zero_grads(self.policy, self.shared_optimizer) # 4. Clear grads
+                self.sync_counter.value += 1
+                if self.sync_counter.value == self.num_workers:
+                    for p in self.shared_policy.parameters():
+                        if p.grad is not None:
+                            p.grad.div_(self.num_workers)
+                    grad_norm = self.clip_grads(self.shared_policy, self.shared_optimizer)
+                    self.optimizer_step(self.shared_optimizer)
+                    self.zero_grads(self.policy, self.shared_optimizer)
+                    self.sync_counter.value = 0        # reset for next batch
 
         else:
             if self.optimizer is None:
@@ -454,15 +452,14 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             pad = np.zeros((max_len - len(trimmed_history), dim), dtype=np.float32)
             trimmed_history = np.vstack([trimmed_history, pad])
         else:
-            trimmed_history = np.vstack(trimmed_history[:max_len])
-
+            trimmed_history = np.vstack(trimmed_history[:max_len]) 
         obs = {
             'p_net_x': encoder_obs['p_net_x'],
             'p_net_edge_index': encoder_obs['p_net_edge_index'],
             'edge_attr': encoder_obs['edge_attr'],
             'history_features': np.array(trimmed_history, dtype=np.float32),  # 🔁 new key
-            'encoder_outputs': encoder_outputs,
-            'action_mask': np.expand_dims(encoder_obs['action_mask'], axis=0),
+            'encoder_outputs': encoder_outputs, 
+            'action_mask': np.expand_dims(encoder_obs['action_mask'], axis=0), 
             'curr_v_node_id': encoder_obs['curr_v_node_id'],
             'vnfs_remaining': encoder_obs['vnfs_remaining'],
         }
@@ -485,10 +482,12 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             self.coef_entropy_loss = 0.1
         elif self.training_epoch_id < (60 / self.num_workers):
             phase = 3 #include reject
-            self.coef_entropy_loss = 0.01
+            self.coef_entropy_loss = 0.05
         else:
             phase = 4 #include pruning-- very slow
-            self.coef_entropy_loss = 0.005
+            self.coef_entropy_loss = 0.01 
+        phase = 4 #include pruning-- very slow
+        self.coef_entropy_loss = 0.05   
     
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
                                 preprocess_obs_fn=self.preprocess_obs, phase=phase, **self.basic_config)
@@ -498,12 +497,9 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         history_features = []  # List of [D] feature vectors
         instance_done = False
          
-        while not instance_done:
-            
-            #dummy first pass
-            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env)
- 
-            # Accessing InstanceRLEnv attribute -- save for when revoke -- less recalculating..
+        while not instance_done: 
+            #dummy first pass 
+            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env ) 
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device) 
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
             #print(f"[Loop] v_nodes placed: {len(sub_env.placed_v_net_nodes)}, action={action}, instance_done={instance_done}")
@@ -527,12 +523,10 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
             sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value) 
             
             if not instance_done:
-                encoder_obs = next_obs
-                encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device)) 
-            
+                encoder_obs = next_obs 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env)
+            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env) 
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
          
@@ -550,10 +544,10 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         p_net_num_nodes=action_dim,
         p_net_feature_dim=p_dimension_features,
         v_net_feature_dim=v_dimension_features,
-        embedding_dim=128,
-        n_heads=8,
-        n_layers=6,
-        dropout=0.2,
+        embedding_dim=100,
+        n_heads=4,
+        n_layers=4,
+        dropout=0.1,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection,
         use_amp=use_amp,

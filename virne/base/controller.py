@@ -1398,19 +1398,8 @@ class Controller:
         if check_node_constraint:
             suitable_nodes = [p_node_id for p_node_id in all_p_nodes if self.check_node_constraints(v_net, p_net, v_node_id, p_node_id)[0]]
             candidate_nodes = list(set(suitable_nodes).difference(set(filter)))
-        else:
-            candidate_nodes = [] 
-            
-        if check_link_constraint:
-            aggr_method = 'sum' if self.shortest_method == 'mcf' else 'max'
-            v_node_degrees = np.array(list(dict(v_net.degree()).values()))
-            p_node_degrees = np.array(list(dict(p_net.degree()).values()))
-            v_link_aggr_resource = np.array(v_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
-            p_link_aggr_resource = np.array(p_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
-            degrees_comparison = p_node_degrees[:] >= v_node_degrees[v_node_id]
-            resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
-            suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
-            candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
+        else: 
+            candidate_nodes = []  
 
         # === Efficient Path Feasibility Pruning ===
         if phase == -1 or phase >=3:
@@ -1434,7 +1423,17 @@ class Controller:
                     import traceback
                     print(f"[find_candidate_nodes] ERROR during path check: {e}")
                     traceback.print_exc()
-
+        elif check_link_constraint:
+            aggr_method = 'sum' if self.shortest_method == 'mcf' else 'max'
+            v_node_degrees = np.array(list(dict(v_net.degree()).values()))
+            p_node_degrees = np.array(list(dict(p_net.degree()).values()))
+            v_link_aggr_resource = np.array(v_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
+            p_link_aggr_resource = np.array(p_net.get_aggregation_attrs_data(self.link_resource_attrs, aggr=aggr_method))
+            degrees_comparison = p_node_degrees[:] >= v_node_degrees[v_node_id]
+            resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
+            suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
+            candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
+ 
         return candidate_nodes
     
     

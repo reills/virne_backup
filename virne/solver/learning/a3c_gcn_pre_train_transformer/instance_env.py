@@ -6,6 +6,7 @@ import networkx as nx
 import os
 import warnings
 import torch
+import random
 from gym import spaces
 from virne.solver.learning.rl_base import JointPRStepInstanceRLEnv, PlaceStepInstanceRLEnv 
 from pathlib import Path
@@ -68,45 +69,47 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         return obs
 
     def generate_action_mask(self):
-        """Generates a valid action mask based on placement feasibility and curriculum phase."""
-        #print(f"[PHASE] Phase = {self.phase} | Placed = {self.num_placed_v_net_nodes} | Interactions = {self.solution['num_interactions']}")
+        """
+        Generates a valid action mask using PREVIOUSLY CACHED candidate nodes.
+        Assumes self._cached_candidates is valid and up-to-date.
+        If all standard valid actions are masked, attempts to unmask a
+        random physical node from the cache that hasn't failed.
+        """
+        # --- Step 1: Use the pre-validated cache ---
+        # Assume self._cached_candidates was updated by get_observation
+        current_candidates = list(self._cached_candidates) if self._cached_candidates is not None else []
 
-        # Get candidates from controller (based on physical constraints and path feasibility)
-        p_node_prev = self.selected_p_net_nodes[-1] if self.selected_p_net_nodes else None
-        #print(f"{p_node_prev} was the previously placed node")
-        candidates = self._cached_candidates
+        # --- Step 2: Filter based on runtime state (revoke/failed lists) ---
+        revoked = self.revoked_actions_dict.get(self.curr_v_node_id, [])
+        failed = self.attempt_blacklist.get(self.curr_v_node_id, set()) 
+        
+        #print(f"BEFORE [MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {current_candidates}") 
+        valid_candidates = [p for p in current_candidates if p not in revoked and p not in failed] 
+        #print(f"AFTER [MASK] VNode {self.curr_v_node_id} candidates AFTER mask: {valid_candidates}")
 
-        # Remove previously revoked candidates
-        key = (str(self.solution.node_slots), self.curr_v_node_id)
-        revoked = self.revoked_actions_dict.get(key, [])
-        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
-        
-        #print(f"BEFORE [MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
-        candidates = [p for p in candidates if p not in revoked and p not in failed]
-        
-        #print(f"AFTER [MASK] VNode {self.curr_v_node_id} candidates AFTER mask: {candidates}")
-        # ---- Curriculum-aware Revoke / Reject Masking ----
+        # --- Step 3: Add Revoke action if applicable ---
         threshold_ok = self.solution['revoke_times'] < self.max_revokes
-
-        # PHASE 2+: Allow revoke if we've placed any nodes and under max_revokes
-        if ( self.phase >= 2 or self.phase == -1) and self.allow_revocable and self.num_placed_v_net_nodes > 0 and threshold_ok:
-            candidates.append(self.revocable_action)
-
+        can_revoke = ( (self.phase >= 2 or self.phase == -1) and
+                       self.allow_revocable and
+                       self.num_placed_v_net_nodes > 0 and
+                       threshold_ok )
+        if can_revoke:
+            valid_candidates.append(self.revocable_action)
+ 
         # PHASE 3+: Allow reject once at least 1 action attempted
         #if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
         #    candidates.append(self.rejection_action)
-            
-        # ---- Build binary action mask ----
+             
         mask = np.zeros(self.num_actions, dtype=bool)
-        indices = [a for a in candidates if 0 <= a < self.num_actions]
-        mask[indices] = True
+        indices = [a for a in valid_candidates if 0 <= a < self.num_actions]
+        if indices:
+            mask[indices] = True
 
-        # ---- Fallback: allow reject if absolutely no other option ----
-        if not mask.any():
+        # --- Step 5: Fallback Logic (if mask is empty) ---
+        if not mask.any(): 
             #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})") 
             candidates.append(self.rejection_action)
-            mask[self.rejection_action] = True
-            #print("[ERROR] No valid fallback. Agent is stuck.")
+            mask[self.rejection_action] = True 
 
         return mask
  
@@ -116,20 +119,20 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             #failed to place entire SFC but at least tried
             reward = -2
         elif revoke:
-            # Small penalty for backtracking
-            reward = -1
+            # Small penalty for backtracking 
+            reward = -.3
         elif solution['early_rejection']:
             # Harsh penalty for giving up entirely 
             reward = -6
         elif not solution['place_result'] or not solution['route_result']:
             # Step failed
-            return -1
+            return -.25
         elif solution['result']:
             # Final success
-            reward = solution['v_net_r2c_ratio'] * 12.0
+            reward = 4
         else:
             # Intermediate success
-            reward = 1
+            reward = .25
 
         self.solution['v_net_reward'] += reward
         return reward

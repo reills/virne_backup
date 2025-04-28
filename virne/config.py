@@ -43,15 +43,16 @@ class Config(ClassDict):
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
-    use_fixed_dataset: bool = True
-    dir_save_dataset: str = "dataset/test_drlt"
-    if_dynamic_v_nets: bool = True
+    use_fixed_dataset: bool = True 
+    dir_save_dataset: str = "dataset/garbage_trans"
+    if_dynamic_v_nets: bool = False 
 
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
     #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
-    pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/finale_drlt/output/output/model/model-worker0-epoch48.pkl'#'/home/stephen-reilly/dev/virne/dataset/garbage_tran_1/model-worker8-epoch3.pkl'
+ 
+    pretrained_model_path: str ='' 
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
@@ -70,14 +71,14 @@ class Config(ClassDict):
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
-    distributed_training: bool = True
+    distributed_training: bool = True 
     num_train_epochs: int = 0 #changed by me was 100
     num_workers: int = 1 #changed by me was 10
     batch_size: int = 128 # changed by me was 128
     target_steps: int = batch_size * 2
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 1
-    eval_interval: int = 122 #changed was 10
+    eval_interval: int = 122 #changed was 10 
     curriculum_phase: int = 0
     
 
@@ -91,7 +92,7 @@ class Config(ClassDict):
     l2reg_rate: float = 2.5e-4    # L2 regularization rate
     lr: float = 0.001          # Learning rate
     # lr_decay: float = 0.5      # Learning rate decay
-    pretrained_bc_path: str = ""# "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
+    pretrained_bc_path: str = 'dataset/finale_drlt/output/output/model/model-worker0-epoch23_.pkl' # "/home/stephen-reilly/dev/virne/pretrained_transformer_final_corrected.pth"
     pretrained_loaded: bool = False
     p_dimension_features: int = 9
     v_dimension_features: int = 4
@@ -103,8 +104,8 @@ class Config(ClassDict):
     rl_gamma: float = 0.99
     explore_rate: float = 0.9
     gae_lambda: float = 0.98
-    lr_actor: float = 5e-5
-    lr_critic: float = 5e-4
+    lr_actor: float = 1e-5
+    lr_critic: float = 5e-5
     decode_strategy: str = 'greedy'
     k_searching: int = 1
 
