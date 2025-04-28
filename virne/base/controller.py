@@ -1411,7 +1411,29 @@ class Controller:
             resource_comparison = np.all(v_link_aggr_resource[:, [v_node_id]] <= p_link_aggr_resource[:, :], axis=0)
             suitable_nodes = all_p_nodes[np.logical_and(degrees_comparison, resource_comparison)]
             candidate_nodes = list(set(candidate_nodes).intersection(set(suitable_nodes)))
- 
+
+        # === Efficient Path Feasibility Pruning ===
+        if phase == -1 or phase >=3:
+            if p_node_prev is not None and solution is not None:
+                try:
+                    ranked_list = [int(v) for v in v_net.ranked_nodes]
+                    current_v_idx = ranked_list.index(v_node_id)
+                    if current_v_idx > 0:
+                        prev_v_node_id = ranked_list[current_v_idx - 1]
+                        v_link_id = (int(min(prev_v_node_id, v_node_id)), int(max(prev_v_node_id, v_node_id)))
+                        temp_p_net = self.create_available_network(v_net, p_net, v_link_id)
+
+                        # Just check if a feasible path exists, not k of them
+                        weight = self.link_latency_attrs[0].name if self.link_latency_attrs else None
+                        candidate_nodes = [
+                            p_node for p_node in candidate_nodes
+                            if p_node != p_node_prev and self.has_feasible_path(temp_p_net, p_node_prev, p_node, weight=weight)
+                        ]
+
+                except Exception as e:
+                    import traceback
+                    print(f"[find_candidate_nodes] ERROR during path check: {e}")
+                    traceback.print_exc()
 
         return candidate_nodes
     
