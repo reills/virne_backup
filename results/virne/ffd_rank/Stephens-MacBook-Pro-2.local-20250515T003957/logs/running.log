@@ -1,0 +1,4 @@
+[32mINFO    [0m Use ffd_rank Solver (Type = node_ranking)...
+[0m
+[32mINFO    [0m Dataset Dir of Physical Network: dataset/p_net/100-waxman_[0.5-0.2]-cpu_[50-100]-max_cpu_None-bw_[50-100]-max_bw_None[0m
+[1;31mCRITICAL[0m Physical Network: Regenerate it from setting[0m
