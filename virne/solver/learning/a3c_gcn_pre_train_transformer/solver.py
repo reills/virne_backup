@@ -1,6 +1,6 @@
 
 # ==============================================================================
-# solver.py (Refactored for Autoregressive Transformer to Match Pretrainer)
+# solver.py  for Autoregressive Transformer to Match Pretrainer
 # ==============================================================================
 import os
 import torch
@@ -25,23 +25,7 @@ from virne.solver.learning.rl_base.shared_adam import SharedAdam, sync_gradients
 from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2CSolver, RolloutBuffer
 
 from ..utils import get_pyg_data
-
-def apply_mask_to_logit(logit, mask=None):
-        """
-        Apply a mask to a given logits tensor.  Returns: masked_logit (tensor): the masked logits tensor
-        """
-        if mask is None:
-            return logit
-        # mask = torch.IntTensor(mask).to(logit.device).expand_as(logit)
-        # masked_logit = logit + mask.log()
-        if not isinstance(mask, torch.Tensor):
-            mask = torch.BoolTensor(mask)
-        
-        NEG_TENSER = torch.tensor(-1e8).float()
-        mask = mask.bool().to(logit.device).reshape(logit.size())
-        mask_value_tensor = NEG_TENSER.type_as(logit).to(logit.device)
-        masked_logit = torch.where(mask, logit, mask_value_tensor)
-        return masked_logit
+ 
     
 def obs_as_tensor(obs, device, pad_token=None):
     """Preprocess the entire observation into tensor form."""
@@ -221,29 +205,30 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         )
 
         encoder_obs = instance_env.get_observation()
-        encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
+        # This provides the static context for the Transformer Decoder
+        preprocessed_initial_encoder_obs = self.preprocess_encoder_obs(encoder_obs, device=self.device)
+        encoder_outputs = self.policy.encode(preprocessed_initial_encoder_obs)
         history_features = []
-
-        done = False 
+        #don't bother if no valid actions - dead end state. 
+        done = encoder_obs['dead_end'] 
         while not done:  
-            instance_obs = self.make_instance_obs(  history_features, encoder_obs, encoder_outputs, instance_env)
+            instance_obs = self.make_instance_obs(  history_features, encoder_obs, encoder_outputs  )
   
             tensor_obs = self.preprocess_obs(instance_obs, device=self.device)  
             action, action_logprob = self.select_action(tensor_obs, sample=False)
-            obs, reward, done, info = instance_env.step(action)
+            next_obs, reward, done, info = instance_env.step(action)
             
-            if action == self.policy.actor.decoder.num_actions - 2:
+            if action == self.policy.actor.decoder.revoke_action_idx:
                 selected_node_feats = self.policy.actor.decoder.revoke_embedding.detach().cpu().numpy()
-            elif action == self.policy.actor.decoder.num_actions - 1:
+            elif action == self.policy.actor.decoder.reject_action_idx:
                 selected_node_feats = self.policy.actor.decoder.reject_embedding.detach().cpu().numpy()
             else:
                 selected_node_feats = encoder_obs['p_net_x'][action]
             history_features.append(selected_node_feats)
 
             if not done:
-                encoder_obs = obs   
-                encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device)) 
-
+                encoder_obs = next_obs    
+                
         return instance_env.solution 
 
     
@@ -435,7 +420,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         
     
-    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs, sub_env ):
+    def make_instance_obs(self, history_features, encoder_obs, encoder_outputs  ):
         """
         Constructs an observation dict using the given history of physical node feature vectors.
         """
@@ -466,48 +451,51 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
 
         return obs
  
- 
-    
+  
     def learn_with_instance(self, instance):
         """Collect one trajectory and store it in the buffer."""
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
         
-        # Curriculum logic: decide which phase we're in (5 workers = 5*5epochs = 25th epoch)
-        if self.training_epoch_id < (20 / self.num_workers) :
+        # Curriculum logic: decide which phase we're in  
+        global_epoch_id = self.training_epoch_id + self.start_train_epoch  # self.training_epoch_id is local to current loop
+
+        if global_epoch_id < (100 / self.num_workers) :
             phase = 1 #include no special actions
             self.coef_entropy_loss = 0.2
-        elif self.training_epoch_id < (40 / self.num_workers):
+        elif global_epoch_id < (200 / self.num_workers):
             phase = 2 #include revoke
             self.coef_entropy_loss = 0.1
-        elif self.training_epoch_id < (60 / self.num_workers):
+        elif global_epoch_id < (300 / self.num_workers):
             phase = 3 #include reject
             self.coef_entropy_loss = 0.05
         else:
             phase = 4 #include pruning-- very slow
-            self.coef_entropy_loss = 0.01 
-        phase = 4 #include pruning-- very slow
-        self.coef_entropy_loss = 0.05   
-    
+            self.coef_entropy_loss = 0.01   
+            
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter,
                                 preprocess_obs_fn=self.preprocess_obs, phase=phase, **self.basic_config)
 
         encoder_obs = sub_env.get_observation()
-        encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
+        # This provides the static context for the Transformer Decoder
+        preprocessed_initial_encoder_obs = self.preprocess_encoder_obs(encoder_obs, device=self.device)
+        encoder_outputs = self.policy.encode(preprocessed_initial_encoder_obs)
         history_features = []  # List of [D] feature vectors
-        instance_done = False
-         
+        instance_done = encoder_obs['dead_end'] #dead end checks if any possible actions, if not don't take actions 
+        # currently NOT learning from dead ends' just not adding anything to buffer in merge instance 
         while not instance_done: 
             #dummy first pass 
-            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env ) 
+            instance_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs  ) 
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device) 
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True) 
             #print(f"[Loop] v_nodes placed: {len(sub_env.placed_v_net_nodes)}, action={action}, instance_done={instance_done}")
-
+             
             # --- Determine which embedding to insert ---
-            if action == self.policy.actor.decoder.num_actions - 2:  # revoke
-                selected_node_feats = self.policy.actor.decoder.revoke_embedding.detach().cpu().numpy()
-            elif action == self.policy.actor.decoder.num_actions - 1:  # reject
+            if action == self.policy.actor.decoder.revoke_action_idx: 
+                if history_features:
+                    history_features.pop()  # Remove the last placement
+                selected_node_feats = self.policy.actor.decoder.revoke_embedding.detach().cpu().numpy() 
+            elif action == self.policy.actor.decoder.reject_action_idx:
                 selected_node_feats = self.policy.actor.decoder.reject_embedding.detach().cpu().numpy()
             else:
                 selected_node_feats = encoder_obs['p_net_x'][action]
@@ -526,7 +514,7 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
                 encoder_obs = next_obs 
         last_value = 0.
         if hasattr(self.policy, 'evaluate'):
-            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs, sub_env) 
+            final_obs = self.make_instance_obs(history_features, encoder_obs, encoder_outputs ) 
             final_tensor_obs = self.preprocess_obs(final_obs, device=self.device)
             last_value = self.estimate_value(final_tensor_obs)
          
@@ -544,10 +532,10 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
         p_net_num_nodes=action_dim,
         p_net_feature_dim=p_dimension_features,
         v_net_feature_dim=v_dimension_features,
-        embedding_dim=100,
-        n_heads=4,
-        n_layers=4,
-        dropout=0.1,
+        embedding_dim=128,
+        n_heads=8,
+        n_layers=6,
+        dropout=0.2,
         allow_revocable=is_revocable,
         allow_rejection=is_rejection,
         use_amp=use_amp,
@@ -555,7 +543,7 @@ def make_policy(agent, p_dimension_features, v_dimension_features, is_revocable,
     ).to(agent.device) 
     
     return policy 
-
+ 
 
 def encoder_obs_to_tensor(obs, device, policy=None):
     """

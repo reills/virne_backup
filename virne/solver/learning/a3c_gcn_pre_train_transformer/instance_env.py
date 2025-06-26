@@ -29,14 +29,24 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         self._cached_candidates_num_placed = None
 
  
+    def filter_repeats(self, candidates): # --- Step 2: Filter based on runtime state (revoke/failed lists) ---
+        revoked = self.revoked_actions_dict.get(self.curr_v_node_id, [])
+        failed = self.attempt_blacklist.get(self.curr_v_node_id, set()) 
+        
+        #print(f"BEFORE [MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {current_candidates}") 
+        valid_candidates = [p for p in candidates if p not in revoked and p not in failed] 
+        #print(f"AFTER [MASK] VNode {self.curr_v_node_id} candidates AFTER mask: {valid_candidates}")
+        
+        return valid_candidates
+        
+        
     def get_observation(self ):
         """
         Returns the observation as a dictionary.
         If a transformer policy is provided, injects encoder_outputs.
         """
         p_net_obs = self._get_p_net_obs()
-        v_net_obs = self._get_v_net_obs()
-        history_features = self.get_history_features() 
+        v_net_obs = self._get_v_net_obs() 
         
         if (
             self._cached_candidates is None or
@@ -54,16 +64,23 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             self._cached_candidates_vnode = self.curr_v_node_id
             self._cached_candidates_num_placed = self.num_placed_v_net_nodes
 
+
+        no_valid_candidates = len(self.filter_repeats(self._cached_candidates)) == 0 
+        no_more_revokes = not self.has_more_revokes()
+
+        # DEAD END if no candidates and no way to revoke
+        dead_end = no_valid_candidates and no_more_revokes
+        self.solution['description'] = 'Dead End' if dead_end else ''
         obs = {
             'p_net_x': p_net_obs['x'],
             'p_net_edge_index': p_net_obs['edge_index'],
             'edge_attr': p_net_obs['edge_attr'],
             'v_net_x': v_net_obs['x'],
             'v_net_edge_index': v_net_obs['edge_index'],
-            'action_mask': self.generate_action_mask(),
-            'history_features': history_features,
+            'action_mask': self.generate_action_mask(), 
             'curr_v_node_id': self.curr_v_node_id,
             'vnfs_remaining': self.v_net.num_nodes - self.curr_v_node_id,
+            'dead_end': dead_end
         }
 
         return obs
@@ -78,8 +95,8 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         # --- Step 1: Use the pre-validated cache ---
         # Assume self._cached_candidates was updated by get_observation
         current_candidates = list(self._cached_candidates) if self._cached_candidates is not None else []
-
-        # --- Step 2: Filter based on runtime state (revoke/failed lists) ---
+        
+         # --- Step 2: Filter based on runtime state (revoke/failed lists) ---
         revoked = self.revoked_actions_dict.get(self.curr_v_node_id, [])
         failed = self.attempt_blacklist.get(self.curr_v_node_id, set()) 
         
@@ -87,52 +104,59 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
         valid_candidates = [p for p in current_candidates if p not in revoked and p not in failed] 
         #print(f"AFTER [MASK] VNode {self.curr_v_node_id} candidates AFTER mask: {valid_candidates}")
 
-        # --- Step 3: Add Revoke action if applicable ---
-        threshold_ok = self.solution['revoke_times'] < self.max_revokes
-        can_revoke = ( (self.phase >= 2 or self.phase == -1) and
-                       self.allow_revocable and
-                       self.num_placed_v_net_nodes > 0 and
-                       threshold_ok )
+        # --- Step 3: Add Revoke action if applicable --- 
+        can_revoke = self.has_more_revokes()
+                    
         if can_revoke:
             valid_candidates.append(self.revocable_action)
  
-        # PHASE 3+: Allow reject once at least 1 action attempted
-        #if (self.phase >= 3 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
-        #    candidates.append(self.rejection_action)
+        # PHASE 4+: Allow reject once at least 1 action attempted
+        if (self.phase >= 4 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
+            valid_candidates.append(self.rejection_action)
              
         mask = np.zeros(self.num_actions, dtype=bool)
         indices = [a for a in valid_candidates if 0 <= a < self.num_actions]
         if indices:
             mask[indices] = True
-
+ 
         # --- Step 5: Fallback Logic (if mask is empty) ---
         if not mask.any(): 
             #print(f"[WARN] No valid actions for VNode {self.curr_v_node_id} (revokes={self.solution['revoke_times']})") 
-            candidates.append(self.rejection_action)
-            mask[self.rejection_action] = True 
+            valid_candidates.append(self.rejection_action)
+            mask[self.rejection_action] = True  
 
         return mask
  
     def compute_reward(self, solution, revoke=False):
-        
-        if self.solution['failed']:
-            #failed to place entire SFC but at least tried
-            reward = -2
+        # TBD -- should i add logic to distinguish if dead end was from taking Revoke? 
+        # or doesn't matter.. currently doesn't matter same penalty 
+        scale = .2
+        if solution['dead_end']:
+            #failed to place entire SFC but at least tried -- ran out of valid choices for placement 
+            # max -.2, min -1.5
+            reward = -self.v_net.num_nodes /2 
         elif revoke:
             # Small penalty for backtracking 
-            reward = -.3
+            # max -.026, min -.2
+            reward = -2 / self.v_net.num_nodes 
         elif solution['early_rejection']:
-            # Harsh penalty for giving up entirely 
-            reward = -6
+            # Harsh penalty for giving up entirely -- decided to completley reject node without trying
+            # max -.8, min -6.0
+            reward = -self.v_net.num_nodes * 2
         elif not solution['place_result'] or not solution['route_result']:
-            # Step failed
-            return -.25
+            # Step failed, either placing failed or routing failed 
+            # max -.013., min -.1
+            reward = -1/self.v_net.num_nodes 
         elif solution['result']:
             # Final success
-            reward = 4
+            #max 2.8, min 2
+            reward = solution['v_net_r2c_ratio'] * 20
         else:
             # Intermediate success
-            reward = .25
+            # max .1, min .013
+            reward = 1/self.v_net.num_nodes 
+        
+        reward = reward*scale
 
         self.solution['v_net_reward'] += reward
         return reward
@@ -283,16 +307,3 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             'edge_index': edge_index,
             'edge_attr': edge_attr
         }
-
-    
-    def get_history_features(self):
-        """
-        Return context vectors for selected physical nodes (instead of raw node indices).
-        Uses already-computed features from p_net_obs['x'].
-        """
-        p_net_x = self._get_p_net_obs()['x']
-        selected_indices = self.selected_p_net_nodes
-
-        history_feats = [p_net_x[i] for i in selected_indices]  # shape: (T, D)
-        return np.array(history_feats, dtype=np.float32)
- 

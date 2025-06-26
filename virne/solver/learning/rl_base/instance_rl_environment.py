@@ -1,5 +1,5 @@
 # ==============================================================================
-# instance_rl_environment.py
+# instance_rl_environment.py edited logic of place and step to better handle revoke and reject
 # ==============================================================================
 
 
@@ -121,12 +121,11 @@ class InstanceRLEnv(RLBaseEnv):
         done = True
         return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
 
-    def revoke(self):
-        assert len(self.placed_v_net_nodes) != 0
-        self.solution['place_result'] = True
-        self.solution['route_result'] = True
-        self.solution['revoke_times'] += 1
 
+    def revoke(self):
+        assert len(self.placed_v_net_nodes) != 0 
+        self.solution['revoke_times'] += 1
+        
         last_v_node_id = self.placed_v_net_nodes[-1]
         paired_p_node_id = self.selected_p_net_nodes[-1]
 
@@ -139,34 +138,36 @@ class InstanceRLEnv(RLBaseEnv):
             self.v_net, self.p_net,
             last_v_node_id, paired_p_node_id,
             self.solution
-        )
+        )  
 
         solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
         self.revoked_actions_dict[last_v_node_id].append(paired_p_node_id)
 
         # ── Return raw observation (agent will re-inject encoder_outputs and preprocess externally) ──
-        obs = self.get_observation()
-        return obs, self.compute_reward(self.solution, revoke=True), False, self.get_info(solution_info)
-
+        obs = self.get_observation() 
+        done = obs['dead_end']
+        self.solution['dead_end'] = done
+        self.solution['description'] = 'Too Many Revokable Actions' if not done else 'Dead End'
+        return obs, self.compute_reward(self.solution, revoke=True), done, self.get_info(solution_info)
+    
 
 class JointPRStepInstanceRLEnv(InstanceRLEnv):
     
     def __init__(self, p_net, v_net, controller, recorder, counter, **kwargs):
         super(JointPRStepInstanceRLEnv, self).__init__(p_net, v_net, controller, recorder, counter, **kwargs)
- 
-    def check_last_chance(self ):
-        candidates = self._cached_candidates
+    
+    def has_more_revokes(self):
+        return  (self.solution['revoke_times'] < self.max_revokes and
+                 (self.phase >= 2 or self.phase == -1) and 
+                self.allow_revocable and
+                self.num_placed_v_net_nodes > 0 
+            )
+        
+    def has_more_retries(self):
+        retry_used = self.retry_budget[self.curr_v_node_id]
+        retry_cap = self.max_retry_budget[self.curr_v_node_id]
+        return retry_used < retry_cap
 
-        # Remove previously revoked candidates
-        key = (str(self.solution.node_slots), self.curr_v_node_id)
-        revoked = self.revoked_actions_dict.get(key, [])
-        failed = self.attempt_blacklist.get(self.curr_v_node_id, set())
-        
-        #print(f"[MASK] VNode {self.curr_v_node_id} candidates BEFORE mask: {candidates}")
-        candidates = [p for p in candidates if p not in revoked and p not in failed]
-        
-        #print(f' still available {len(candidates)}: {candidates}')
-        return len(candidates) == 0 
     
     def step(self, action):
         """
@@ -211,25 +212,24 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
                                                                             k=self.k_shortest,
                                                                             check_feasibility=self.check_feasibility)
         # Step Failure
-        if not place_and_route_result: 
-            # Placement failed — retryable 
-            self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)
-            reward = self.compute_reward(self.solution)  
+        if not place_and_route_result:  
+            # Step failure 
+            self.attempt_blacklist[self.curr_v_node_id].add(p_node_id)  
             self.retry_budget[self.curr_v_node_id] += 1
-            retry_used = self.retry_budget[self.curr_v_node_id]
-            retry_cap = self.max_retry_budget[self.curr_v_node_id]
-            done = self.check_last_chance()  
-            #print(f"PLACE FAILED [CHECK LAST CHANCE] FAILED = {done}  ")
-            self.solution['failed'] = done
+             
+            obs = self.get_observation()
+            done = obs['dead_end'] 
+            self.solution['dead_end'] = done 
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
-            return self.get_observation(), reward, done, self.get_info(solution_info) 
+            return obs, self.compute_reward(self.solution), done, self.get_info(solution_info)
  
         # Placement and Route Success
         self.attempt_blacklist[self.curr_v_node_id].clear()
         self.solution['last_placement_failed'] = False
         self.retry_budget[self.curr_v_node_id] = 0
         self.max_retry_budget[self.curr_v_node_id] = 3  # Optional: reset to default, or keep if dynamic
-  
+    
+        obs = self.get_observation()
         #finished placing and routing full SFC 
         if self.num_placed_v_net_nodes == self.v_net.num_nodes:
             self.solution['result'] = True  
@@ -237,12 +237,14 @@ class JointPRStepInstanceRLEnv(InstanceRLEnv):
             solution_info = self.counter.count_solution(self.v_net, self.solution)
         # still more chains to place
         else: 
-            done = False
+            done = obs['dead_end'] 
+            self.solution['dead_end'] = done
+            self.solution['description'] = 'Dead End' if done else ''
             solution_info = self.counter.count_partial_solution(self.v_net, self.solution)
                      
         self._cached_candidates = None
         self._cached_candidates_vnode = None
-        return self.get_observation(), self.compute_reward(self.solution), done, self.get_info(solution_info)
+        return obs, self.compute_reward(self.solution), done, self.get_info(solution_info)
     
 
 class SolutionStepInstanceRLEnv(InstanceRLEnv):

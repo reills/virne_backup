@@ -172,6 +172,8 @@ class Environment:
         """
         if solution['description'] == 'Too Many Revokable Actions':
             return 'revoke'
+        if solution['description'] == 'Dead End':
+            return 'deadend'
         if solution['early_rejection']:
             return 'reject'
         if not solution['place_result']:
@@ -190,6 +192,8 @@ class Environment:
         """
         # self.solution.reset()
         self.p_net = copy.deepcopy(self.p_net_backup)
+        if reason in ['deadend', -3]:
+            self.solution['description'] = 'Dead End'
         if reason in ['revoke', -2]:
             self.solution['description'] = 'Too Many Revokable Actions'
         elif reason in ['unknown', -1]:

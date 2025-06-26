@@ -9,11 +9,15 @@ import re
 from matplotlib.patches import FancyArrowPatch
 import numpy as np
 from typing import Dict, Tuple, List, Any, Optional
+import os
+
+
 
 # ------------------------------------------------------------------------------
 # 1) Paths & CSV
 # ------------------------------------------------------------------------------
 root = "/Users/stephenreilly/Desktop/github/virne/dataset/results-sfc/"
+root = os.path.join(os.getcwd(), "dataset", "test_1")
 csv_files = [f for f in os.listdir(root) if f.endswith(".csv")]
 if not csv_files:
     raise FileNotFoundError(f"No CSV files found in {root}")
@@ -258,7 +262,7 @@ def build_physical_node_label(p_node, node_usage_dict, pnode_to_sfc):
     if sfc_info:
         sfc_info_sorted = sorted(sfc_info, key=lambda x: int(x[0]))
         # MODIFIED: Use "vID: vNode" format
-        sfc_parts = [f"{vnet_id}|{vnode}" for (vnet_id, vnode) in sfc_info_sorted]
+        sfc_parts = [f"{vnode }" for (vnet_id, vnode) in sfc_info_sorted]
         lines.append("vID: " + ", ".join(sfc_parts))  # MODIFIED: Changed label
 
     return "\n".join(lines)
@@ -475,12 +479,16 @@ def draw_graph(index):
                 print(f"Error parsing path for ({vsrc},{vdst}): {ppath} — {e}")
 
 
-        lines = [f"SFC: {vnet_id}"] 
+        lines = [f"SFC Requested VNFs"] 
 
         vnodes = sorted(node_demands.keys(), key=int)
 
         for i, v_node in enumerate(vnodes):
             cpu = node_demands[v_node].get('cpu', '?')
+            gpu = node_demands[v_node].get('gpu', '?')         # or 'GPU'
+            ram = (node_demands[v_node].get('ram')             # prefer 'ram' if present
+                or node_demands[v_node].get('rom')          # fall back to 'rom'
+                or '?')
             
             # Only try to get bandwidth if there is a next vNode
             if i < len(vnodes) - 1:
@@ -494,7 +502,10 @@ def draw_graph(index):
                 bw_str = "—"
                 path_str = "—"
             
-            lines.append(f"vID {v_node}: CPU {cpu}, bw→ {bw_str}, paths: {path_str}")
+            lines.append(
+                f"vID {v_node}: CPU {cpu}, GPU {gpu}, RAM {ram}, "
+                f"bw → {bw_str}, link path: {path_str}"
+            )
 
         # Place text at the bottom (y ~ 0.05) and center (x=0.5)
         # Use a partially transparent bbox so we can see the graph behind the text.
@@ -504,7 +515,7 @@ def draw_graph(index):
 
         # Example: place box in bottom-center with left-aligned text
         tooltip = ax.text(
-            0.5, 0.05,  # x and y in axes fraction (0.5 = center horizontally, 0.05 = bottom)
+            0.1, 0.05,  # x and y in axes fraction (0.5 = center horizontally, 0.05 = bottom)
             tooltip_text,
             transform=ax.transAxes,
             ha='left',     # << Left-align the text

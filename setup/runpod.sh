@@ -21,9 +21,9 @@ echo "Creating and activating Conda environment..."
 conda env create -f setup/nfv_env.yml
 conda activate nfv
  
-echo "Copying garbage_1 into dataset/garbage_1_trans..."
-mkdir -p dataset/garbage_1_trans
-cp -r garbage_1/* dataset/garbage_1_trans/
+echo "Copying test_1 into dataset/test_1."
+mkdir -p dataset/test_1
+cp -r test_1/* dataset/test_1/
 
 pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric \
   -f https://data.pyg.org/whl/torch-2.5.1+cu118.html
@@ -33,11 +33,9 @@ echo "set -g mouse on" >> ~/.tmux.conf
 
 echo "Launching experiment in tmux session 'train'..."
 tmux new -s train -d 
-
-echo "Started in tmux session. Run this to reattach:"
-echo "  tmux attach -t train"
+tmux attach -t train
 
 conda activate nfv 
-#python -m virne.main 
+python -m virne.main 
 
 #echo 'done' > /root/training_complete.flag"

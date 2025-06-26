@@ -268,9 +268,9 @@ class SampleSearcher(Searcher):
 
 class BeamSearcher(Searcher):
     
-    def __init__(self, policy, preprocess_obs_func, k, device=None, mask_actions=True, maskable_policy=True, parallel_searching=True):
-        super(BeamSearcher, self).__init__(policy, preprocess_obs_func, k, device, mask_actions, maskable_policy)
-
+    def __init__(self, policy, preprocess_obs_func, make_policy_func, k, device=None, mask_actions=True, maskable_policy=True, parallel_searching=True):
+        super(BeamSearcher, self).__init__(policy, preprocess_obs_func, make_policy_func, k, device, mask_actions, maskable_policy)
+        
     def find_solution(self, instance_env):
         if self.parallel_searching: self.set_mp_pool()
         
@@ -292,12 +292,7 @@ class BeamSearcher(Searcher):
                 probs, indices = torch.topk(candicate_action_probs_list[env_id], self.k)
                 for prob_id in range(self.k):
                     current_step_prob_dict[(env_id, int(indices[prob_id]))] = global_conditional_prob_list[env_id] * probs[prob_id] * (not done_list[env_id])
-            if first_flag:
-                for e_p, prob in current_step_prob_dict.items():
-                    if e_p[0] != 0:
-                        current_step_prob_dict[e_p] *= 0
-                first_flag = False
-            
+             
             # select top-k (env_id, action)
             sorted_list = list(sorted(current_step_prob_dict.items(), key=lambda item: item[1], reverse=True))
             topk_probs = sorted_list[:self.k]

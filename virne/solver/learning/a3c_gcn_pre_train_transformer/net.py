@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GENConv
 from torch_geometric.utils import scatter
+from torch_geometric.nn import global_mean_pool
+
 
 class MultiHeadGENLayer(nn.Module):
     def __init__(self, in_dim, out_dim, aggr='softmax', edge_dim=2):
@@ -130,12 +132,13 @@ class Actor(nn.Module):
         return self.decoder(obs, training=training)
 
 
-# --- Critic Module ---
 class Critic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
-        # Retrieve special action flags from kwargs 
+        self.p_net_feature_dim = p_net_feature_dim
+        self.embedding_dim = embedding_dim
+
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -143,18 +146,37 @@ class Critic(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            is_actor=False,  
+            is_actor=False,
             **kwargs
         )
+
+        combined_dim = embedding_dim + p_net_feature_dim  # decoder + graph summary
+        combined_dim = embedding_dim + embedding_dim  # NOT + p_net_feature_dim
+
         self.value_head = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
+            nn.Linear(combined_dim, embedding_dim // 2),
             nn.GELU(),
             nn.Linear(embedding_dim // 2, 1)
         )
 
     def forward(self, obs):
-        last_emb = self.decoder(obs, return_last_embed=True, training=False)
-        return self.value_head(last_emb)
+        # Get full decoder sequence and GAT-processed physical node features
+        decoder_outputs, graph_embedding = self.decoder(
+            obs, return_all_embeds=True, return_gat_embedding=True, training=False
+        )  # decoder_outputs: [B, T, D], graph_embedding: [N, D]
+
+        # Mean pool over sequence
+        seq_summary = decoder_outputs.mean(dim=1)  # [B, D]
+
+        # Mean pool over graph embedding (physical node embeddings)
+        node_batch = obs['p_net'].batch  # [N]
+        graph_summary = global_mean_pool(graph_embedding, node_batch)  # [B, D]
+
+        # Combine and estimate value
+        combined = torch.cat([seq_summary, graph_summary], dim=-1)  # [B, 2D]
+        return self.value_head(combined)
+
+
 
 # --- Autoregressive Decoder ---
 class AutoregressiveDecoder(nn.Module):
@@ -249,7 +271,9 @@ class AutoregressiveDecoder(nn.Module):
         
 
 
-    def forward(self, obs, return_last_embed=False, training=False):
+    def forward(self, obs, return_last_embed=False, return_all_embeds=False, return_gat_embedding=False, training=False):
+
+
         batch_p_net = obs['p_net']
         node_features = batch_p_net.x.float()
         edge_index = batch_p_net.edge_index
@@ -282,7 +306,14 @@ class AutoregressiveDecoder(nn.Module):
             tgt_mask=causal_mask,
             tgt_key_padding_mask=padding_mask
         )
+        if return_all_embeds and return_gat_embedding:
+            return decoder_output, graph_embedding
+        elif return_all_embeds:
+            return decoder_output
+
+        
         last_decoder_output = decoder_output[:, -1, :]
+        
 
         # Add step and remaining count context
         step_emb = self.step_embedding(obs['curr_v_node_id'])

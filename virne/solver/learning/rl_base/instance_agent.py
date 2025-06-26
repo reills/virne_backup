@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved. quality of life adjustments
 # ==============================================================================
 
 
@@ -106,34 +106,51 @@ class InstanceAgent(object):
         return solution, instance_buffer, last_value
 
     def merge_instance_experience(self, instance, solution, instance_buffer, last_value):
-        ### -- use_negative_sample -- ##
-        if self.use_negative_sample:
-            baseline_solution_info = self.get_baseline_solution_info(instance, self.use_baseline_solver)
-            if baseline_solution_info['result'] or solution['result']:
-                instance_buffer.compute_returns_and_advantages(last_value, gamma=self.gamma, gae_lambda=self.gae_lambda, method=self.compute_advantage_method)
-                self.buffer.merge(instance_buffer)
-                self.time_step += 1
-            else:
-                pass
-        elif solution['result']:  #  or True
-            instance_buffer.compute_mc_returns(gamma=self.gamma)
-            self.buffer.merge(instance_buffer)
-            self.time_step += 1
-        else:
-            pass
+        if instance_buffer.size() == 0:
+            if self.verbose > 1:
+                print(f"[Worker {self.rank}] Skipping empty trajectory: no valid actions taken.")
+            return self.buffer  # Do nothing if no data
+
+        instance_buffer.compute_returns_and_advantages(
+            last_value,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            method=self.compute_advantage_method
+        )
+        self.buffer.merge(instance_buffer)
+        self.time_step += 1
+        
         return self.buffer
 
     
     
-    def learn_singly(self, env, num_epochs=1, **kwargs): 
+         ### -- use_negative_sample -- ## buffer updates less frequent... but dont include negatives. 
         
+        # if self.use_negative_sample:
+        #     baseline_solution_info = self.get_baseline_solution_info(instance, self.use_baseline_solver)
+        #     if baseline_solution_info['result'] or solution['result']:
+        #         instance_buffer.compute_returns_and_advantages(last_value, gamma=self.gamma, gae_lambda=self.gae_lambda, method=self.compute_advantage_method)
+        #         self.buffer.merge(instance_buffer)
+        #         self.time_step += 1
+        #     else:
+        #         pass
+        # elif solution['result']:  #  or True
+        #     instance_buffer.compute_mc_returns(gamma=self.gamma)
+        #     self.buffer.merge(instance_buffer)
+        #     self.time_step += 1
+        # else:
+        #     pass
+        # return self.buffer
+ 
+    def learn_singly(self, env, num_epochs=1, start_epoch=0, **kwargs): 
+        self.start_train_epoch = start_epoch
 
-        for epoch_id in range(num_epochs):
+        for epoch_id in range(start_epoch, start_epoch + num_epochs):
             if self.verbose > 0:
                 print(f'=============== Training Epoch: {epoch_id} ===================')
 
             self.training_epoch_id = epoch_id
-            instance = env.reset()
+            instance = env.reset('') #it will recreate a new set of vnet requests during testing
 
             success_count = 0
             epoch_logprobs = []

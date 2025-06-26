@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# rl_solver.py edited distributed parts for memory savings
 # ==============================================================================
 
 
@@ -85,7 +85,7 @@ def run_worker_process(cls_type, config_dict, rank, env, num_epochs,sync_counter
 
     # --- Launch training loop ---
     print(f"[Worker {rank}] Starting training loop...")
-    solver.learn_singly(env, num_epochs)
+    solver.learn_singly(env, num_epochs, config_dict['start_epoch'])
     print(f"[Worker {rank}] Training loop finished.")
 
 
@@ -318,6 +318,7 @@ class RLSolver(Solver):
         if decode_strategy is None: decode_strategy = self.decode_strategy
         if k is None: k = self.k_searching
         assert k >= 1, f'k should greater than 0. (k={k})'
+        print(f'\n\n\n\nk is {k}\n\n\n\n')
         self.policy.eval()
         self.searcher = get_searcher(decode_strategy, 
                                     policy=self.policy, 
@@ -342,16 +343,16 @@ class RLSolver(Solver):
             print(f"[Worker {self.rank}] ERROR during sync_parameters: {e}")
             # Potentially re-raise or handle
 
-    def learn(self, env, num_epochs=1, **kwargs):
+    def learn(self, env, num_epochs=1, start_epoch=0, **kwargs):
         if self.verbose >= 0: 
             self.show_config()
             
         self.start_time = time.time()
         if self.distributed_training:
-            self.learn_distributedly(env, num_epochs)
+            self.learn_distributedly(env, num_epochs, start_epoch=start_epoch)
         else:
             print(f'Start to learn singly')
-            self.learn_singly(env, num_epochs)
+            self.learn_singly(env, num_epochs, start_epoch=start_epoch)
         print(f'Start to validate')
         self.save_model(f'model.pkl')
         # self.validate(env)
@@ -377,7 +378,7 @@ class RLSolver(Solver):
             return config
         
 
-    def learn_distributedly(self, env, num_epochs, **kwargs):
+    def learn_distributedly(self, env, num_epochs, start_epoch=0, **kwargs):
         assert self.distributed_training, 'distributed_training should be True'
         # Optional: Uncomment if your logic requires splitting epochs evenly
         # assert num_epochs % self.num_workers == 0, 'num_epochs should be divisible by num_workers'
@@ -394,12 +395,13 @@ class RLSolver(Solver):
         else:
             self.optimizer.share_memory()
 
-        # You can divide epochs across workers if needed, or let workers run the full span.
+        #   divide epochs across workers if needed 
         worker_num_epochs = int(num_epochs // self.num_workers)
         worker_save_interval = self.save_interval
         worker_eval_interval = self.eval_interval
 
         config_dict = self.get_worker_config()
+        config_dict['start_epoch'] = start_epoch
         job_list = []
 
         for worker_rank in range(self.num_workers):

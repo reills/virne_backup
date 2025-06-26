@@ -1,5 +1,5 @@
 # ==============================================================================
-# controller
+# lightly edited controller.py
 # ==============================================================================
 
 
@@ -1402,7 +1402,7 @@ class Controller:
             candidate_nodes = []  
 
         # === Efficient Path Feasibility Pruning ===
-        if phase == -1 or phase >=3:
+        if phase == 0:
             if p_node_prev is not None and solution is not None:
                 try:
                     ranked_list = [int(v) for v in v_net.ranked_nodes]
@@ -1416,7 +1416,10 @@ class Controller:
                         weight = self.link_latency_attrs[0].name if self.link_latency_attrs else None
                         candidate_nodes = [
                             p_node for p_node in candidate_nodes
-                            if p_node != p_node_prev and self.has_feasible_path(temp_p_net, p_node_prev, p_node, weight=weight)
+                            if p_node != p_node_prev and 
+                            p_node_prev in temp_p_net and 
+                            p_node in temp_p_net and 
+                            self.has_feasible_path(temp_p_net, p_node_prev, p_node, weight=weight)
                         ]
 
                 except Exception as e:

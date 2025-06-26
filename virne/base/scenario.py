@@ -95,7 +95,7 @@ class Scenario:
         # execute pretrain
         if hasattr(self.solver, 'learn') and self.config.num_train_epochs > 0:
             print(f"\n{'-' * 20}  Pretrain  {'-' * 20}\n")
-            self.solver.learn(self.env, num_epochs=self.config.num_train_epochs)
+            self.solver.learn(self.env, num_epochs=self.config.num_train_epochs, start_epoch=self.config.start_train_epoch)
             print(f"\n{'-' * 20}    Done    {'-' * 20}\n")
         # set eval mode
         if hasattr(self.solver, 'eval'):
