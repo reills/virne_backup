@@ -2,7 +2,9 @@
 .vscode
 
 #datasets
+outputs/*
 dataset/
+poisson_test/
 dataset/results*
 dataset/april15_results
 *.pth
