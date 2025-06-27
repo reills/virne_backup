@@ -72,10 +72,9 @@ class State:
 
 
 class Node:
-    """
-    Node of Monte Carlo Tree
-    """
-    def __init__(self, parent=None, state=None):
+    """Node of the Monte Carlo Tree."""
+
+    def __init__(self, parent=None, state=None, prior: float = 0.0):
         self.parent = parent
         if parent is not None:
             parent.children.append(self)
@@ -83,6 +82,8 @@ class Node:
         self.state = state
         self.visit_times = 0
         self.value = 0.0
+        # Prior probability of selecting this node predicted by the policy
+        self.prior = float(prior)
 
     def is_complete_expand(self):
         if len(self.children) == self.state.max_expansion:
