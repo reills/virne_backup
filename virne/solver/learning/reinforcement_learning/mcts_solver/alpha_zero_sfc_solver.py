@@ -47,10 +47,24 @@ class AlphaZeroSFCSolver(MctsSolver):
         if os.path.exists(self.policy_path):
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
         self.policy.eval()
+        
+        
+        # Caches used during one solve episode
+        self._p_data = None
+        self._v_data = None
+        self._encoder_outputs = None
+
 
     def solve(self, instance):
         """Run MCTS guided by the current policy and store the episode."""
         v_net, p_net = instance["v_net"], instance["p_net"]
+
+        # Pre-compute graph tensors and encoder outputs for efficiency
+        from virne.solver.learning.utils import load_pyg_data_from_network
+        self._p_data = load_pyg_data_from_network(p_net)
+        self._v_data = load_pyg_data_from_network(v_net)
+        self._encoder_outputs = self.policy.encode({'v_net_x': self._v_data.x.unsqueeze(0)})
+
         current_node = Node(None, State(p_net, v_net, self.controller, self.recorder, self.counter))
         solution = Solution.from_v_net(v_net)
         trajectory: List[dict] = []
@@ -78,6 +92,7 @@ class AlphaZeroSFCSolver(MctsSolver):
         self._store_episode(trajectory, outcome)
         return solution
 
+    
     def _compute_policy(self, node: Node) -> torch.Tensor:
         visits = torch.tensor([child.visit_times for child in node.children], dtype=torch.float32)
         if visits.sum() == 0:
@@ -115,17 +130,26 @@ class AlphaZeroSFCSolver(MctsSolver):
     # --- AlphaZero overrides of MCTS methods ---
     def select_and_expand(self, node: Node):
         while not node.state.is_terminal():
-            if node.is_complete_expand():
-                node = self.best_child(node, True)
-                if node is None:
-                    break
-            else:
-                candidate_state = node.state.random_select_next_state()
-                prior, value = self._policy_value(candidate_state)
-                next_node = Node(node, candidate_state, prior=prior)
-                next_node.value = value
-                return next_node
+            if not node.children:
+                self._expand_node(node)
+                return node
+            node = self.best_child(node, True)
+            if node is None:
+                break
         return node
+    
+    
+    def _expand_node(self, node: Node) -> None:
+        """Expand a leaf node by evaluating the policy and adding all children."""
+        obs = self._state_to_obs(node.state)
+        with torch.no_grad():
+            logits = self.policy.act(obs)
+            probs = torch.softmax(logits, dim=-1)[0]
+        candidate_states = node.state.get_candidate_states()
+        for state in candidate_states:
+            p_idx = state.p_node_id
+            prior = probs[p_idx].item() if p_idx >= 0 and p_idx < probs.numel() else 0.0
+            Node(node, state, prior=prior)
 
     def simulate(self, node: Node):
         _, value = self._policy_value(node.state)
@@ -156,24 +180,41 @@ class AlphaZeroSFCSolver(MctsSolver):
         prior = prob[action_idx].item() if action_idx < prob.numel() else 0.0
         return prior, float(value.item())
 
-    def _state_to_obs(self, state: State) -> dict:
-        from virne.solver.learning.utils import load_pyg_data_from_network
-        p_data = load_pyg_data_from_network(state.p_net)
-        v_data = load_pyg_data_from_network(state.v_net)
-        encoder_in = v_data.x.unsqueeze(0)
-        encoder_outputs = self.policy.encode({'v_net_x': encoder_in})
+
+    def _state_to_obs(self, state: State) -> dict: 
+        if self._p_data is None:
+            from virne.solver.learning.utils import load_pyg_data_from_network
+            self._p_data = load_pyg_data_from_network(state.p_net)
+            self._v_data = load_pyg_data_from_network(state.v_net)
+            self._encoder_outputs = self.policy.encode({'v_net_x': self._v_data.x.unsqueeze(0)})
+
+        p_data = self._p_data
+        encoder_outputs = self._encoder_outputs
         history_len = len(state.selected_p_net_nodes) + 1
-        hist = torch.zeros(1, history_len, p_data.num_node_features)
+        hist = torch.zeros(1, history_len, p_data.num_node_features, dtype=p_data.x.dtype)
+        hist[0, 0] = self.policy.actor.decoder.start_embedding
         for i, idx in enumerate(state.selected_p_net_nodes):
-            if idx >= 0 and idx < p_data.num_nodes:
-                hist[0, i + 1] = p_data.x[idx]
-        action_mask = torch.ones(1, self.policy.actor.decoder.num_actions, dtype=torch.bool)
+            if 0 <= idx < p_data.num_nodes: 
+                hist[0, i + 1] = p_data.x[idx] 
+
+        candidate_nodes = self.controller.find_candidate_nodes(
+            v_net=state.v_net,
+            p_net=state.p_net,
+            v_node_id=state.v_node_id + 1,
+            filter=state.selected_p_net_nodes,
+        )
+        action_mask = torch.zeros(1, self.policy.actor.decoder.num_actions, dtype=torch.bool)
+        for idx in candidate_nodes:
+            if 0 <= idx < action_mask.size(1):
+                action_mask[0, idx] = True
+
         return {
             'p_net': p_data,
             'history_features': hist,
             'encoder_outputs': encoder_outputs,
             'curr_v_node_id': torch.tensor([state.v_node_id + 1]),
             'vnfs_remaining': torch.tensor([state.v_net.num_nodes - state.v_node_id - 1]),
-            'action_mask': action_mask,
-            'v_net_x': encoder_in,
+            'action_mask': action_mask, 
+            'v_net_x': self._v_data.x.unsqueeze(0),
         }
+         

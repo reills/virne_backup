@@ -70,6 +70,35 @@ class State:
         next_state.selected_p_net_nodes = self.selected_p_net_nodes + [random_choice]
         return next_state
 
+    def get_candidate_states(self):
+        """Return all feasible next states for the upcoming virtual node."""
+        candidate_p_nodes = self.controller.find_candidate_nodes(
+            v_net=self.v_net,
+            p_net=self.p_net,
+            v_node_id=self.v_node_id + 1,
+            filter=self.selected_p_net_nodes,
+        )
+        self.max_expansion = len(candidate_p_nodes)
+        if self.max_expansion == 0:
+            candidate_p_nodes = [-1]
+            self.max_expansion = 1
+
+        next_states = []
+        for p_node in candidate_p_nodes:
+            next_state = copy.deepcopy(self)
+            next_state.v_node_id = self.v_node_id + 1
+            next_state.p_node_id = p_node
+            next_state.selected_p_net_nodes = self.selected_p_net_nodes + [p_node]
+            next_states.append(next_state)
+        return next_states
+
+    def next_state(self, p_node_id: int):
+        """Generate the next state choosing a specific physical node."""
+        next_state = copy.deepcopy(self)
+        next_state.v_node_id = self.v_node_id + 1
+        next_state.p_node_id = p_node_id
+        next_state.selected_p_net_nodes = self.selected_p_net_nodes + [p_node_id]
+        return next_state
 
 class Node:
     """Node of the Monte Carlo Tree."""
