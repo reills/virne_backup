@@ -6,6 +6,10 @@ import random
 import math
 from typing import List
 
+import tqdm
+import torch.nn.functional as F
+from torch_geometric.data import Batch
+
 import networkx as nx
 
 import torch
@@ -47,6 +51,7 @@ class AlphaZeroSFCSolver(MctsSolver):
         if os.path.exists(self.policy_path):
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
         self.policy.eval()
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
         
         
         # Caches used during one solve episode
@@ -91,6 +96,54 @@ class AlphaZeroSFCSolver(MctsSolver):
         outcome = 1 if solution.get("result", False) else -1
         self._store_episode(trajectory, outcome)
         return solution
+
+    def learn(self, env, num_epochs: int, start_epoch: int = 0, **kwargs):
+        """Main AlphaZero self-play and learning loop."""
+        num_games_per_epoch = kwargs.get('num_games_per_epoch', 50)
+        num_train_steps_per_epoch = kwargs.get('num_train_steps_per_epoch', 100)
+
+        for epoch_id in range(start_epoch, num_epochs):
+            print(f"\n--- AlphaZero Epoch {epoch_id + 1}/{num_epochs} ---")
+
+            # --- Phase 1: Data Generation ---
+            print(f"Generating {num_games_per_epoch} games of experience...")
+            self.policy.eval()
+            pbar_generate = tqdm.tqdm(desc='Generating data', total=num_games_per_epoch)
+            for _ in range(num_games_per_epoch):
+                instance = env.reset()
+                self.solve(instance)
+                pbar_generate.update(1)
+            pbar_generate.close()
+
+            # --- Phase 2: Training ---
+            print(f"Training for {num_train_steps_per_epoch} steps...")
+            self.policy.train()
+            pbar_train = tqdm.tqdm(desc='Training policy', total=num_train_steps_per_epoch)
+            for _ in range(num_train_steps_per_epoch):
+                batch = self._load_and_prepare_batch()
+                if batch is None:
+                    print("Replay buffer is not large enough to start training. Skipping step.")
+                    continue
+
+                batch_obs, batch_mcts_policies, batch_outcomes = batch
+
+                self.optimizer.zero_grad()
+
+                predicted_logits = self.policy.act(batch_obs)
+                predicted_values = self.policy.evaluate(batch_obs).squeeze()
+
+                loss_policy = F.cross_entropy(predicted_logits, batch_mcts_policies)
+                loss_value = F.mse_loss(predicted_values, batch_outcomes)
+                total_loss = loss_policy + loss_value
+
+                total_loss.backward()
+                self.optimizer.step()
+                pbar_train.update(1)
+                pbar_train.set_postfix({'loss': f'{total_loss.item():.4f}'})
+            pbar_train.close()
+
+            print("Saving updated policy...")
+            torch.save(self.policy.state_dict(), self.policy_path)
 
     
     def _compute_policy(self, node: Node) -> torch.Tensor:
@@ -181,7 +234,7 @@ class AlphaZeroSFCSolver(MctsSolver):
         return prior, float(value.item())
 
 
-    def _state_to_obs(self, state: State) -> dict: 
+    def _state_to_obs(self, state: State) -> dict:
         if self._p_data is None:
             from virne.solver.learning.utils import load_pyg_data_from_network
             self._p_data = load_pyg_data_from_network(state.p_net)
@@ -214,7 +267,75 @@ class AlphaZeroSFCSolver(MctsSolver):
             'encoder_outputs': encoder_outputs,
             'curr_v_node_id': torch.tensor([state.v_node_id + 1]),
             'vnfs_remaining': torch.tensor([state.v_net.num_nodes - state.v_node_id - 1]),
-            'action_mask': action_mask, 
+            'action_mask': action_mask,
             'v_net_x': self._v_data.x.unsqueeze(0),
         }
+
+    def _deserialize_state(self, state_dict: dict) -> State:
+        """Reconstruct a State object from its serialized form."""
+        from virne.network import PhysicalNetwork, VirtualNetwork
+
+        p_graph = nx.node_link_graph(state_dict['p_net'])
+        v_graph = nx.node_link_graph(state_dict['v_net'])
+        p_net = PhysicalNetwork(p_graph)
+        v_net = VirtualNetwork(v_graph)
+
+        state = State(p_net, v_net, self.controller, self.recorder, self.counter)
+        state.selected_p_net_nodes = list(state_dict.get('selected', []))
+        state.v_node_id = state_dict.get('v_node_id', -1)
+        if state.selected_p_net_nodes:
+            state.p_node_id = state.selected_p_net_nodes[-1]
+        return state
+
+    def _load_and_prepare_batch(self):
+        """Load a batch of training samples from disk."""
+        all_files = [f for f in os.listdir(self.replay_dir) if f.endswith('.json')]
+        if len(all_files) < self.batch_size:
+            return None
+
+        batch_files = random.sample(all_files, self.batch_size)
+
+        obs_list = []
+        batch_policies = []
+        batch_outcomes = []
+
+        for fname in batch_files:
+            with open(os.path.join(self.replay_dir, fname), 'r') as f:
+                data = json.load(f)
+            trajectory = data.get('trajectory', [])
+            if not trajectory:
+                continue
+            step = random.choice(trajectory)
+            state = self._deserialize_state(step['state'])
+            obs = self._state_to_obs(state)
+            obs_list.append(obs)
+            batch_policies.append(torch.tensor(step['policy'], dtype=torch.float32))
+            batch_outcomes.append(torch.tensor(data['outcome'], dtype=torch.float32))
+
+        if not obs_list:
+            return None
+
+        if len(obs_list) == 1:
+            batch_obs = obs_list[0]
+        else:
+            p_net_batch = Batch.from_data_list([o['p_net'] for o in obs_list])
+            hist = torch.cat([o['history_features'] for o in obs_list], dim=0)
+            enc = torch.cat([o['encoder_outputs'] for o in obs_list], dim=0)
+            curr = torch.cat([o['curr_v_node_id'] for o in obs_list], dim=0)
+            remain = torch.cat([o['vnfs_remaining'] for o in obs_list], dim=0)
+            mask = torch.cat([o['action_mask'] for o in obs_list], dim=0)
+            v_x = torch.cat([o['v_net_x'] for o in obs_list], dim=0)
+            batch_obs = {
+                'p_net': p_net_batch,
+                'history_features': hist,
+                'encoder_outputs': enc,
+                'curr_v_node_id': curr,
+                'vnfs_remaining': remain,
+                'action_mask': mask,
+                'v_net_x': v_x,
+            }
+
+        policies = torch.stack(batch_policies)
+        outcomes = torch.stack(batch_outcomes)
+        return batch_obs, policies, outcomes
          
