@@ -15,7 +15,6 @@ import networkx as nx
 import torch
 
 from .net import ActorCritic
-from virne.solver.learning.rl_core.policy_builder import PolicyBuilder
 
 from virne.core import Solution
 from virne.solver.base_solver import Solver, SolverRegistry
@@ -41,12 +40,13 @@ class AlphaZeroSFCSolver(MctsSolver):
         self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
         os.makedirs(self.replay_dir, exist_ok=True)
 
-        feature_cfg = PolicyBuilder.get_feature_dim_config(config)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.policy = ActorCritic(
-            p_net_num_nodes=feature_cfg['p_net_num_nodes'],
-            p_net_feature_dim=feature_cfg['p_net_x_dim'],
-            v_net_feature_dim=feature_cfg['v_net_x_dim']
+            p_net_num_nodes=config.simulation.p_net_setting_num_nodes,
+            p_net_feature_dim=config.simulation.p_net_setting_num_node_resource_attrs,
+            v_net_feature_dim=config.simulation.v_sim_setting_num_node_resource_attrs,
+            p_net_edge_dim=config.simulation.p_net_setting_num_link_resource_attrs
         ).to(self.device)
         if os.path.exists(self.policy_path):
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
@@ -66,8 +66,8 @@ class AlphaZeroSFCSolver(MctsSolver):
 
         # Pre-compute graph tensors and encoder outputs for efficiency
         from virne.solver.learning.utils import load_pyg_data_from_network
-        self._p_data = load_pyg_data_from_network(p_net)
-        self._v_data = load_pyg_data_from_network(v_net)
+        self._p_data = load_pyg_data_from_network(p_net).to(self.device)
+        self._v_data = load_pyg_data_from_network(v_net).to(self.device)
         self._encoder_outputs = self.policy.encode({'v_net_x': self._v_data.x.unsqueeze(0)})
 
         current_node = Node(None, State(p_net, v_net, self.controller, self.recorder, self.counter))
@@ -237,14 +237,14 @@ class AlphaZeroSFCSolver(MctsSolver):
     def _state_to_obs(self, state: State) -> dict:
         if self._p_data is None:
             from virne.solver.learning.utils import load_pyg_data_from_network
-            self._p_data = load_pyg_data_from_network(state.p_net)
-            self._v_data = load_pyg_data_from_network(state.v_net)
+            self._p_data = load_pyg_data_from_network(state.p_net).to(self.device)
+            self._v_data = load_pyg_data_from_network(state.v_net).to(self.device)
             self._encoder_outputs = self.policy.encode({'v_net_x': self._v_data.x.unsqueeze(0)})
 
         p_data = self._p_data
         encoder_outputs = self._encoder_outputs
         history_len = len(state.selected_p_net_nodes) + 1
-        hist = torch.zeros(1, history_len, p_data.num_node_features, dtype=p_data.x.dtype)
+        hist = torch.zeros(1, history_len, p_data.num_node_features, dtype=p_data.x.dtype, device=self.device)
         hist[0, 0] = self.policy.actor.decoder.start_embedding
         for i, idx in enumerate(state.selected_p_net_nodes):
             if 0 <= idx < p_data.num_nodes: 
@@ -256,7 +256,7 @@ class AlphaZeroSFCSolver(MctsSolver):
             v_node_id=state.v_node_id + 1,
             filter=state.selected_p_net_nodes,
         )
-        action_mask = torch.zeros(1, self.policy.actor.decoder.num_actions, dtype=torch.bool)
+        action_mask = torch.zeros(1, self.policy.actor.decoder.num_actions, dtype=torch.bool, device=self.device)
         for idx in candidate_nodes:
             if 0 <= idx < action_mask.size(1):
                 action_mask[0, idx] = True
@@ -265,8 +265,8 @@ class AlphaZeroSFCSolver(MctsSolver):
             'p_net': p_data,
             'history_features': hist,
             'encoder_outputs': encoder_outputs,
-            'curr_v_node_id': torch.tensor([state.v_node_id + 1]),
-            'vnfs_remaining': torch.tensor([state.v_net.num_nodes - state.v_node_id - 1]),
+            'curr_v_node_id': torch.tensor([state.v_node_id + 1], device=self.device),
+            'vnfs_remaining': torch.tensor([state.v_net.num_nodes - state.v_node_id - 1], device=self.device),
             'action_mask': action_mask,
             'v_net_x': self._v_data.x.unsqueeze(0),
         }
@@ -318,13 +318,13 @@ class AlphaZeroSFCSolver(MctsSolver):
         if len(obs_list) == 1:
             batch_obs = obs_list[0]
         else:
-            p_net_batch = Batch.from_data_list([o['p_net'] for o in obs_list])
-            hist = torch.cat([o['history_features'] for o in obs_list], dim=0)
-            enc = torch.cat([o['encoder_outputs'] for o in obs_list], dim=0)
-            curr = torch.cat([o['curr_v_node_id'] for o in obs_list], dim=0)
-            remain = torch.cat([o['vnfs_remaining'] for o in obs_list], dim=0)
-            mask = torch.cat([o['action_mask'] for o in obs_list], dim=0)
-            v_x = torch.cat([o['v_net_x'] for o in obs_list], dim=0)
+            p_net_batch = Batch.from_data_list([o['p_net'] for o in obs_list]).to(self.device)
+            hist = torch.cat([o['history_features'] for o in obs_list], dim=0).to(self.device)
+            enc = torch.cat([o['encoder_outputs'] for o in obs_list], dim=0).to(self.device)
+            curr = torch.cat([o['curr_v_node_id'] for o in obs_list], dim=0).to(self.device)
+            remain = torch.cat([o['vnfs_remaining'] for o in obs_list], dim=0).to(self.device)
+            mask = torch.cat([o['action_mask'] for o in obs_list], dim=0).to(self.device)
+            v_x = torch.cat([o['v_net_x'] for o in obs_list], dim=0).to(self.device)
             batch_obs = {
                 'p_net': p_net_batch,
                 'history_features': hist,
@@ -335,7 +335,7 @@ class AlphaZeroSFCSolver(MctsSolver):
                 'v_net_x': v_x,
             }
 
-        policies = torch.stack(batch_policies)
-        outcomes = torch.stack(batch_outcomes)
+        policies = torch.stack(batch_policies).to(self.device)
+        outcomes = torch.stack(batch_outcomes).to(self.device)
         return batch_obs, policies, outcomes
          
