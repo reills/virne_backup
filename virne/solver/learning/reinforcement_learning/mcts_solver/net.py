@@ -10,7 +10,7 @@ from torch_geometric.nn import global_mean_pool
 
 
 class MultiHeadGENLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, aggr='softmax', edge_dim=2):
+    def __init__(self, in_dim, out_dim, aggr='softmax', edge_dim=1):
         super().__init__()
         self.conv = GENConv(
             in_channels=in_dim,
@@ -48,7 +48,8 @@ class MultiHeadGENLayer(nn.Module):
 # --- ActorCritic Model ---
 class ActorCritic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, v_net_feature_dim,
-                 embedding_dim=100, n_heads=5, n_layers=4, dropout=0.1, **kwargs):
+                 embedding_dim=100, n_heads=5, n_layers=4, dropout=0.1,
+                 p_net_edge_dim=1, **kwargs):
         super().__init__()
         
         common_kwargs = dict(
@@ -58,6 +59,7 @@ class ActorCritic(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
+            p_net_edge_dim=p_net_edge_dim,
             **kwargs  # include allow_rejection, allow_revocable, etc.
         )
         
@@ -115,7 +117,7 @@ class Actor(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
-        # Retrieve special action flags from kwargs 
+        # Retrieve special action flags from kwargs
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -123,7 +125,8 @@ class Actor(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
-            is_actor=True, 
+            is_actor=True,
+            p_net_edge_dim=kwargs.get('p_net_edge_dim', 1),
             **kwargs
         )
 
@@ -146,6 +149,7 @@ class Critic(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             is_actor=False,
+            p_net_edge_dim=kwargs.get('p_net_edge_dim', 1),
             **kwargs
         )
 
@@ -185,7 +189,8 @@ class AutoregressiveDecoder(nn.Module):
     """
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
                  n_heads=5, n_layers=4, dropout=0.1, is_actor=True,
-                 allow_revocable=False, allow_rejection=False, use_amp=False, max_seq_len=15):
+                 allow_revocable=False, allow_rejection=False, use_amp=False, max_seq_len=15,
+                 p_net_edge_dim=1):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.use_amp = use_amp
@@ -207,7 +212,8 @@ class AutoregressiveDecoder(nn.Module):
         self.gat_layers = nn.ModuleList([
             MultiHeadGENLayer(
                 in_dim=p_net_feature_dim if i == 0 else embedding_dim,
-                out_dim=embedding_dim
+                out_dim=embedding_dim,
+                edge_dim=p_net_edge_dim
             )
             for i in range(3)
         ])

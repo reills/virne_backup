@@ -15,7 +15,6 @@ import networkx as nx
 import torch
 
 from .net import ActorCritic
-from virne.solver.learning.rl_core.policy_builder import PolicyBuilder
 
 from virne.core import Solution
 from virne.solver.base_solver import Solver, SolverRegistry
@@ -41,12 +40,13 @@ class AlphaZeroSFCSolver(MctsSolver):
         self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
         os.makedirs(self.replay_dir, exist_ok=True)
 
-        feature_cfg = PolicyBuilder.get_feature_dim_config(config)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.policy = ActorCritic(
-            p_net_num_nodes=feature_cfg['p_net_num_nodes'],
-            p_net_feature_dim=feature_cfg['p_net_x_dim'],
-            v_net_feature_dim=feature_cfg['v_net_x_dim']
+            p_net_num_nodes=config.simulation.p_net_setting_num_nodes,
+            p_net_feature_dim=config.simulation.p_net_setting_num_node_resource_attrs,
+            v_net_feature_dim=config.simulation.v_sim_setting_num_node_resource_attrs,
+            p_net_edge_dim=config.simulation.p_net_setting_num_link_resource_attrs
         ).to(self.device)
         if os.path.exists(self.policy_path):
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
