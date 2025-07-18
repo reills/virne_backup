@@ -5,7 +5,7 @@ import torch
 
 from .net import ActorCritic
 from .node import State
-from ..utils import load_pyg_data_from_network
+from ...utils import load_pyg_data_from_network
 
 
 def serialize_state(state: State) -> dict:

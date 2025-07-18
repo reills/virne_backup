@@ -118,6 +118,8 @@ class Actor(nn.Module):
                  n_heads=5, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
         # Retrieve special action flags from kwargs
+        # Extract p_net_edge_dim from kwargs to avoid duplicate parameter
+        p_net_edge_dim = kwargs.pop('p_net_edge_dim', 1)
         self.decoder = AutoregressiveDecoder(
             p_net_num_nodes=p_net_num_nodes,
             p_net_feature_dim=p_net_feature_dim,
@@ -126,7 +128,7 @@ class Actor(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             is_actor=True,
-            p_net_edge_dim=kwargs.get('p_net_edge_dim', 1),
+            p_net_edge_dim=p_net_edge_dim,
             **kwargs
         )
 
@@ -149,7 +151,6 @@ class Critic(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             is_actor=False,
-            p_net_edge_dim=kwargs.get('p_net_edge_dim', 1),
             **kwargs
         )
 

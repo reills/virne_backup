@@ -35,7 +35,7 @@ system:
 
 # For VNE Solver
 solver:
-  solver_name: 'ppo_dual_gat+'
+  solver_name: 'alpha_zero_sfc'
 
   matching_mathod: greedy
   shortest_method: k_shortest

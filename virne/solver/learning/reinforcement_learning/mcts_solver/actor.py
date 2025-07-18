@@ -6,6 +6,7 @@ import os
 import random
 from typing import List
 
+import numpy as np
 import torch
 
 from virne.core import Solution
@@ -13,6 +14,18 @@ from .net import ActorCritic
 from .mcts import MctsSolver
 from .node import Node, State
 from .common import state_to_obs, serialize_state
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder for numpy data types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 class AlphaZeroActor(MctsSolver):
@@ -123,7 +136,7 @@ class AlphaZeroActor(MctsSolver):
         data = {"trajectory": trajectory, "outcome": outcome}
         path = os.path.join(self.replay_dir, f"{random.random():.6f}.json")
         with open(path, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, cls=NumpyEncoder)
         self._cleanup()
 
     def _cleanup(self, keep: int = 500000) -> None:
