@@ -192,7 +192,7 @@ class MctsSolver(Solver):
 
             # UCB = quality / times + C * sqrt(2 * ln(total_times) / times)
             left = child_node.value / child_node.visit_times
-            right = math.log(node.visit_times) / child_node.visit_times
+            right = 2 * math.log(node.visit_times) / child_node.visit_times
             score = left + c * math.sqrt(right)
 
             if score > best_score:
