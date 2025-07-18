@@ -1,0 +1,7 @@
+tests/
+*.whl
+*.pt
+*.tar.gz
+__pycache__/
+docs/
+build/
