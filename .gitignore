@@ -2,6 +2,9 @@
 .vscode
 .hydra
 
+#dataset
+dataset/*
+
 # cache
 *.log
 *.py[cod]
