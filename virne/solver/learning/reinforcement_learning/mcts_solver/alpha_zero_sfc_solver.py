@@ -25,11 +25,12 @@ from .node import Node, State
 
 @SolverRegistry.register(solver_name="alpha_zero_sfc", solver_type="r_learning")
 class AlphaZeroSFCSolver(MctsSolver):
-    """AlphaZero-style solver for Service Function Chaining VNE.
+"""AlphaZero-style solver for Service Function Chaining VNE.
 
-    This solver uses Monte Carlo Tree Search guided by a neural policy. Actors
-    generate trajectories which are stored on disk for an off-policy learner.
-    The implementation here focuses on the actor side and basic replay logic.
+    The original implementation combined actor and learner logic in a single
+    class.  The project has since been refactored so that :mod:`actor` and
+    :mod:`learner` contain the decoupled components.  This class keeps the
+    former behaviour but now mainly serves as a reference wrapper.
     """
 
     def __init__(self, controller, recorder, counter, logger, config,
