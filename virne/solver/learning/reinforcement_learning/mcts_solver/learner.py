@@ -6,13 +6,13 @@ import os
 import random
 from typing import List
 
-import networkx as nx
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from .net import ActorCritic
 from .node import State
+from .common import deserialize_state, state_to_obs
 
 
 class AlphaZeroLearner:
@@ -43,11 +43,6 @@ class AlphaZeroLearner:
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
 
-        # caches used when reconstructing observations
-        self._p_data = None
-        self._v_data = None
-        self._encoder_outputs = None
-
     # ------------------------------------------------------------------
     def train_steps(self, num_steps: int) -> None:
         self.policy.train()
@@ -73,57 +68,10 @@ class AlphaZeroLearner:
 
     # ------------------------------------------------------------------
     def _deserialize_state(self, state_dict: dict) -> State:
-        from virne.network import PhysicalNetwork, VirtualNetwork
-
-        p_graph = nx.node_link_graph(state_dict["p_net"])
-        v_graph = nx.node_link_graph(state_dict["v_net"])
-        p_net = PhysicalNetwork(p_graph)
-        v_net = VirtualNetwork(v_graph)
-
-        state = State(p_net, v_net, self.controller, self.recorder, self.counter)
-        state.selected_p_net_nodes = list(state_dict.get("selected", []))
-        state.v_node_id = state_dict.get("v_node_id", -1)
-        if state.selected_p_net_nodes:
-            state.p_node_id = state.selected_p_net_nodes[-1]
-        return state
+        return deserialize_state(state_dict, self.controller, self.recorder, self.counter)
 
     def _state_to_obs(self, state: State) -> dict:
-        if self._p_data is None:
-            from virne.solver.learning.utils import load_pyg_data_from_network
-
-            self._p_data = load_pyg_data_from_network(state.p_net).to(self.device)
-            self._v_data = load_pyg_data_from_network(state.v_net).to(self.device)
-            self._encoder_outputs = self.policy.encode({"v_net_x": self._v_data.x.unsqueeze(0)})
-
-        p_data = self._p_data
-        encoder_outputs = self._encoder_outputs
-        history_len = len(state.selected_p_net_nodes) + 1
-        hist = torch.zeros(1, history_len, p_data.num_node_features, dtype=p_data.x.dtype, device=self.device)
-        hist[0, 0] = self.policy.actor.decoder.start_embedding
-        for i, idx in enumerate(state.selected_p_net_nodes):
-            if 0 <= idx < p_data.num_nodes:
-                hist[0, i + 1] = p_data.x[idx]
-
-        candidate_nodes = self.controller.find_candidate_nodes(
-            v_net=state.v_net,
-            p_net=state.p_net,
-            v_node_id=state.v_node_id + 1,
-            filter=state.selected_p_net_nodes,
-        )
-        action_mask = torch.zeros(1, self.policy.actor.decoder.num_actions, dtype=torch.bool, device=self.device)
-        for idx in candidate_nodes:
-            if 0 <= idx < action_mask.size(1):
-                action_mask[0, idx] = True
-
-        return {
-            "p_net": p_data,
-            "history_features": hist,
-            "encoder_outputs": encoder_outputs,
-            "curr_v_node_id": torch.tensor([state.v_node_id + 1], device=self.device),
-            "vnfs_remaining": torch.tensor([state.v_net.num_nodes - state.v_node_id - 1], device=self.device),
-            "action_mask": action_mask,
-            "v_net_x": self._v_data.x.unsqueeze(0),
-        }
+        return state_to_obs(state, self.policy, self.controller, self.device)
 
     # ------------------------------------------------------------------
     def _load_and_prepare_batch(self):
