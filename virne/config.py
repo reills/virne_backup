@@ -43,16 +43,15 @@ class Config(ClassDict):
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
-    use_fixed_dataset: bool = True 
-    dir_save_dataset: str = "dataset/test_0"
+    use_fixed_dataset: bool = False 
+    dir_save_dataset: str = "dataset/large"
     if_dynamic_v_nets: bool = False 
 
     ### solver  ###
     solver_name: str = 'random_rank'
     sub_solver_name: str = None
-    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-padding/a3c_gcn_pre_train_transformer/dataset/results-padding/model/model-best.pkl'
- 
-    pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/test_3/output/output/model/model-worker0-epoch269.pkl'
+    pretrained_model_path: str =  ''
+    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-3/output/model/model.pkl'
     pretrained_subsolver_model_path: str = ''
     # solver_name: str = 'nrm_rank'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
@@ -72,11 +71,11 @@ class Config(ClassDict):
     use_cuda: bool = True
     cuda_id: int = 0
     distributed_training: bool = True 
-    num_train_epochs: int = 0 #changed by me was 100
+    num_train_epochs: int = 100 #changed by me was 100
     start_train_epoch: int = 0 #where to start training if reloading.... 
-    num_workers: int = 1 #changed by me was 10
-    batch_size: int = 128 # changed by me was 128
-    target_steps: int = batch_size * 2
+    num_workers: int = 3 #changed by me was 10
+    batch_size: int = 125
+    target_steps: int = 250 # changed by me was 128 
     repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
     eval_interval: int = 400 #changed was 10 
@@ -107,7 +106,7 @@ class Config(ClassDict):
     gae_lambda: float = 0.98
     lr_actor: float = 1e-5
     lr_critic: float = 5e-5
-    decode_strategy: str = 'beam'
+    decode_strategy: str = 'greedy'
     k_searching: int = 1
 
     ### Loss ###
