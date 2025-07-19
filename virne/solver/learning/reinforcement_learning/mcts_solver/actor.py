@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 from typing import List
@@ -10,8 +11,8 @@ import numpy as np
 import torch
 
 from virne.core import Solution
+from virne.solver.base_solver import Solver
 from .net import ActorCritic
-from .mcts import MctsSolver
 from .node import Node, State
 from .common import state_to_obs, serialize_state
 
@@ -28,7 +29,7 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-class AlphaZeroActor(MctsSolver):
+class AlphaZeroActor(Solver):
     """Actor process that generates trajectories using MCTS."""
 
     def __init__(self, controller, recorder, counter, logger, config,
@@ -37,6 +38,7 @@ class AlphaZeroActor(MctsSolver):
         self.replay_dir = replay_dir
         self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
         os.makedirs(self.replay_dir, exist_ok=True)
+        # MCTS configuration parameters\n        self.computation_budget = kwargs.get('computation_budget', 50)  # More simulations for AlphaZero\n        self.c_puct = kwargs.get('c_puct', 1.0)  # PUCT exploration constant\n        # Link mapping parameters (inherited from MctsSolver)\n        self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')\n        self.k_shortest = kwargs.get('k_shortest', 10)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy = ActorCritic(
@@ -97,6 +99,112 @@ class AlphaZeroActor(MctsSolver):
         self._store_episode_new_format(static_environment, trajectory, final_reward)
         return solution
 
+    # ------------------------------------------------------------------
+    # AlphaZero MCTS Implementation
+    # ------------------------------------------------------------------
+    
+    def search(self, root_node: Node) -> Node:
+        """AlphaZero MCTS search that uses neural network guidance."""
+        # If this is the first call, expand the root node
+        if not root_node.children and not root_node.state.is_terminal():
+            self._expand_node(root_node)
+        
+        # Run MCTS simulations
+        for _ in range(self.computation_budget):
+            self._run_simulation(root_node)
+        
+        # Select best child based on visit counts (no exploration)
+        best_child = self._select_best_child(root_node, temperature=0)
+        
+        if best_child is not None:
+            # Create a new root node for the next search step
+            # This represents the state after taking the selected action
+            next_state = best_child.state
+            return Node(None, next_state)
+        
+        return None
+    
+    def _run_simulation(self, root_node: Node) -> None:
+        """Run a single MCTS simulation from root to leaf."""
+        path = []
+        node = root_node
+        
+        # 1. Selection - traverse down the tree using PUCT
+        while not node.state.is_terminal() and node.children:
+            node = self._select_child_puct(node)
+            path.append(node)
+        
+        # 2. Expansion and Evaluation
+        if not node.state.is_terminal():
+            # Expand the node using neural network
+            self._expand_node(node)
+            if node.children:
+                # Select a child to evaluate
+                node = random.choice(node.children)
+                path.append(node)
+        
+        # 3. Backup - propagate value up the path
+        value = self._evaluate_leaf(node)
+        self._backup(path, value)
+    
+    def _select_child_puct(self, node: Node) -> Node:
+        """Select child using PUCT (Polynomial Upper Confidence Trees)."""
+        if not node.children:
+            return None
+            
+        total_visits = sum(child.visit_times for child in node.children)
+        sqrt_total = math.sqrt(total_visits + 1)
+        
+        best_score = -float('inf')
+        best_child = None
+        
+        for child in node.children:
+            # PUCT formula: Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
+            if child.visit_times > 0:
+                q_value = child.value / child.visit_times
+            else:
+                q_value = 0.0
+            
+            u_value = self.c_puct * child.prior * sqrt_total / (1 + child.visit_times)
+            score = q_value + u_value
+            
+            if score > best_score:
+                best_score = score
+                best_child = child
+        
+        return best_child if best_child else node.children[0]
+    
+    def _evaluate_leaf(self, node: Node) -> float:
+        """Evaluate a leaf node using the neural network value head."""
+        obs = self._state_to_obs(node.state)
+        with torch.no_grad():
+            value = self.policy.evaluate(obs)
+        return float(value.item())
+    
+    def _backup(self, path: List[Node], value: float) -> None:
+        """Backup the value through the path."""
+        for node in reversed(path):
+            node.visit_times += 1
+            node.value += value
+    
+    def _select_best_child(self, node: Node, temperature: float = 1.0) -> Node:
+        """Select best child based on visit counts."""
+        if not node.children:
+            return None
+        
+        if temperature == 0:
+            # Greedy selection
+            return max(node.children, key=lambda child: child.visit_times)
+        else:
+            # Temperature-based selection
+            visits = np.array([child.visit_times for child in node.children])
+            if temperature != 1.0:
+                visits = visits ** (1.0 / temperature)
+            
+            probs = visits / visits.sum()
+            idx = np.random.choice(len(node.children), p=probs)
+            return node.children[idx]
+    
     # ------------------------------------------------------------------
     def _state_to_obs(self, state: State) -> dict:
         return state_to_obs(
