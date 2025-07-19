@@ -52,14 +52,22 @@ class AlphaZeroLearner:
                 print("Replay buffer is not large enough to start training. Skipping step.")
                 break
 
-            batch_obs, batch_policies, batch_outcomes = batch
+            batch_obs, batch_policies, batch_values = batch
 
             self.optimizer.zero_grad()
             predicted_logits = self.policy.act(batch_obs)
             predicted_values = self.policy.evaluate(batch_obs).squeeze()
 
-            loss_policy = F.cross_entropy(predicted_logits, batch_policies)
-            loss_value = F.mse_loss(predicted_values, batch_outcomes)
+            # For policy loss, convert policy probabilities to target indices for cross-entropy
+            if batch_policies.dim() > 1 and batch_policies.size(1) > 1:
+                # If we have probability distributions, use KL divergence
+                predicted_probs = F.softmax(predicted_logits, dim=-1)
+                loss_policy = F.kl_div(predicted_probs.log(), batch_policies, reduction='batchmean')
+            else:
+                # Legacy format with single outcomes
+                loss_policy = F.cross_entropy(predicted_logits, batch_policies.long())
+            
+            loss_value = F.mse_loss(predicted_values, batch_values)
             total_loss = loss_policy + loss_value
 
             total_loss.backward()
@@ -82,20 +90,43 @@ class AlphaZeroLearner:
         batch_files = random.sample(all_files, self.batch_size)
         obs_list: List[dict] = []
         batch_policies = []
-        batch_outcomes = []
+        batch_values = []
 
         for fname in batch_files:
             with open(os.path.join(self.replay_dir, fname), 'r') as f:
                 data = json.load(f)
-            trajectory = data.get('trajectory', [])
-            if not trajectory:
-                continue
-            step = random.choice(trajectory)
-            state = self._deserialize_state(step['state'])
-            obs = self._state_to_obs(state)
-            obs_list.append(obs)
-            batch_policies.append(torch.tensor(step['policy'], dtype=torch.float32))
-            batch_outcomes.append(torch.tensor(data['outcome'], dtype=torch.float32))
+            
+            # Check if it's new format or legacy format
+            if 'static_environment' in data:
+                # New format: reconstruct full state from static + dynamic components
+                trajectory = data.get('trajectory', [])
+                if not trajectory:
+                    continue
+                
+                step = random.choice(trajectory)
+                static_env = data['static_environment']
+                dynamic_state = step['dynamic_state']
+                
+                # Reconstruct the full network state for this timestep
+                state = self._reconstruct_state_from_components(static_env, dynamic_state)
+                obs = self._state_to_obs(state)
+                obs_list.append(obs)
+                
+                # Use the policy and value from MCTS
+                batch_policies.append(torch.tensor(step['policy'], dtype=torch.float32))
+                batch_values.append(torch.tensor(step['value'], dtype=torch.float32))
+            else:
+                # Legacy format: deserialize full state
+                trajectory = data.get('trajectory', [])
+                if not trajectory:
+                    continue
+                
+                step = random.choice(trajectory)
+                state = self._deserialize_state(step['state'])
+                obs = self._state_to_obs(state)
+                obs_list.append(obs)
+                batch_policies.append(torch.tensor(step['policy'], dtype=torch.float32))
+                batch_values.append(torch.tensor(data['outcome'], dtype=torch.float32))
 
         if not obs_list:
             return None
@@ -121,7 +152,61 @@ class AlphaZeroLearner:
             }
 
         policies = torch.stack(batch_policies).to(self.device)
-        outcomes = torch.stack(batch_outcomes).to(self.device)
-        return batch_obs, policies, outcomes
+        values = torch.stack(batch_values).to(self.device)
+        return batch_obs, policies, values
 
 
+
+    def _reconstruct_state_from_components(self, static_env: dict, dynamic_state: dict) -> State:
+        """Reconstruct a full state from static environment and dynamic state components."""
+        from virne.network import PhysicalNetwork, VirtualNetwork
+        import networkx as nx
+        
+        # Reconstruct physical network with current resource usage
+        p_graph = nx.Graph()
+        
+        # Add nodes with current resource state
+        p_node_cpu_used = dynamic_state.get('p_node_cpu_used', {})
+        for node_info in static_env['physical_network']['nodes']:
+            node_id = node_info['id']
+            max_cpu = node_info['max_cpu']
+            used_cpu = int(p_node_cpu_used.get(str(node_id), 0))
+            available_cpu = max_cpu - used_cpu
+            
+            p_graph.add_node(node_id, 
+                           cpu=available_cpu,
+                           max_cpu=max_cpu)
+        
+        # Add edges with current resource state
+        p_link_bw_used = dynamic_state.get('p_link_bw_used', {})
+        for link_info in static_env['physical_network']['links']:
+            u, v = link_info['source'], link_info['target']
+            max_bw = link_info['max_bw']
+            used_bw = int(p_link_bw_used.get(f"{u}-{v}", p_link_bw_used.get(f"{v}-{u}", 0)))
+            available_bw = max_bw - used_bw
+            
+            p_graph.add_edge(u, v,
+                           bw=available_bw,
+                           max_bw=max_bw)
+        
+        # Reconstruct virtual network (SFC request) - this is static
+        v_graph = nx.Graph()
+        for node_info in static_env['sfc_request']['nodes']:
+            node_id = node_info['id']
+            cpu_demand = node_info['cpu_demand']
+            v_graph.add_node(node_id, cpu=cpu_demand)
+        
+        for link_info in static_env['sfc_request']['links']:
+            u, v = link_info['source'], link_info['target']
+            bw_demand = link_info['bw_demand']
+            v_graph.add_edge(u, v, bw=bw_demand)
+        
+        # Create network objects
+        p_net = PhysicalNetwork(p_graph)
+        v_net = VirtualNetwork(v_graph)
+        
+        # Create state object
+        state = State(p_net, v_net, self.controller, self.recorder, self.counter)
+        
+        return state
+EOF < /dev/null
