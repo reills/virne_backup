@@ -3,6 +3,7 @@
 
 #datasets
 outputs/*
+results/replay_buffer/*
 dataset/
 poisson_test/
 dataset/results*

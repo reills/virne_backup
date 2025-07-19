@@ -318,7 +318,7 @@ class RLSolver(Solver):
         if decode_strategy is None: decode_strategy = self.decode_strategy
         if k is None: k = self.k_searching
         assert k >= 1, f'k should greater than 0. (k={k})'
-        print(f'\n\n\n\nk is {k}\n\n\n\n')
+        print(f'\n\n\n\nk is {self.k_shortest}\n\n\n\n')
         self.policy.eval()
         self.searcher = get_searcher(decode_strategy, 
                                     policy=self.policy, 

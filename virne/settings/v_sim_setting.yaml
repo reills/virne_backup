@@ -1,21 +1,21 @@
-num_v_nets: 2000
+num_v_nets: 1000
 topology:
   type: path
 v_net_size:
   distribution: uniform
   dtype: int
-  low: 2
-  high: 15
+  low: 7
+  high: 7
 arrival_rate:
-  #distribution: poisson
-  #dtype: float
-  #lam: 0.04
-  #reciprocal: true
+  distribution: poisson
+  dtype: float
+  lam: 0.04
+  reciprocal: true
 
-  distribution: lognormal # <-- New distribution type
-  dtype: float          # <-- Keep dtype
-  mean: 2.0             # <-- Add mean parameter (Adjust this value!)
-  sigma: 1.5            # <-- Add sigma parameter (Adjust this value!)
+  #distribution: lognormal # <-- New distribution type
+  #dtype: float          # <-- Keep dtype
+  #mean: 2.0             # <-- Add mean parameter (Adjust this value!)
+  #sigma: 1.5            # <-- Add sigma parameter (Adjust this value!)
 
   #distribution: pareto
   #dtype: float
@@ -36,24 +36,24 @@ node_attrs_setting:
     distribution: uniform
     dtype: int
     generative: true
-    low: 0
-    high: 50
+    low: 30
+    high: 30
     owner: node
     type: resource
   - name: gpu
     distribution: uniform
     dtype: int
     generative: true
-    low: 0
-    high: 50
+    low: 30
+    high: 30
     owner: node
     type: resource
   - name: rom
     distribution: uniform
     dtype: int
     generative: true
-    low: 0
-    high: 50
+    low: 30
+    high: 30
     owner: node
     type: resource
 link_attrs_setting:
@@ -61,8 +61,8 @@ link_attrs_setting:
     distribution: uniform
     dtype: int
     generative: true
-    low: 0
-    high: 50
+    low: 30
+    high: 30
     owner: link
     type: resource
   # - name: ltc

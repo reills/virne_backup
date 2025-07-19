@@ -459,14 +459,15 @@ class A3CGcnPreTrainTransformerSolver(InstanceAgent, A2CSolver):
         
         # Curriculum logic: decide which phase we're in  
         global_epoch_id = self.training_epoch_id + self.start_train_epoch  # self.training_epoch_id is local to current loop
+        total_training = self.total_train 
 
-        if global_epoch_id < (100 / self.num_workers) :
+        if global_epoch_id < (.2 * total_training / self.num_workers) :
             phase = 1 #include no special actions
             self.coef_entropy_loss = 0.2
-        elif global_epoch_id < (200 / self.num_workers):
+        elif global_epoch_id < (.4 * total_training / self.num_workers):
             phase = 2 #include revoke
             self.coef_entropy_loss = 0.1
-        elif global_epoch_id < (300 / self.num_workers):
+        elif global_epoch_id < (.6 * total_training / self.num_workers):
             phase = 3 #include reject
             self.coef_entropy_loss = 0.05
         else:

@@ -144,8 +144,9 @@ class InstanceAgent(object):
  
     def learn_singly(self, env, num_epochs=1, start_epoch=0, **kwargs): 
         self.start_train_epoch = start_epoch
+        self.total_train = num_epochs
 
-        for epoch_id in range(start_epoch, start_epoch + num_epochs):
+        for epoch_id in range(start_epoch, num_epochs):
             if self.verbose > 0:
                 print(f'=============== Training Epoch: {epoch_id} ===================')
 

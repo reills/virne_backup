@@ -111,7 +111,7 @@ class InstanceEnv(JointPRStepInstanceRLEnv):
             valid_candidates.append(self.revocable_action)
  
         # PHASE 4+: Allow reject once at least 1 action attempted
-        if (self.phase >= 4 or self.phase == -1) and self.allow_rejection and self.solution['num_interactions'] > 0:
+        if (self.phase >= 4 or self.phase == -2) and self.allow_rejection and self.solution['num_interactions'] > 0:
             valid_candidates.append(self.rejection_action)
              
         mask = np.zeros(self.num_actions, dtype=bool)

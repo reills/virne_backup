@@ -9,8 +9,8 @@ link_attrs_setting:
   - distribution: uniform
     dtype: int
     generative: true
-    high: 100
-    low: 50
+    high: 75
+    low: 75
     name: bw
     owner: link
     type: resource
@@ -24,7 +24,7 @@ node_attrs_setting:
     dtype: int
     generative: true
     high: 100
-    low: 50
+    low: 100
     owner: node
     type: resource
   - name: max_cpu
@@ -36,7 +36,7 @@ node_attrs_setting:
     dtype: int
     generative: true
     high: 100
-    low: 50
+    low: 100
     owner: node
     type: resource
   - name: max_gpu
@@ -48,7 +48,7 @@ node_attrs_setting:
     dtype: int
     generative: true
     high: 100
-    low: 50
+    low: 100
     owner: node
     type: resource
   - name: max_rom
