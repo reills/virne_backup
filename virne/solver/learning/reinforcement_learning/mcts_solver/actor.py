@@ -75,17 +75,26 @@ class AlphaZeroActor(Solver):
         trajectory: List[dict] = []
 
         for v_node_id in range(v_net.num_nodes):
-            # Get MCTS search results
-            current_node = self.search(current_node)
-            if current_node is None or current_node.state.p_node_id == -1:
+            # Run MCTS search to update current_node's children with visit statistics
+            self.search(current_node)
+            
+            # Select the best child based on visit counts
+            best_child = self._select_best_child(current_node, temperature=0)
+            if best_child is None or best_child.state.p_node_id == -1:
                 solution["place_result"] = False
                 break
             
-            solution["node_slots"].update({v_node_id: current_node.state.p_node_id})
+            # Store the action taken
+            solution["node_slots"].update({v_node_id: best_child.state.p_node_id})
             
-            # Create timestep data with all required information
-            timestep_data = self._create_timestep_data(current_node, v_node_id)
+            # Create timestep data using the current root (before moving to child)
+            timestep_data = self._create_timestep_data(current_node, v_node_id, best_child.state.p_node_id)
             trajectory.append(timestep_data)
+            
+            # Promote the best child as the new root for next iteration
+            # Detach from parent to avoid memory buildup
+            best_child.parent = None
+            current_node = best_child
 
         if solution.get("place_result", True):
             link_ok = self.controller.link_mapper.link_mapping(
@@ -103,8 +112,12 @@ class AlphaZeroActor(Solver):
     # AlphaZero MCTS Implementation
     # ------------------------------------------------------------------
     
-    def search(self, root_node: Node) -> Node:
-        """AlphaZero MCTS search that uses neural network guidance."""
+    def search(self, root_node: Node) -> None:
+        """AlphaZero MCTS search that uses neural network guidance.
+        
+        Performs simulations and updates the root node's children with visit statistics.
+        Does not return anything - the caller should select the best child afterwards.
+        """
         # If this is the first call, expand the root node
         if not root_node.children and not root_node.state.is_terminal():
             self._expand_node(root_node)
@@ -112,17 +125,6 @@ class AlphaZeroActor(Solver):
         # Run MCTS simulations
         for _ in range(self.computation_budget):
             self._run_simulation(root_node)
-        
-        # Select best child based on visit counts (no exploration)
-        best_child = self._select_best_child(root_node, temperature=0)
-        
-        if best_child is not None:
-            # Create a new root node for the next search step
-            # This represents the state after taking the selected action
-            next_state = best_child.state
-            return Node(None, next_state)
-        
-        return None
     
     def _run_simulation(self, root_node: Node) -> None:
         """Run a single MCTS simulation from root to leaf."""
@@ -138,12 +140,9 @@ class AlphaZeroActor(Solver):
         if not node.state.is_terminal():
             # Expand the node using neural network
             self._expand_node(node)
-            if node.children:
-                # Select a child to evaluate
-                node = random.choice(node.children)
-                path.append(node)
+            # Note: We evaluate the expanded leaf node itself, not a random child
         
-        # 3. Backup - propagate value up the path
+        # 3. Backup - propagate value from the leaf node up the path
         value = self._evaluate_leaf(node)
         self._backup(path, value)
     
@@ -223,15 +222,6 @@ class AlphaZeroActor(Solver):
             return torch.ones(len(node.children)) / max(len(node.children), 1)
         return visits / visits.sum()
 
-    def _policy_value(self, state: State) -> tuple[float, float]:
-        obs = self._state_to_obs(state)
-        with torch.no_grad():
-            logits = self.policy.act(obs)
-            value = self.policy.evaluate(obs)
-            prob = torch.softmax(logits, dim=-1)[0]
-        action_idx = state.p_node_id
-        prior = prob[action_idx].item() if action_idx < prob.numel() else 0.0
-        return prior, float(value.item())
 
     def _expand_node(self, node: Node) -> None:
         obs = self._state_to_obs(node.state)
@@ -315,7 +305,7 @@ class AlphaZeroActor(Solver):
             "sfc_request": sfc_request
         }
     
-    def _create_timestep_data(self, node: Node, v_node_id: int) -> dict:
+    def _create_timestep_data(self, node: Node, v_node_id: int, action_taken: int) -> dict:
         """Create timestep data with dynamic state, policy, value, and action info."""
         state = node.state
         
@@ -352,7 +342,7 @@ class AlphaZeroActor(Solver):
             "action_mask": action_mask,
             "policy": policy,
             "value": value,
-            "action_taken": state.p_node_id
+            "action_taken": action_taken
         }
     
     def _compute_policy_vector(self, node: Node) -> List[float]:
