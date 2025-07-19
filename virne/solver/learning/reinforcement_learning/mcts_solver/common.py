@@ -43,6 +43,7 @@ def state_to_obs(
     p_data=None,
     v_data=None,
     encoder_outputs=None,
+    v_node_id=None,
 ):
     """Build an observation dictionary for the given state."""
 
@@ -64,10 +65,13 @@ def state_to_obs(
         if 0 <= idx < p_data.num_nodes:
             hist[0, i + 1] = p_data.x[idx]
 
+    # Use provided v_node_id or default to next virtual node
+    target_v_node_id = v_node_id if v_node_id is not None else state.v_node_id + 1
+    
     candidate_nodes = controller.find_candidate_nodes(
         v_net=state.v_net,
         p_net=state.p_net,
-        v_node_id=state.v_node_id + 1,
+        v_node_id=target_v_node_id,
         filter=state.selected_p_net_nodes,
     )
     action_mask = torch.zeros(
@@ -84,9 +88,9 @@ def state_to_obs(
         "p_net": p_data,
         "history_features": hist,
         "encoder_outputs": encoder_outputs,
-        "curr_v_node_id": torch.tensor([state.v_node_id + 1], device=device),
+        "curr_v_node_id": torch.tensor([target_v_node_id], device=device),
         "vnfs_remaining": torch.tensor([
-            state.v_net.num_nodes - state.v_node_id - 1
+            state.v_net.num_nodes - target_v_node_id
         ], device=device),
         "action_mask": action_mask,
         "v_net_x": v_data.x.unsqueeze(0),

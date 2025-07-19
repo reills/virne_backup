@@ -209,4 +209,3 @@ class AlphaZeroLearner:
         state = State(p_net, v_net, self.controller, self.recorder, self.counter)
         
         return state
-EOF < /dev/null

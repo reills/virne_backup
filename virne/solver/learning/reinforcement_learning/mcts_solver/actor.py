@@ -38,7 +38,12 @@ class AlphaZeroActor(Solver):
         self.replay_dir = replay_dir
         self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
         os.makedirs(self.replay_dir, exist_ok=True)
-        # MCTS configuration parameters\n        self.computation_budget = kwargs.get('computation_budget', 50)  # More simulations for AlphaZero\n        self.c_puct = kwargs.get('c_puct', 1.0)  # PUCT exploration constant\n        # Link mapping parameters (inherited from MctsSolver)\n        self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')\n        self.k_shortest = kwargs.get('k_shortest', 10)
+        # MCTS configuration parameters
+        self.computation_budget = kwargs.get('computation_budget', 50)  # More simulations for AlphaZero
+        self.c_puct = kwargs.get('c_puct', 1.0)  # PUCT exploration constant
+        # Link mapping parameters (inherited from MctsSolver)
+        self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')
+        self.k_shortest = kwargs.get('k_shortest', 10)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy = ActorCritic(
@@ -76,7 +81,7 @@ class AlphaZeroActor(Solver):
 
         for v_node_id in range(v_net.num_nodes):
             # Run MCTS search to update current_node's children with visit statistics
-            self.search(current_node)
+            self.search(current_node, v_node_id)
             
             # Select the best child based on visit counts
             best_child = self._select_best_child(current_node, temperature=0)
@@ -112,7 +117,7 @@ class AlphaZeroActor(Solver):
     # AlphaZero MCTS Implementation
     # ------------------------------------------------------------------
     
-    def search(self, root_node: Node) -> None:
+    def search(self, root_node: Node, v_node_id: int) -> None:
         """AlphaZero MCTS search that uses neural network guidance.
         
         Performs simulations and updates the root node's children with visit statistics.
@@ -120,13 +125,13 @@ class AlphaZeroActor(Solver):
         """
         # If this is the first call, expand the root node
         if not root_node.children and not root_node.state.is_terminal():
-            self._expand_node(root_node)
+            self._expand_node(root_node, v_node_id)
         
         # Run MCTS simulations
         for _ in range(self.computation_budget):
-            self._run_simulation(root_node)
+            self._run_simulation(root_node, v_node_id)
     
-    def _run_simulation(self, root_node: Node) -> None:
+    def _run_simulation(self, root_node: Node, v_node_id: int) -> None:
         """Run a single MCTS simulation from root to leaf."""
         path = []
         node = root_node
@@ -139,11 +144,11 @@ class AlphaZeroActor(Solver):
         # 2. Expansion and Evaluation
         if not node.state.is_terminal():
             # Expand the node using neural network
-            self._expand_node(node)
+            self._expand_node(node, v_node_id)
             # Note: We evaluate the expanded leaf node itself, not a random child
         
         # 3. Backup - propagate value from the leaf node up the path
-        value = self._evaluate_leaf(node)
+        value = self._evaluate_leaf(node, v_node_id)
         self._backup(path, value)
     
     def _select_child_puct(self, node: Node) -> Node:
@@ -173,9 +178,9 @@ class AlphaZeroActor(Solver):
         
         return best_child if best_child else node.children[0]
     
-    def _evaluate_leaf(self, node: Node) -> float:
+    def _evaluate_leaf(self, node: Node, v_node_id: int) -> float:
         """Evaluate a leaf node using the neural network value head."""
-        obs = self._state_to_obs(node.state)
+        obs = self._state_to_obs(node.state, v_node_id)
         with torch.no_grad():
             value = self.policy.evaluate(obs)
         return float(value.item())
@@ -205,7 +210,11 @@ class AlphaZeroActor(Solver):
             return node.children[idx]
     
     # ------------------------------------------------------------------
-    def _state_to_obs(self, state: State) -> dict:
+    def _state_to_obs(self, state: State, v_node_id: int = None) -> dict:
+        # If v_node_id is not provided, use the next virtual node to place
+        if v_node_id is None:
+            v_node_id = state.v_node_id + 1
+        
         return state_to_obs(
             state,
             self.policy,
@@ -214,6 +223,7 @@ class AlphaZeroActor(Solver):
             p_data=self._p_data,
             v_data=self._v_data,
             encoder_outputs=self._encoder_outputs,
+            v_node_id=v_node_id,
         )
 
     def _compute_policy(self, node: Node) -> torch.Tensor:
@@ -223,8 +233,8 @@ class AlphaZeroActor(Solver):
         return visits / visits.sum()
 
 
-    def _expand_node(self, node: Node) -> None:
-        obs = self._state_to_obs(node.state)
+    def _expand_node(self, node: Node, v_node_id: int) -> None:
+        obs = self._state_to_obs(node.state, v_node_id)
         with torch.no_grad():
             logits = self.policy.act(obs)
             probs = torch.softmax(logits, dim=-1)[0]
@@ -325,7 +335,7 @@ class AlphaZeroActor(Solver):
         candidate_nodes = self.controller.find_candidate_nodes(
             v_net=state.v_net,
             p_net=state.p_net,
-            v_node_id=state.v_node_id + 1,
+            v_node_id=v_node_id,
             filter=state.selected_p_net_nodes,
         )
         action_mask = [False] * state.p_net.num_nodes
@@ -335,7 +345,7 @@ class AlphaZeroActor(Solver):
         
         # Get policy from MCTS visit counts and value from root
         policy = self._compute_policy_vector(node)
-        value = self._compute_value(node)
+        value = self._compute_value(node, v_node_id)
         
         return {
             "dynamic_state": dynamic_state,
@@ -363,11 +373,11 @@ class AlphaZeroActor(Solver):
         
         return policy
     
-    def _compute_value(self, node: Node) -> float:
+    def _compute_value(self, node: Node, v_node_id: int) -> float:
         """Compute value estimate from MCTS root node."""
         if node.visit_times == 0:
             # If no visits, get neural network value estimate
-            obs = self._state_to_obs(node.state)
+            obs = self._state_to_obs(node.state, v_node_id)
             with torch.no_grad():
                 value = self.policy.evaluate(obs)
             return float(value.item())

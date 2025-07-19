@@ -283,8 +283,15 @@ class AutoregressiveDecoder(nn.Module):
         node_features = batch_p_net.x.float()
         edge_index = batch_p_net.edge_index
         edge_attr = batch_p_net.edge_attr
-        node_batch = batch_p_net.batch
-        B = batch_p_net.num_graphs
+        
+        # Handle both single graphs and batches
+        if hasattr(batch_p_net, 'batch') and batch_p_net.batch is not None:
+            node_batch = batch_p_net.batch
+            B = batch_p_net.num_graphs if hasattr(batch_p_net, 'num_graphs') else 1
+        else:
+            # Single graph case
+            node_batch = torch.zeros(batch_p_net.num_nodes, dtype=torch.long, device=batch_p_net.x.device)
+            B = 1
 
         # Apply GAT layers
         for gat_layer in self.gat_layers:
