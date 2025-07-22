@@ -43,7 +43,8 @@ class AlphaZeroSFCSolver(Solver):
             **kwargs,
         )
         self.learner_process: Optional[Process] = None
-        self._num_train_steps = kwargs.get("num_train_steps_per_epoch", 100)
+        self._num_train_steps = getattr(config.training, "num_train_steps_per_epoch", 100)
+        self._num_games_per_epoch = getattr(config.training, "num_games_per_epoch", 20)
 
     # ------------------------------------------------------------------
     def _learner_loop(self) -> None:
@@ -98,14 +99,17 @@ class AlphaZeroSFCSolver(Solver):
         return self.actor.solve(instance)
 
     def learn(self, env, num_epochs: int, start_epoch: int = 0, **kwargs) -> None:
-        self._num_train_steps = kwargs.get("num_train_steps_per_epoch", self._num_train_steps)
-        num_games = kwargs.get("num_games_per_epoch", 50)
         self._start_learner()
 
-        for _ in range(start_epoch, num_epochs):
-            for _ in range(num_games):
+        for epoch in range(start_epoch, num_epochs):
+            print(f"AlphaZero Learning Epoch {epoch + 1}/{num_epochs}")
+            for game in range(self._num_games_per_epoch):
                 instance = env.reset()
-                self.solve(instance)
+                solution = self.solve(instance)
+                if (game + 1) % 5 == 0:
+                    result = solution.get("result", False)
+                    print(f"  Game {game + 1}/{self._num_games_per_epoch}: {'SUCCESS' if result else 'FAILED'}")
+            print(f"  Completed {self._num_games_per_epoch} games for epoch {epoch + 1}")
 
     def close(self) -> None:
         if self.learner_process is not None:

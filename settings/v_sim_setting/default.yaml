@@ -16,7 +16,7 @@ v_net_size:
 arrival_rate:
   distribution: poisson
   dtype: float
-  lam: 0.04
+  lam: 0.03
   reciprocal: true
 
 lifetime:

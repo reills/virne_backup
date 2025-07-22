@@ -38,9 +38,9 @@ class AlphaZeroActor(Solver):
         self.replay_dir = replay_dir
         self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
         os.makedirs(self.replay_dir, exist_ok=True)
-        # MCTS configuration parameters
-        self.computation_budget = kwargs.get('computation_budget', 50)  # More simulations for AlphaZero
-        self.c_puct = kwargs.get('c_puct', 1.0)  # PUCT exploration constant
+        # MCTS configuration parameters from config
+        self.computation_budget = getattr(config.training, 'computation_budget', 50)
+        self.c_puct = getattr(config.training, 'c_puct', 1.0)
         # Link mapping parameters (inherited from MctsSolver)
         self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')
         self.k_shortest = kwargs.get('k_shortest', 10)

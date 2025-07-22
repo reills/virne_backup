@@ -14,8 +14,8 @@ node_attrs_setting:
     distribution: uniform
     dtype: int
     generative: true
-    high: 100
-    low: 50
+    high: 120
+    low: 80
   - name: max_cpu
     type: extrema
     owner: node
