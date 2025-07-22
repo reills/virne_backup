@@ -52,8 +52,26 @@ class AlphaZeroActor(Solver):
             v_net_feature_dim=config.simulation.v_sim_setting_num_node_resource_attrs,
             p_net_edge_dim=config.simulation.p_net_setting_num_link_resource_attrs,
         ).to(self.device)
-        if os.path.exists(self.policy_path):
+        
+        # Load pretrained weights if specified (same logic as learner)
+        model_loaded = False
+        alphazero_model_path = getattr(config.training, 'alphazero_model_path', '')
+        resume_training = getattr(config.training, 'resume_training', True)
+        
+        # Priority 1: Specific model path
+        if alphazero_model_path and os.path.exists(alphazero_model_path):
+            self.policy.load_state_dict(torch.load(alphazero_model_path, map_location=self.device))
+            self.logger.info(f"Actor loaded AlphaZero model from: {alphazero_model_path}")
+            model_loaded = True
+        # Priority 2: Resume from latest policy
+        elif resume_training and os.path.exists(self.policy_path):
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
+            self.logger.info(f"Actor resumed from: {self.policy_path}")
+            model_loaded = True
+        
+        if not model_loaded:
+            self.logger.info("Actor starting from scratch (no pretrained model loaded)")
+            
         self.policy.eval()
 
         # Caches used during one solve episode

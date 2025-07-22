@@ -39,14 +39,34 @@ class AlphaZeroLearner:
             v_net_feature_dim=config.simulation.v_sim_setting_num_node_resource_attrs,
             p_net_edge_dim=config.simulation.p_net_setting_num_link_resource_attrs,
         ).to(self.device)
-        if os.path.exists(self.policy_path):
+        
+        # Load pretrained weights if specified
+        model_loaded = False
+        alphazero_model_path = getattr(config.training, 'alphazero_model_path', '')
+        resume_training = getattr(config.training, 'resume_training', True)
+        
+        # Priority 1: Specific model path
+        if alphazero_model_path and os.path.exists(alphazero_model_path):
+            self.policy.load_state_dict(torch.load(alphazero_model_path, map_location=self.device))
+            logger.info(f"Loaded AlphaZero model from: {alphazero_model_path}")
+            model_loaded = True
+        # Priority 2: Resume from latest policy
+        elif resume_training and os.path.exists(self.policy_path):
             self.policy.load_state_dict(torch.load(self.policy_path, map_location=self.device))
+            logger.info(f"Resumed training from: {self.policy_path}")
+            model_loaded = True
+        
+        if not model_loaded:
+            logger.info("Starting training from scratch (no pretrained model loaded)")
+            
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
 
     # ------------------------------------------------------------------
     def train_steps(self, num_steps: int) -> None:
         self.policy.train()
-        for _ in range(num_steps):
+        save_interval = getattr(self.config.training, 'save_interval', 10)
+        
+        for step in range(num_steps):
             batch = self._load_and_prepare_batch()
             if batch is None:
                 print("Replay buffer is not large enough to start training. Skipping step.")
@@ -72,6 +92,13 @@ class AlphaZeroLearner:
 
             total_loss.backward()
             self.optimizer.step()
+            
+            # Save model periodically
+            if (step + 1) % save_interval == 0:
+                torch.save(self.policy.state_dict(), self.policy_path)
+                print(f"Model saved at step {step + 1}, policy_loss: {loss_policy:.4f}, value_loss: {loss_value:.4f}")
+        
+        # Always save at the end
         torch.save(self.policy.state_dict(), self.policy_path)
 
     # ------------------------------------------------------------------

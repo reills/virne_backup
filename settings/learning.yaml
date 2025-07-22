@@ -13,6 +13,13 @@ training:
   model_dir_name: models
   weight_decay: 0.00001
   if_use_random_training_seed: true
+  # MCTS/AlphaZero specific settings
+  max_training_steps: 5000  # Total training steps before termination
+  min_buffer_size: 50       # Minimum replay buffer size to start training
+  num_train_steps_per_epoch: 50  # Training steps per batch
+  # Model loading options
+  resume_training: true     # If true, load policy_latest.pt if it exists
+  alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)
 
 inference:
   decode_strategy: greedy

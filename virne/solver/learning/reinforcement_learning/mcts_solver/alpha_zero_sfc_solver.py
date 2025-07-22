@@ -56,8 +56,32 @@ class AlphaZeroSFCSolver(Solver):
             replay_dir=self.replay_dir,
             batch_size=self.batch_size,
         )
-        while True:
+        
+        # Get termination conditions from config
+        max_training_steps = getattr(self.config.training, 'max_training_steps', 10000)
+        min_buffer_size = getattr(self.config.training, 'min_buffer_size', 100)
+        
+        total_steps = 0
+        consecutive_empty_batches = 0
+        max_empty_batches = 50  # Stop if no data for 50 consecutive attempts
+        
+        while total_steps < max_training_steps:
+            # Check if we have enough data to train
+            replay_files = [f for f in os.listdir(self.replay_dir) if f.endswith('.json')]
+            if len(replay_files) < min_buffer_size:
+                consecutive_empty_batches += 1
+                if consecutive_empty_batches > max_empty_batches:
+                    print(f"Stopping learner: insufficient data for {max_empty_batches} attempts")
+                    break
+                import time
+                time.sleep(1)  # Wait for more data
+                continue
+            
+            consecutive_empty_batches = 0
             learner.train_steps(self._num_train_steps)
+            total_steps += self._num_train_steps
+            
+        print(f"Learner terminated after {total_steps} training steps")
 
     def _start_learner(self) -> None:
         if self.learner_process is not None and self.learner_process.is_alive():
