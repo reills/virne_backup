@@ -114,7 +114,7 @@ class AlphaZeroSFCSolver(RLSolver):
         
         total_steps = 0
         consecutive_empty_batches = 0
-        max_empty_batches = 50  # Stop if no data for 50 consecutive attempts
+        max_empty_batches = getattr(self.config.training, 'max_empty_batches', 50)
         
         while total_steps < max_training_steps:
             # Check if we have enough data to train
@@ -122,7 +122,7 @@ class AlphaZeroSFCSolver(RLSolver):
             if len(replay_files) < min_buffer_size:
                 consecutive_empty_batches += 1
                 if consecutive_empty_batches > max_empty_batches:
-                    print(f"Stopping learner: insufficient data for {max_empty_batches} attempts")
+                    self.logger.warning(f"Stopping learner: insufficient data for {max_empty_batches} attempts")
                     break
                 import time
                 time.sleep(1)  # Wait for more data
@@ -132,7 +132,7 @@ class AlphaZeroSFCSolver(RLSolver):
             learner.train_steps(self._num_train_steps)
             total_steps += self._num_train_steps
             
-        print(f"Learner terminated after {total_steps} training steps")
+        self.logger.info(f"Learner terminated after {total_steps} training steps")
 
     def _start_learner(self) -> None:
         if self.learner_process is not None and self.learner_process.is_alive():
@@ -181,54 +181,8 @@ class AlphaZeroSFCSolver(RLSolver):
 
     def _node_mapping_with_mcts(self, v_net, p_net, solution):
         """Use MCTS to determine node mappings, then use controller to place them."""
-        from virne.solver.learning.utils import load_pyg_data_from_network
-
-        # Prepare data for neural network
-        self.actor._p_data = load_pyg_data_from_network(p_net).to(self.actor.device)
-        self.actor._v_data = load_pyg_data_from_network(v_net).to(self.actor.device)
-        self.actor._encoder_outputs = self.actor.policy.encode({"v_net_x": self.actor._v_data.x.unsqueeze(0)})
-
-        # Create initial state
-        current_node = Node(None, State(p_net, v_net, self.controller, self.recorder, self.counter))
-        
-        # Generate training data for this episode
-        static_environment = self.actor._create_static_environment(p_net, v_net)
-        trajectory = []
-
-        # Use MCTS to decide placement for each virtual node
-        for v_node_id in range(v_net.num_nodes):
-            # Run MCTS search to get the best physical node for this virtual node
-            self.actor.search(current_node, v_node_id)
-            
-            # Select the best child based on visit counts
-            best_child = self.actor._select_best_child(current_node, temperature=0)
-            if best_child is None or best_child.state.p_node_id == -1:
-                return False
-                
-            p_node_id = best_child.state.p_node_id
-            
-            # Use the controller to actually place the node (standard VNE way)
-            place_result, place_info = self.controller.node_mapper.place(
-                v_net, p_net, v_node_id, p_node_id, solution=solution
-            )
-            
-            if not place_result:
-                return False
-                
-            # Store trajectory data for learning
-            timestep_data = self.actor._create_timestep_data(current_node, v_node_id, p_node_id)
-            trajectory.append(timestep_data)
-            
-            # Move to the next state
-            best_child.parent = None
-            current_node = best_child
-
-        # Store episode for learning
-        final_reward = self.actor._compute_final_reward(solution, v_net, p_net)
-        self.actor._store_episode_new_format(static_environment, trajectory, final_reward)
-        self.actor._cleanup()
-        
-        return True
+        # Delegate to actor's consolidated solve method
+        return self.actor.solve_vnr_with_mcts(v_net, p_net, solution, self.controller)
 
     def learn(self, env, num_epochs: int, start_epoch: int = 0, **kwargs) -> None:
         """
@@ -241,8 +195,8 @@ class AlphaZeroSFCSolver(RLSolver):
             start_epoch: Starting epoch (for resuming)
         """
         total_vnrs = env.v_net_simulator.v_sim_setting['num_v_nets']  # Gets from config
-        print(f"AlphaZero Training: {num_epochs} epochs x {total_vnrs} VNRs each")
-        print(f"Using distributed_training: {self.config.training.distributed_training}, num_workers: {self.config.training.num_workers}")
+        self.logger.info(f"AlphaZero Training: {num_epochs} epochs x {total_vnrs} VNRs each")
+        self.logger.info(f"Using distributed_training: {self.config.training.distributed_training}, num_workers: {self.config.training.num_workers}")
         
         self._start_learner()
         
@@ -252,8 +206,8 @@ class AlphaZeroSFCSolver(RLSolver):
         else:
             self.learn_singly(env, num_epochs, **kwargs)
         
-        print(f"Training completed! Model saved to {self.policy_path}")
-        print(f"Now ready for evaluation phase (num_simulations = inference-only runs)")
+        self.logger.info(f"Training completed! Model saved to {self.policy_path}")
+        self.logger.info(f"Now ready for evaluation phase (num_simulations = inference-only runs)")
 
     def learn_singly(self, env, num_epochs: int, **kwargs) -> None:
         """Single-worker training: one worker processes all epochs sequentially."""
@@ -268,7 +222,7 @@ class AlphaZeroSFCSolver(RLSolver):
         writer = SummaryWriter(tb_log_dir)
         
         for epoch in range(num_epochs):
-            print(f"Training Epoch {epoch + 1}/{num_epochs} - Processing {total_vnrs} VNRs")
+            self.logger.info(f"Training Epoch {epoch + 1}/{num_epochs} - Processing {total_vnrs} VNRs")
             
             # Reset metrics tracking
             epoch_metrics = {
@@ -334,19 +288,19 @@ class AlphaZeroSFCSolver(RLSolver):
             
             # Print epoch summary with canary metrics
             print("=" * 80)
-            print(f"EPOCH {epoch + 1}/{num_epochs} SUMMARY")
+            self.logger.info(f"EPOCH {epoch + 1}/{num_epochs} SUMMARY")
             print("=" * 80)
-            print(f"VNE Performance:")
-            print(f"   Acceptance Rate: {acceptance_rate:.1f}% ({epoch_metrics['accepted']}/{vnr_count})")
-            print(f"   Avg Revenue:     {avg_revenue:.2f}")
-            print(f"   Avg Cost:        {avg_cost:.2f}")
-            print(f"   R/C Ratio:       {rc_ratio:.2f}")
-            print(f"Training Data:")
-            print(f"   Episodes Added:  {new_episodes}")
-            print(f"   Buffer Size:     {episode_files_after}")
+            self.logger.info(f"VNE Performance:")
+            self.logger.info(f"   Acceptance Rate: {acceptance_rate:.1f}% ({epoch_metrics['accepted']}/{vnr_count})")
+            self.logger.info(f"   Avg Revenue:     {avg_revenue:.2f}")
+            self.logger.info(f"   Avg Cost:        {avg_cost:.2f}")
+            self.logger.info(f"   R/C Ratio:       {rc_ratio:.2f}")
+            self.logger.info(f"Training Data:")
+            self.logger.info(f"   Episodes Added:  {new_episodes}")
+            self.logger.info(f"   Buffer Size:     {episode_files_after}")
             
             # Get learner stats if available
-            print(f"Neural Network: Training in background...")
+            self.logger.info(f"Neural Network: Training in background...")
             
             # Health check warnings
             warnings = []
@@ -362,7 +316,7 @@ class AlphaZeroSFCSolver(RLSolver):
             if warnings:
                 print("HEALTH WARNINGS:")
                 for warning in warnings:
-                    print(f"   {warning}")
+                    self.logger.warning(f"   {warning}")
             else:
                 print("All metrics look healthy!")
                 
@@ -381,9 +335,9 @@ class AlphaZeroSFCSolver(RLSolver):
         epochs_per_worker = num_epochs // self.num_workers
         total_vnrs = env.v_net_simulator.v_sim_setting['num_v_nets']
         
-        print(f"Distributed Training: {self.num_workers} workers x {epochs_per_worker} epochs each")
-        print(f"Each worker processes: {epochs_per_worker} x {total_vnrs} = {epochs_per_worker * total_vnrs} VNRs")
-        print(f"All workers share replay buffer: {self.replay_dir}")
+        self.logger.info(f"Distributed Training: {self.num_workers} workers x {epochs_per_worker} epochs each")
+        self.logger.info(f"Each worker processes: {epochs_per_worker} x {total_vnrs} = {epochs_per_worker * total_vnrs} VNRs")
+        self.logger.info(f"All workers share replay buffer: {self.replay_dir}")
         
         # Start the learner process (shared across all workers)
         self._start_learner()
@@ -403,66 +357,16 @@ class AlphaZeroSFCSolver(RLSolver):
             )
             processes.append(process)
             process.start()
-            print(f"Started worker {worker_id} (PID: {process.pid})")
+            self.logger.debug(f"Started worker {worker_id} (PID: {process.pid})")
         
         # Wait for all workers to complete
         for i, process in enumerate(processes):
             process.join()
-            print(f"Worker {i} completed")
+            self.logger.debug(f"Worker {i} completed")
             
         print("All workers completed. Training finished!")
 
-def _solve_vnr_with_mcts_worker(actor, controller, v_net, p_net, solution):
-    """MCTS VNR solving for worker processes with episode storage."""
-    from virne.solver.learning.utils import load_pyg_data_from_network
-    from virne.solver.learning.reinforcement_learning.mcts_solver.mcts import Node, State
-    
-    # Prepare data for neural network
-    actor._p_data = load_pyg_data_from_network(p_net).to(actor.device)
-    actor._v_data = load_pyg_data_from_network(v_net).to(actor.device)
-    actor._encoder_outputs = actor.policy.encode({"v_net_x": actor._v_data.x.unsqueeze(0)})
-
-    # Create initial state
-    current_node = Node(None, State(p_net, v_net, controller, actor.recorder, actor.counter))
-    
-    # Generate training data for this episode
-    static_environment = actor._create_static_environment(p_net, v_net)
-    trajectory = []
-
-    # Use MCTS to decide placement for each virtual node
-    for v_node_id in range(v_net.num_nodes):
-        # Run MCTS search to get the best physical node for this virtual node
-        actor.search(current_node, v_node_id)
-        
-        # Select the best child based on visit counts
-        best_child = actor._select_best_child(current_node, temperature=0)
-        if best_child is None or best_child.state.p_node_id == -1:
-            return False
-            
-        p_node_id = best_child.state.p_node_id
-        
-        # Use the controller to actually place the node (standard VNE way)
-        place_result, place_info = controller.node_mapper.place(
-            v_net, p_net, v_node_id, p_node_id, solution=solution
-        )
-        
-        if not place_result:
-            return False
-            
-        # Store trajectory data for learning
-        timestep_data = actor._create_timestep_data(current_node, v_node_id, p_node_id)
-        trajectory.append(timestep_data)
-        
-        # Move to the next state
-        best_child.parent = None
-        current_node = best_child
-
-    # Store episode for learning
-    final_reward = actor._compute_final_reward(solution, v_net, p_net)
-    actor._store_episode_new_format(static_environment, trajectory, final_reward)
-    actor._cleanup()
-    
-    return True
+# Removed: _solve_vnr_with_mcts_worker - consolidated into actor.solve_vnr_with_mcts
 
 def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, replay_dir: str, policy_path: str) -> None:
     """Training loop for a single worker process."""
@@ -539,7 +443,7 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
                 )
             
             # Use MCTS to solve this VNR - simplified version for worker
-            node_mapping_result = _solve_vnr_with_mcts_worker(worker_actor, controller, v_net, p_net, solution)
+            node_mapping_result = worker_actor.solve_vnr_with_mcts(v_net, p_net, solution, controller)
             
             if node_mapping_result:
                 # Standard link mapping using the controller

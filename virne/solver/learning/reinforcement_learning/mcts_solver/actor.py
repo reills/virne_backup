@@ -78,7 +78,7 @@ class AlphaZeroActor(Solver):
             model_loaded = True
         
         if not model_loaded:
-            # self.logger.info("Actor starting from scratch (no pretrained model loaded)")
+            self.logger.info("Actor starting from scratch (no pretrained model loaded)")
             
         self.policy.eval()
 
@@ -421,5 +421,56 @@ class AlphaZeroActor(Solver):
     def _serialize_state(self, state: State) -> dict:
         """Legacy method for backward compatibility."""
         return serialize_state(state)
+    
+    def solve_vnr_with_mcts(self, v_net, p_net, solution, controller):
+        """Consolidated MCTS VNR solving method used by both solver and workers."""
+        from virne.solver.learning.utils import load_pyg_data_from_network
+
+        # Prepare data for neural network
+        self._p_data = load_pyg_data_from_network(p_net).to(self.device)
+        self._v_data = load_pyg_data_from_network(v_net).to(self.device)
+        self._encoder_outputs = self.policy.encode({"v_net_x": self._v_data.x.unsqueeze(0)})
+
+        # Create initial state
+        current_node = Node(None, State(p_net, v_net, controller, self.recorder, self.counter))
+        
+        # Generate training data for this episode
+        static_environment = self._create_static_environment(p_net, v_net)
+        trajectory = []
+
+        # Use MCTS to decide placement for each virtual node
+        for v_node_id in range(v_net.num_nodes):
+            # Run MCTS search to get the best physical node for this virtual node
+            self.search(current_node, v_node_id)
+            
+            # Select the best child based on visit counts
+            best_child = self._select_best_child(current_node, temperature=0)
+            if best_child is None or best_child.state.p_node_id == -1:
+                return False
+                
+            p_node_id = best_child.state.p_node_id
+            
+            # Use the controller to actually place the node (standard VNE way)
+            place_result, place_info = controller.node_mapper.place(
+                v_net, p_net, v_node_id, p_node_id, solution=solution
+            )
+            
+            if not place_result:
+                return False
+                
+            # Store trajectory data for learning
+            timestep_data = self._create_timestep_data(current_node, v_node_id, p_node_id)
+            trajectory.append(timestep_data)
+            
+            # Move to the next state
+            best_child.parent = None
+            current_node = best_child
+
+        # Store episode for learning
+        final_reward = self._compute_final_reward(solution, v_net, p_net)
+        self._store_episode_new_format(static_environment, trajectory, final_reward)
+        self._cleanup()
+        
+        return True
 
 

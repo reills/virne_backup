@@ -68,7 +68,8 @@ class AlphaZeroLearner:
         if not model_loaded:
             logger.info("Starting training from scratch (no pretrained model loaded)")
             
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
+        learning_rate = getattr(config.training, 'policy_learning_rate', 1e-4)
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=learning_rate)
         
         # TensorBoard logging
         from virne.utils.config import get_run_id_dir
@@ -165,6 +166,7 @@ class AlphaZeroLearner:
 
     # ------------------------------------------------------------------
     def _load_and_prepare_batch(self):
+        """Load and prepare a batch of training data from replay buffer."""
         all_files = [f for f in os.listdir(self.replay_dir) if f.endswith('.json')]
         if len(all_files) < self.batch_size:
             return None
@@ -178,37 +180,25 @@ class AlphaZeroLearner:
             with open(os.path.join(self.replay_dir, fname), 'r') as f:
                 data = json.load(f)
             
-            # Check if it's new format or legacy format
-            if 'static_environment' in data:
-                # New format: reconstruct full state from static + dynamic components
-                trajectory = data.get('trajectory', [])
-                if not trajectory:
-                    continue
+            # Process standardized episode format
+            trajectory = data.get('trajectory', [])
+            if not trajectory:
+                continue
+            
+            # Sample a random timestep from the trajectory
+            step = random.choice(trajectory)
+            
+            # Extract training data (already in correct format from actor)
+            obs = step.get('observation')
+            target_policy = step.get('policy') 
+            target_value = step.get('value')
+            
+            if obs is None or target_policy is None or target_value is None:
+                continue
                 
-                step = random.choice(trajectory)
-                static_env = data['static_environment']
-                dynamic_state = step['dynamic_state']
-                
-                # Reconstruct the full network state for this timestep
-                state = self._reconstruct_state_from_components(static_env, dynamic_state)
-                obs = self._state_to_obs(state)
-                obs_list.append(obs)
-                
-                # Use the policy and value from MCTS
-                batch_policies.append(torch.tensor(step['policy'], dtype=torch.float32))
-                batch_values.append(torch.tensor(step['value'], dtype=torch.float32))
-            else:
-                # Legacy format: deserialize full state
-                trajectory = data.get('trajectory', [])
-                if not trajectory:
-                    continue
-                
-                step = random.choice(trajectory)
-                state = self._deserialize_state(step['state'])
-                obs = self._state_to_obs(state)
-                obs_list.append(obs)
-                batch_policies.append(torch.tensor(step['policy'], dtype=torch.float32))
-                batch_values.append(torch.tensor(data['outcome'], dtype=torch.float32))
+            obs_list.append(obs)
+            batch_policies.append(torch.tensor(target_policy, dtype=torch.float32))
+            batch_values.append(torch.tensor(target_value, dtype=torch.float32))
 
         if not obs_list:
             return None

@@ -17,9 +17,12 @@ training:
   max_training_steps: 8000  # Total training steps before termination
   min_buffer_size: 50       # Minimum replay buffer size to start training
   num_train_steps_per_epoch: 20  # Training steps per batch
+  max_empty_batches: 50     # Stop if no data for N consecutive attempts
   # MCTS parameters for AlphaZero
   computation_budget: 20    # More MCTS simulations per decision
   c_puct: 1.4               # Higher exploration for complex space
+  # Learning parameters
+  policy_learning_rate: 1e-4  # Learning rate for policy network
   # Model loading options
   resume_training: true     # If true, load policy_latest.pt if it exists
   alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)
