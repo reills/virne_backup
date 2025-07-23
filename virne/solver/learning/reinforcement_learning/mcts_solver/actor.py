@@ -33,11 +33,19 @@ class AlphaZeroActor(Solver):
     """Actor process that generates trajectories using MCTS."""
 
     def __init__(self, controller, recorder, counter, logger, config,
-                 replay_dir: str = "replay_buffer", **kwargs):
+                 replay_dir: str = "replay_buffer", models_dir: str = None, **kwargs):
         super().__init__(controller, recorder, counter, logger, config, **kwargs)
         self.replay_dir = replay_dir
-        self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
+        
+        # Policy path should be in models directory, not replay buffer
+        if models_dir:
+            self.policy_path = os.path.join(models_dir, "policy_latest.pt")
+        else:
+            self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
+            
         os.makedirs(self.replay_dir, exist_ok=True)
+        if models_dir:
+            os.makedirs(models_dir, exist_ok=True)
         # MCTS configuration parameters from config
         self.computation_budget = getattr(config.training, 'computation_budget', 50)
         self.c_puct = getattr(config.training, 'c_puct', 1.0)
@@ -70,7 +78,7 @@ class AlphaZeroActor(Solver):
             model_loaded = True
         
         if not model_loaded:
-            self.logger.info("Actor starting from scratch (no pretrained model loaded)")
+            # self.logger.info("Actor starting from scratch (no pretrained model loaded)")
             
         self.policy.eval()
 

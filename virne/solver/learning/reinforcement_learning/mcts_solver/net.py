@@ -48,7 +48,7 @@ class MultiHeadGENLayer(nn.Module):
 # --- ActorCritic Model ---
 class ActorCritic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, v_net_feature_dim,
-                 embedding_dim=100, n_heads=5, n_layers=4, dropout=0.1,
+                 embedding_dim=128, n_heads=8, n_layers=4, dropout=0.1,
                  p_net_edge_dim=1, **kwargs):
         super().__init__()
         
@@ -80,7 +80,7 @@ class ActorCritic(nn.Module):
 
 # --- Encoder Module ---
 class Encoder(nn.Module):
-    def __init__(self, v_net_feature_dim, embedding_dim=100, n_heads=5, n_layers=4, dropout=0.1, max_seq_len=15):
+    def __init__(self, v_net_feature_dim, embedding_dim=128, n_heads=8, n_layers=4, dropout=0.1, max_seq_len=15):
         super().__init__()
         
         self.token_embed = nn.Linear(v_net_feature_dim, embedding_dim)
@@ -114,8 +114,8 @@ class Encoder(nn.Module):
 
 # --- Actor Module ---
 class Actor(nn.Module):
-    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
-                 n_heads=5, n_layers=4, dropout=0.1, **kwargs):
+    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
+                 n_heads=8, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
         # Retrieve special action flags from kwargs
         # Extract p_net_edge_dim from kwargs to avoid duplicate parameter
@@ -137,8 +137,8 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
-                 n_heads=5, n_layers=4, dropout=0.1, **kwargs):
+    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
+                 n_heads=8, n_layers=4, dropout=0.1, **kwargs):
         super().__init__()
         self.p_net_feature_dim = p_net_feature_dim
         self.embedding_dim = embedding_dim
@@ -188,8 +188,8 @@ class AutoregressiveDecoder(nn.Module):
     Transformer-based decoder for autoregressive action selection in SFC placement.
     Computes per-node placement logits and context-based special action logits (revoke/reject).
     """
-    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=100,
-                 n_heads=5, n_layers=4, dropout=0.1, is_actor=True,
+    def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
+                 n_heads=8, n_layers=4, dropout=0.1, is_actor=True,
                  allow_revocable=False, allow_rejection=False, use_amp=False, max_seq_len=15,
                  p_net_edge_dim=1):
         super().__init__()

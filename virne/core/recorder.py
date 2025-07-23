@@ -54,7 +54,7 @@ class Recorder:
             Save the records.
     """
     # def __init__(self, counter, summary_dir='save/', save_dir='save/', if_temp_save_records=True, config={}, **kwargs) -> None:
-    def __init__(self, counter, config) -> None:
+    def __init__(self, counter, config, worker_id=None) -> None:
         """
         Initialize the recorder.
 
@@ -78,6 +78,9 @@ class Recorder:
         self.summary_dir = os.path.join(self.save_root_dir, solver_name, self.run_id)
         self.record_dir = os.path.join(self.save_root_dir, solver_name, self.run_id, self.record_dir_name)
         os.makedirs(self.record_dir, exist_ok=True)
+        
+        # Store worker_id for temp file naming
+        self.worker_id = worker_id
         self.reset()
 
     def reset(self) -> None:
@@ -99,13 +102,18 @@ class Recorder:
             'num_running_p_net_nodes': 0
         }
         if self.if_temp_save_records:
-            suffixes = 0
-            available_fname = False
-            while not available_fname:
-                temp_save_path = os.path.join(self.record_dir , f'temp-{suffixes}.csv')
-                suffixes += 1
-                if not os.path.exists(temp_save_path):
-                    available_fname = True
+            if self.worker_id is not None:
+                # Use worker_id for parallel workers to avoid conflicts
+                temp_save_path = os.path.join(self.record_dir, f'temp-worker-{self.worker_id}.csv')
+            else:
+                # Original logic for single worker
+                suffixes = 0
+                available_fname = False
+                while not available_fname:
+                    temp_save_path = os.path.join(self.record_dir, f'temp-{suffixes}.csv')
+                    suffixes += 1
+                    if not os.path.exists(temp_save_path):
+                        available_fname = True
             self.temp_save_path = temp_save_path
             self.written_temp_header = False
 

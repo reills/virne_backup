@@ -2,10 +2,10 @@ training:
   seed: null
   use_cuda: true
   gpu_id: 0
-  distributed_training: false
-  num_train_epochs: 50
+  distributed_training: true
+  num_train_epochs: 20
   num_workers: 4
-  batch_size: 64
+  batch_size: 32
   log_interval: 1
   save_interval: 50
   eval_interval: 10
@@ -14,13 +14,12 @@ training:
   weight_decay: 0.00001
   if_use_random_training_seed: true
   # MCTS/AlphaZero specific settings
-  max_training_steps: 15000  # Total training steps before termination
-  min_buffer_size: 100       # Minimum replay buffer size to start training
-  num_train_steps_per_epoch: 100  # Training steps per batch
+  max_training_steps: 8000  # Total training steps before termination
+  min_buffer_size: 50       # Minimum replay buffer size to start training
+  num_train_steps_per_epoch: 20  # Training steps per batch
   # MCTS parameters for AlphaZero
-  computation_budget: 100    # More MCTS simulations per decision
+  computation_budget: 20    # More MCTS simulations per decision
   c_puct: 1.4               # Higher exploration for complex space
-  num_games_per_epoch: 20   # Games to play per epoch before training
   # Model loading options
   resume_training: true     # If true, load policy_latest.pt if it exists
   alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)

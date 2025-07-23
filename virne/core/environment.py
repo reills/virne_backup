@@ -117,7 +117,7 @@ class BaseEnvironment:
             self.logger.critical(f'Virtual networks: Load them from {self.v_nets_dataset_dir}')
         else: 
             self.v_net_simulator.renew(v_nets=True, events=True, seed=seed)
-            self.logger.critical(f'Virtual networks: Generate them with seed {seed}')
+            # self.logger.critical(f'Virtual networks: Generate them with seed {seed}')
         self.cumulative_reward: float = 0
         self.num_processed_v_nets: int = 0
         self.start_run_time: float = time.time()

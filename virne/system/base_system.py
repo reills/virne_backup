@@ -76,7 +76,7 @@ class BaseSystem:
             system = TimeWindowSystem(env, solver, logger, counter, controller, recorder, config)
         else:
             system = OnlineSystem(env, solver, logger, counter, controller, recorder, config)
-        system.logger.info(f'Config:\n{pprint.pformat(OmegaConf.to_container(config, resolve=True))}')
+        # system.logger.info(f'Config:\n{pprint.pformat(OmegaConf.to_container(config, resolve=True))}')
         system.save_system(config)
         return system
 
@@ -103,14 +103,14 @@ class BaseSystem:
         config: DictConfig,
     ) -> Tuple[PhysicalNetwork, VirtualNetworkRequestSimulator]:
         p_net_dataset_dir = config.simulation.p_net_dataset_dir
-        logger.info(f'Dataset Dir of Physical Network: {p_net_dataset_dir}')
-        logger.info(f'Fix seed: {config.experiment.seed}')
+        # logger.info(f'Dataset Dir of Physical Network: {p_net_dataset_dir}')
+        # logger.info(f'Fix seed: {config.experiment.seed}')
         if os.path.exists(p_net_dataset_dir) and config.experiment.if_load_p_net:
             p_net = PhysicalNetwork.load_dataset(p_net_dataset_dir)
             logger.critical(f'Physical Network: Loaded from {p_net_dataset_dir}')
         else:
             p_net = PhysicalNetwork.from_setting(config.p_net_setting, seed=config.experiment.seed)
-            logger.critical(f'Physical Network: Regenerate it from setting')
+            # logger.critical(f'Physical Network: Regenerate it from setting')
         with open_dict(config):
             config.p_net_setting.topology.num_nodes = p_net.num_nodes
             config.simulation.p_net_num_nodes = p_net.num_nodes
