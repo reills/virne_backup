@@ -2,8 +2,8 @@
 .vscode
 
 #datasets
-outputs/*
-results/replay_buffer/*
+results/*
+outputs/* 
 dataset/
 poisson_test/
 dataset/results*
