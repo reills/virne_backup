@@ -139,13 +139,13 @@ class AlphaZeroLearner:
             
             # Save model periodically
             if (step + 1) % save_interval == 0:
-                torch.save(self.policy.state_dict(), self.policy_path)
+                self._save_model_atomically()
                 avg_policy_loss = sum(epoch_losses['policy'][-save_interval:]) / min(save_interval, len(epoch_losses['policy']))
                 avg_value_loss = sum(epoch_losses['value'][-save_interval:]) / min(save_interval, len(epoch_losses['value']))
                 self.logger.info(f"Learner Step {self.global_step}: Policy={avg_policy_loss:.4f}, Value={avg_value_loss:.4f}")
         
         # Always save at the end and return summary stats
-        torch.save(self.policy.state_dict(), self.policy_path)
+        self._save_model_atomically()
         
         # Return average losses for epoch summary
         if epoch_losses['policy']:
@@ -156,6 +156,17 @@ class AlphaZeroLearner:
                 'num_training_steps': len(epoch_losses['policy'])
             }
         return None
+
+    def _save_model_atomically(self):
+        """Save model using atomic file replacement to prevent race conditions."""
+        import tempfile
+        
+        # Write to temporary file first
+        temp_path = self.policy_path + '.tmp'
+        torch.save(self.policy.state_dict(), temp_path)
+        
+        # Atomic rename (works on most filesystems)
+        os.rename(temp_path, self.policy_path)
 
     # ------------------------------------------------------------------
     def _deserialize_state(self, state_dict: dict) -> State:

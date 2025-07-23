@@ -94,6 +94,9 @@ class AlphaZeroSFCSolver(RLSolver):
         )
         self.learner_process: Optional[Process] = None
         self._num_train_steps = getattr(config.training, "num_train_steps_per_epoch", 100)
+        
+        # Cache for model weights to avoid repeated loading
+        self._cached_model_mtime = None
 
     # ------------------------------------------------------------------
     def _learner_loop(self) -> None:
@@ -151,11 +154,8 @@ class AlphaZeroSFCSolver(RLSolver):
         # Create solution following the standard pattern
         solution = Solution.from_v_net(v_net)
         
-        # Load latest policy weights if available
-        if os.path.exists(self.policy_path):
-            self.actor.policy.load_state_dict(
-                torch.load(self.policy_path, map_location=self.actor.device)
-            )
+        # Load latest policy weights only if file has changed
+        self._load_model_if_changed()
         
         # Use the actor to determine node mappings via MCTS
         node_mapping_result = self._node_mapping_with_mcts(v_net, p_net, solution)
@@ -178,6 +178,18 @@ class AlphaZeroSFCSolver(RLSolver):
             
         solution['result'] = False
         return solution
+
+    def _load_model_if_changed(self):
+        """Load model weights only if the file has been modified."""
+        if not os.path.exists(self.policy_path):
+            return
+            
+        current_mtime = os.path.getmtime(self.policy_path)
+        if self._cached_model_mtime != current_mtime:
+            self.actor.policy.load_state_dict(
+                torch.load(self.policy_path, map_location=self.actor.device)
+            )
+            self._cached_model_mtime = current_mtime
 
     def _node_mapping_with_mcts(self, v_net, p_net, solution):
         """Use MCTS to determine node mappings, then use controller to place them."""
@@ -375,12 +387,8 @@ class AlphaZeroSFCSolver(RLSolver):
 
 # Removed: _solve_vnr_with_mcts_worker - consolidated into actor.solve_vnr_with_mcts
 
-def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, replay_dir: str, policy_path: str) -> None:
-    """Training loop for a single worker process."""
-    import tqdm
-    
-    # print(f"Worker {worker_id}: Starting training with seed {seed}")
-    
+def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: str, policy_path: str):
+    """Create environment components for a worker process."""
     # Set different random seed for each worker
     import random
     import numpy as np
@@ -417,6 +425,20 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
         models_dir=os.path.dirname(policy_path),
     )
     
+    return env, controller, worker_actor
+
+def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, replay_dir: str, policy_path: str) -> None:
+    """Training loop for a single worker process."""
+    import tqdm
+    
+    # print(f"Worker {worker_id}: Starting training with seed {seed}")
+    
+    # Create environment and components for this worker
+    env, controller, worker_actor = _create_worker_environment(worker_id, config, seed, replay_dir, policy_path)
+    
+    # Cache for model weights to avoid repeated loading
+    cached_model_mtime = None
+    
     total_vnrs = env.v_net_simulator.v_sim_setting['num_v_nets']
     
     for epoch in range(num_epochs):
@@ -443,11 +465,14 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
             
             solution = Solution.from_v_net(v_net)
             
-            # Load latest policy weights if available
+            # Load latest policy weights only if file has changed
             if os.path.exists(policy_path):
-                worker_actor.policy.load_state_dict(
-                    torch.load(policy_path, map_location=worker_actor.device)
-                )
+                current_mtime = os.path.getmtime(policy_path)
+                if cached_model_mtime != current_mtime:
+                    worker_actor.policy.load_state_dict(
+                        torch.load(policy_path, map_location=worker_actor.device)
+                    )
+                    cached_model_mtime = current_mtime
             
             # Use MCTS to solve this VNR - simplified version for worker
             node_mapping_result = worker_actor.solve_vnr_with_mcts(v_net, p_net, solution, controller)
