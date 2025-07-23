@@ -154,8 +154,8 @@ class Critic(nn.Module):
             **kwargs
         )
 
-        combined_dim = embedding_dim + p_net_feature_dim  # decoder + graph summary
-        combined_dim = embedding_dim + embedding_dim  # NOT + p_net_feature_dim
+        # Value head input: decoder features + graph summary features
+        combined_dim = embedding_dim + embedding_dim
 
         self.value_head = nn.Sequential(
             nn.Linear(combined_dim, embedding_dim // 2),

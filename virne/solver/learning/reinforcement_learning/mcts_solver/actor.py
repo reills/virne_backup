@@ -291,10 +291,15 @@ class AlphaZeroActor(Solver):
             json.dump(data, f, cls=NumpyEncoder)
         self._cleanup()
 
-    def _cleanup(self, keep: int = 500000) -> None:
+    def _cleanup(self, keep: int = None) -> None:
+        """Clean up old replay buffer files, keeping only the most recent ones."""
+        if keep is None:
+            keep = getattr(self.config.training, 'replay_buffer_max_size', 500000)
+        
         files = sorted([f for f in os.listdir(self.replay_dir) if f.endswith(".json")])
-        for f in files[:-keep]:
-            os.remove(os.path.join(self.replay_dir, f))
+        if len(files) > keep:
+            for f in files[:-keep]:
+                os.remove(os.path.join(self.replay_dir, f))
 
     def _create_static_environment(self, p_net, v_net) -> dict:
         """Create static environment data containing unchanging network info."""

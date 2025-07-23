@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import copy
 import multiprocessing
-from multiprocessing import Process, Pool
+from multiprocessing import Process
 from typing import Optional, Tuple, Dict, Any
 
 import torch
@@ -287,9 +287,9 @@ class AlphaZeroSFCSolver(RLSolver):
             writer.add_scalar('Training/BufferSize', episode_files_after, epoch)
             
             # Print epoch summary with canary metrics
-            print("=" * 80)
+            self.logger.info("=" * 80)
             self.logger.info(f"EPOCH {epoch + 1}/{num_epochs} SUMMARY")
-            print("=" * 80)
+            self.logger.info("=" * 80)
             self.logger.info(f"VNE Performance:")
             self.logger.info(f"   Acceptance Rate: {acceptance_rate:.1f}% ({epoch_metrics['accepted']}/{vnr_count})")
             self.logger.info(f"   Avg Revenue:     {avg_revenue:.2f}")
@@ -314,20 +314,27 @@ class AlphaZeroSFCSolver(RLSolver):
                 warnings.append("WARNING: NEGATIVE PROFIT - Solutions are too expensive")
             
             if warnings:
-                print("HEALTH WARNINGS:")
+                self.logger.warning("HEALTH WARNINGS:")
                 for warning in warnings:
                     self.logger.warning(f"   {warning}")
             else:
-                print("All metrics look healthy!")
+                self.logger.info("All metrics look healthy!")
                 
-            print("=" * 80)
+            self.logger.info("=" * 80)
         
         writer.close()
+        
+    def close(self) -> None:
+        """Cleanup method to terminate background processes."""
+        if hasattr(self, 'learner_process') and self.learner_process is not None:
+            self.learner_process.terminate()
+            self.learner_process.join()
+            self.learner_process = None
+            self.logger.info("Learner process terminated")
 
     def learn_distributedly(self, env, num_epochs: int, **kwargs) -> None:
         """Distributed training: split epochs among workers."""
         import multiprocessing as mp
-        import copy
         
         assert self.config.training.distributed_training, 'distributed_training should be True'
         assert num_epochs % self.num_workers == 0, f'num_epochs ({num_epochs}) should be divisible by num_workers ({self.num_workers})'
@@ -364,7 +371,7 @@ class AlphaZeroSFCSolver(RLSolver):
             process.join()
             self.logger.debug(f"Worker {i} completed")
             
-        print("All workers completed. Training finished!")
+        self.logger.info("All workers completed. Training finished!")
 
 # Removed: _solve_vnr_with_mcts_worker - consolidated into actor.solve_vnr_with_mcts
 
@@ -472,13 +479,6 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
             instance = next_instance
         
         pbar.close()
-        print(f"Worker {worker_id}: Epoch {epoch + 1} completed - {vnr_count} VNRs processed")
+        # Worker completion logging - could be moved to logger if needed
     
-    print(f"Worker {worker_id}: All epochs completed")
-
-
-    def close(self) -> None:
-        if self.learner_process is not None:
-            self.learner_process.terminate()
-            self.learner_process.join()
-            self.learner_process = None
+    # Worker completion logging

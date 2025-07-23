@@ -88,7 +88,7 @@ class AlphaZeroLearner:
         for step in range(num_steps):
             batch = self._load_and_prepare_batch()
             if batch is None:
-                print("Replay buffer is not large enough to start training. Skipping step.")
+                self.logger.warning("Replay buffer is not large enough to start training. Skipping step.")
                 break
 
             batch_obs, batch_policies, batch_values = batch
@@ -142,7 +142,7 @@ class AlphaZeroLearner:
                 torch.save(self.policy.state_dict(), self.policy_path)
                 avg_policy_loss = sum(epoch_losses['policy'][-save_interval:]) / min(save_interval, len(epoch_losses['policy']))
                 avg_value_loss = sum(epoch_losses['value'][-save_interval:]) / min(save_interval, len(epoch_losses['value']))
-                print(f"Learner Step {self.global_step}: Policy={avg_policy_loss:.4f}, Value={avg_value_loss:.4f}")
+                self.logger.info(f"Learner Step {self.global_step}: Policy={avg_policy_loss:.4f}, Value={avg_value_loss:.4f}")
         
         # Always save at the end and return summary stats
         torch.save(self.policy.state_dict(), self.policy_path)
@@ -229,55 +229,4 @@ class AlphaZeroLearner:
 
 
 
-    def _reconstruct_state_from_components(self, static_env: dict, dynamic_state: dict) -> State:
-        """Reconstruct a full state from static environment and dynamic state components."""
-        from virne.network import PhysicalNetwork, VirtualNetwork
-        import networkx as nx
-        
-        # Reconstruct physical network with current resource usage
-        p_graph = nx.Graph()
-        
-        # Add nodes with current resource state
-        p_node_cpu_used = dynamic_state.get('p_node_cpu_used', {})
-        for node_info in static_env['physical_network']['nodes']:
-            node_id = node_info['id']
-            max_cpu = node_info['max_cpu']
-            used_cpu = int(p_node_cpu_used.get(str(node_id), 0))
-            available_cpu = max_cpu - used_cpu
-            
-            p_graph.add_node(node_id, 
-                           cpu=available_cpu,
-                           max_cpu=max_cpu)
-        
-        # Add edges with current resource state
-        p_link_bw_used = dynamic_state.get('p_link_bw_used', {})
-        for link_info in static_env['physical_network']['links']:
-            u, v = link_info['source'], link_info['target']
-            max_bw = link_info['max_bw']
-            used_bw = int(p_link_bw_used.get(f"{u}-{v}", p_link_bw_used.get(f"{v}-{u}", 0)))
-            available_bw = max_bw - used_bw
-            
-            p_graph.add_edge(u, v,
-                           bw=available_bw,
-                           max_bw=max_bw)
-        
-        # Reconstruct virtual network (SFC request) - this is static
-        v_graph = nx.Graph()
-        for node_info in static_env['sfc_request']['nodes']:
-            node_id = node_info['id']
-            cpu_demand = node_info['cpu_demand']
-            v_graph.add_node(node_id, cpu=cpu_demand)
-        
-        for link_info in static_env['sfc_request']['links']:
-            u, v = link_info['source'], link_info['target']
-            bw_demand = link_info['bw_demand']
-            v_graph.add_edge(u, v, bw=bw_demand)
-        
-        # Create network objects
-        p_net = PhysicalNetwork(p_graph)
-        v_net = VirtualNetwork(v_graph)
-        
-        # Create state object
-        state = State(p_net, v_net, self.controller, self.recorder, self.counter)
-        
-        return state
+    # Removed: _reconstruct_state_from_components - unused method

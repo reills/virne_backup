@@ -23,6 +23,7 @@ training:
   c_puct: 1.4               # Higher exploration for complex space
   # Learning parameters
   policy_learning_rate: 1e-4  # Learning rate for policy network
+  replay_buffer_max_size: 500000  # Maximum number of episodes to keep in replay buffer
   # Model loading options
   resume_training: true     # If true, load policy_latest.pt if it exists
   alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)
