@@ -1,9 +1,40 @@
 # .gitignore
 .vscode
-.hydra
 
-#dataset
-dataset/*
+#datasets
+ablation_results
+results/*
+outputs/* 
+dataset/
+poisson_test/
+dataset/results*
+dataset/april15_results
+*.pth
+*.backup
+analysis.py
+pre-train
+temp_data
+dataset/training-data
+dataset/merged_training_data.pt
+p_net
+
+
+# build
+virne.egg-info
+dist
+
+# save
+save
+running_log
+old_save
+pretrained
+exp_flag_vne_data
+exp_srl_vne_data
+
+# docs
+docs/build/
+docs/source/_autosummary/
+docs/source/generated/
 
 # cache
 *.log
@@ -11,26 +42,3 @@ dataset/*
 **/__pycache__/
 **/.DS_Store
 **/.ipynb_checkpoints
-**/*.pytest_cache
-
-# build
-virne.egg-info/
-dist
-build
-
-# save
-outputs
-results
-save
-running_log
-old_save
-pretrained
-exp_data
-exp_flag_vne_data
-exp_srl_vne_data
-benchmark
-
-# docs
-docs/build/
-docs/source/_autosummary/
-docs/source/generated/
