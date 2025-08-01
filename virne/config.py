@@ -43,17 +43,17 @@ class Config(ClassDict):
     save_dir: str = 'save/'
     summary_file_name: str = 'global_summary.csv'
     sim_id: int = 0
-    use_fixed_dataset: bool = False 
-    dir_save_dataset: str = "dataset/large"
+    use_fixed_dataset: bool = True 
+    dir_save_dataset: str = "/home/stephen-reilly/dev/virne/dataset/results-6"
     if_dynamic_v_nets: bool = False 
 
     ### solver  ###
-    solver_name: str = 'random_rank'
+    solver_name: str = 'a3c_gcn_pre_train_transformer'
     sub_solver_name: str = None
     pretrained_model_path: str =  ''
-    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-3/output/model/model.pkl'
+    #pretrained_model_path: str = '/home/stephen-reilly/dev/virne/dataset/results-6/output/model/model.pkl'
     pretrained_subsolver_model_path: str = ''
-    # solver_name: str = 'nrm_rank'
+    # solver_name: str = 'a3c_gcn_pre_train_transformer'
     verbose: int = 1                      # Level of showing information 0: no output, 1: output summary, 2: output detailed info
     reusable: bool = False                 # Whether or not to allow to deploy several virtual nodes on the same physical node
     ### ranking & mapping ###
@@ -61,17 +61,17 @@ class Config(ClassDict):
     link_ranking_method: str = 'order'    # Method of link ranking: 'order' or 'greedy'
     matching_mathod: str = 'greedy'       # Method of node matching: 'greedy' or 'l2s2'
     shortest_method: str = 'k_shortest'   # Method of path finding: 'bfs_shortest' or 'k_shortest'
-    k_shortest: int = 10                  # Number of shortest paths to be found
+    k_shortest: int = 1                  # Number of shortest paths to be found
     allow_revocable: bool = True           # Whether or not to allow to revoke a virtual node
     allow_rejection: bool = True          # Whether or not to allow to reject a virtual node
 
     ### Training ###
-    num_epochs: int = 1
+    num_epochs: int = 10
     seed: int = None
     use_cuda: bool = True
     cuda_id: int = 0
     distributed_training: bool = True 
-    num_train_epochs: int = 100 #changed by me was 100
+    num_train_epochs: int = 0 #changed by me was 100
     start_train_epoch: int = 0 #where to start training if reloading.... 
     num_workers: int = 3 #changed by me was 10
     batch_size: int = 125

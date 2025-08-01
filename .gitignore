@@ -2,6 +2,7 @@
 .vscode
 
 #datasets
+ablation_results
 results/*
 outputs/* 
 dataset/
@@ -9,6 +10,7 @@ poisson_test/
 dataset/results*
 dataset/april15_results
 *.pth
+*.backup
 analysis.py
 pre-train
 temp_data
