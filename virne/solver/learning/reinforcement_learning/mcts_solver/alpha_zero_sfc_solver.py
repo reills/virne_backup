@@ -13,7 +13,7 @@ from virne.solver.learning.rl_core import RLSolver
 from virne.core import Solution
 from virne.utils.config import get_run_id_dir
 
-from .actor import AlphaZeroActor
+from .actor_optimized import OptimizedAlphaZeroActor
 from .learner import AlphaZeroLearner
 from .node import Node, State
 
@@ -82,7 +82,11 @@ class AlphaZeroSFCSolver(RLSolver):
         self.shortest_method = kwargs.get('shortest_method', 'k_shortest')
         self.k_shortest = kwargs.get('k_shortest', 10)
 
-        self.actor = AlphaZeroActor(
+        # Use optimized actor with batched GPU inference
+        use_batched_gpu = getattr(config.training, 'use_batched_gpu', True)
+        disable_trajectory_writing = getattr(config.training, 'disable_trajectory_writing', False)
+        
+        self.actor = OptimizedAlphaZeroActor(
             controller,
             recorder,
             counter,
@@ -90,8 +94,15 @@ class AlphaZeroSFCSolver(RLSolver):
             config,
             replay_dir=self.replay_dir,
             models_dir=self.models_dir,
+            use_batched_gpu=use_batched_gpu,
+            disable_trajectory_writing=disable_trajectory_writing,
             **kwargs,
         )
+        
+        if use_batched_gpu:
+            logger.info("✅ Using OptimizedAlphaZeroActor with batched GPU inference")
+        else:
+            logger.info("⚠️  Using OptimizedAlphaZeroActor without batching (slower)")
         self.learner_process: Optional[Process] = None
         self._num_train_steps = getattr(config.training, "num_train_steps_per_epoch", 100)
         
@@ -343,6 +354,11 @@ class AlphaZeroSFCSolver(RLSolver):
             self.learner_process.join()
             self.learner_process = None
             self.logger.info("Learner process terminated")
+        
+        # Shutdown GPU worker
+        if hasattr(self, 'actor') and self.actor:
+            self.actor.shutdown()
+            self.logger.info("GPU worker terminated")
 
     def learn_distributedly(self, env, num_epochs: int, **kwargs) -> None:
         """Distributed training: split epochs among workers."""
@@ -419,10 +435,13 @@ def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: st
     env = SolutionStepEnvironment(p_net, v_net_simulator, controller, recorder, counter, logger, config)
     
     # Create a minimal solver instance for this worker (just for solving, no training)
-    worker_actor = AlphaZeroActor(
+    # Use optimized actor but disable batching for workers (to avoid multiprocessing conflicts)
+    worker_actor = OptimizedAlphaZeroActor(
         controller, recorder, counter, logger, config,
         replay_dir=replay_dir,
         models_dir=os.path.dirname(policy_path),
+        use_batched_gpu=False,  # Disable batching for worker processes
+        disable_trajectory_writing=True,  # Workers don't need to write trajectories
     )
     
     return env, controller, worker_actor

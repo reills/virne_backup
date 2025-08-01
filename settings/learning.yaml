@@ -18,8 +18,8 @@ training:
   min_buffer_size: 50       # Minimum replay buffer size to start training
   num_train_steps_per_epoch: 20  # Training steps per batch
   max_empty_batches: 50     # Stop if no data for N consecutive attempts
-  # MCTS parameters for AlphaZero
-  computation_budget: 20    # More MCTS simulations per decision
+  # MCTS parameters for AlphaZero (OPTIMIZED FOR SPEED)
+  computation_budget: 5     # Reduced from 20 for 4x speedup 
   c_puct: 1.4               # Higher exploration for complex space
   # Learning parameters
   policy_learning_rate: 1e-4  # Learning rate for policy network
@@ -27,18 +27,26 @@ training:
   # Model loading options
   resume_training: true     # If true, load policy_latest.pt if it exists
   alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)
+  # GPU batching optimizations
+  use_batched_gpu: true     # Use batched GPU worker for MCTS evaluation
+  gpu_batch_size: 32        # Batch size for GPU worker
+  gpu_timeout_ms: 10        # Timeout for collecting batch requests
+  disable_trajectory_writing: false  # Disable JSON writing for max speed (training only)
 
 inference:
   decode_strategy: greedy
   k_searching: 1
 
 nn:
-  embedding_dim: 128
-  hidden_dim: 128
+  embedding_dim: 96         # Reduced from 128 for speed
+  hidden_dim: 96            # Reduced from 128 for speed  
   num_layers: 1
-  num_gnn_layers: 3
+  num_gnn_layers: 2         # Reduced from 3 for speed
   dropout_prob: 0.0
   batch_norm: false
+  # AlphaZero-specific model size optimizations
+  n_heads: 6                # Reduced from 8 for speed
+  transformer_layers: 2     # Reduced from 4 for speed
 
 rl:
   gamma: 0.99
