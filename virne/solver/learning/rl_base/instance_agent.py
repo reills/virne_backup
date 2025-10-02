@@ -214,7 +214,13 @@ class InstanceAgent(object):
 
             if self.rank == 0:
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.save_interval == 0:
-                    self.save_model(f'model-worker{self.rank}-epoch{epoch_id}.pkl')
+                    # Include k_shortest in worker model filename to prevent overwriting
+                    k_value = getattr(self, 'k_shortest', None)
+                    if k_value is not None:
+                        model_filename = f'model-worker{self.rank}-k{k_value}-epoch{epoch_id}.pkl'
+                    else:
+                        model_filename = f'model-worker{self.rank}-epoch{epoch_id}.pkl'
+                    self.save_model(model_filename)
                 if (epoch_id + 1) != num_epochs and (epoch_id + 1) % self.eval_interval == 0:
                     self.validate(env)
 

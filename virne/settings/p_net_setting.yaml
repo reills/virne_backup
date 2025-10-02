@@ -50,7 +50,7 @@ node_attrs_setting:
   owner: node
   type: extrema
 num_nodes: 100
-save_dir: /home/stephen-reilly/dev/virne/dataset/results-6
+save_dir: /home/stephen-reilly/dev/virne/dataset/large/PNC_medium/size_3/seed_2
 topology:
   type: waxman
   wm_alpha: 0.5

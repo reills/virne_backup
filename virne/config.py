@@ -160,11 +160,15 @@ class Config(ClassDict):
         if use_fixed:
             os.makedirs(fixed_dir, exist_ok=True)
             self.run_id = fixed_dir
+            # When using fixed datasets, do NOT overwrite dataset directories from settings
+            # Keep v_sim_setting['save_dir'] and p_net_setting['save_dir'] as loaded from YAMLs
         else:
             self.run_id = self.get_next_results_dir(base_dir="dataset")
+            # For fresh generation runs, align dataset save directories with the new run directory
+            self.v_sim_setting['save_dir'] = self.run_id
+            self.p_net_setting['save_dir'] = self.run_id
 
-        self.v_sim_setting['save_dir'] = self.run_id 
-        self.p_net_setting['save_dir'] = self.run_id 
+        # Always set save_dir (logs/outputs) to run_id
         self.save_dir = self.run_id 
 
 
@@ -189,7 +193,10 @@ class Config(ClassDict):
 
     @staticmethod
     def load(config_dict):
-        return Config.from_dict(config_dict)
+        # Build a proper Config instance and apply overrides via update()
+        cfg = Config()
+        cfg.update(config_dict)
+        return cfg
 
     def read_settings(self, p_net=True, v_sim=True):
         # config.general_setting = read_setting(config.general_setting_path)

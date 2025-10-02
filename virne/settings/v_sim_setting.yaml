@@ -1,7 +1,7 @@
 arrival_rate:
   distribution: poisson
   dtype: float
-  lam: 0.04
+  lam: 20.0
   reciprocal: true
 events_file_name: events.yaml
 lifetime:
@@ -12,8 +12,8 @@ link_attrs_setting:
 - distribution: uniform
   dtype: int
   generative: true
-  high: 30
-  low: 30
+  high: 12
+  low: 12
   name: bw
   owner: link
   type: resource
@@ -21,36 +21,36 @@ node_attrs_setting:
 - distribution: uniform
   dtype: int
   generative: true
-  high: 30
-  low: 30
+  high: 20
+  low: 20
   name: cpu
   owner: node
   type: resource
 - distribution: uniform
   dtype: int
   generative: true
-  high: 30
-  low: 30
+  high: 20
+  low: 20
   name: gpu
   owner: node
   type: resource
 - distribution: uniform
   dtype: int
   generative: true
-  high: 30
-  low: 30
+  high: 20
+  low: 20
   name: rom
   owner: node
   type: resource
-num_v_nets: 1000
-save_dir: /home/stephen-reilly/dev/virne/dataset/results-6
+num_v_nets: 10
+save_dir: /home/stephen-reilly/dev/virne/dataset/large/PNC_medium/size_3/seed_2
 setting_file_name: v_sim_setting.yaml
 topology:
   type: path
 v_net_size:
   distribution: uniform
   dtype: int
-  high: 7
-  low: 7
+  high: 3
+  low: 3
 v_nets_file_name: v_net.gml
 v_nets_save_dir: v_nets

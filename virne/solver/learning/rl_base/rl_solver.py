@@ -124,6 +124,7 @@ class RLSolver(Solver):
         self.lr = kwargs.get('lr', 0.001)
         self.lr_actor = kwargs.get('lr_actor', 0.005)
         self.lr_critic = kwargs.get('lr_critic', 0.001)
+        self.num_train_epochs = kwargs.get('num_train_epochs', 100)
         self.lr_scheduler = None
         self.criterion_critic = nn.MSELoss()
         self.compute_advantage_method = kwargs.get('compute_advantage_method', 'gae')
@@ -294,14 +295,18 @@ class RLSolver(Solver):
                 self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
             else:
                 self.policy.load_state_dict(checkpoint['policy'])
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
-                # Rebuild optimizer to reset weight decay
-                print("Resetting optimizer with new weight_decay=0.0")
-                self.optimizer = torch.optim.Adam([
-                    {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor},
-                    {'params': self.policy.actor.parameters(),   'lr': self.lr_actor},
-                    {'params': self.policy.critic.parameters(),  'lr': self.lr_critic}
-                ], weight_decay=0.0)  # ← your new value here
+                # Only load and reset optimizer during training, not testing
+                if self.num_train_epochs > 0:
+                    self.optimizer.load_state_dict(checkpoint['optimizer'])
+                    # Rebuild optimizer to reset weight decay
+                    print("Resetting optimizer with new weight_decay=0.0")
+                    self.optimizer = torch.optim.Adam([
+                        {'params': self.policy.encoder.parameters(), 'lr': self.lr_actor},
+                        {'params': self.policy.actor.parameters(),   'lr': self.lr_actor},
+                        {'params': self.policy.critic.parameters(),  'lr': self.lr_critic}
+                    ], weight_decay=0.0)
+                else:
+                    print("Testing mode: skipping optimizer reset")
             print(f'Loaded pretrained model from {checkpoint_path}') if self.verbose >= 0 else None
         except Exception as e:
             print(f'error {e}')
@@ -354,7 +359,13 @@ class RLSolver(Solver):
             print(f'Start to learn singly')
             self.learn_singly(env, num_epochs, start_epoch=start_epoch)
         print(f'Start to validate')
-        self.save_model(f'model.pkl')
+        # Include k_shortest in model filename to prevent overwriting
+        k_value = getattr(self, 'k_shortest', None)
+        if k_value is not None:
+            model_filename = f'model_k{k_value}.pkl'
+        else:
+            model_filename = 'model.pkl'
+        self.save_model(model_filename)
         # self.validate(env)
         self.end_time = time.time()
         print(f'\nTotal training time: {(self.end_time - self.start_time) / 3600:4.6f} h')

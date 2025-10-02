@@ -1,5 +1,7 @@
 from virne.base import BasicScenario
 from virne import Config, REGISTRY, Generator, update_simulation_setting
+import argparse
+from virne.utils.setting import read_setting
 
 
 def run(config):
@@ -14,30 +16,32 @@ def run(config):
 
     print(f"\n{'-' * 20}   Complete   {'-' * 20}\n")
 
-
 if __name__ == '__main__':
-    config = Config(
-        #solver_name='sa',
-        #solver_name='a3c_gcn_seq2seq'
-        #solver_name='a2c_gcn_transformer_encoder'
-        #solver_name='a3c_gcn_oneshot_transformer'
-        solver_name='a3c_gcn_pre_train_transformer'
-        # p_net_setting_path='customized_p_net_setting_file_path',
-        # v_sim_setting_path='customized_v_sim_setting_file_path',
-    ) 
-    
+    parser = argparse.ArgumentParser(description='Run VIRNE main with optional external config')
+    parser.add_argument('--config', type=str, help='Path to a YAML/JSON config file to load')
+    parser.add_argument('--skip-generate', action='store_true', help='Skip dataset generation step')
+    args, unknown = parser.parse_known_args()
+
+    if args.config:
+        cfg_dict = read_setting(args.config)
+        config = Config.load(cfg_dict)
+    else:
+        config = Config(
+            solver_name='a3c_gcn_pre_train_transformer'
+        )
+
+    # Ensure max sequence length reflects dataset v_net_size
     config.max_seq_len = config.v_sim_setting['v_net_size']['high']
 
-    Generator.generate_dataset(
-        config,
-        p_net=True,
-        v_nets=True,
-        save=True,
-        reuse_existing_p=True,
-        reuse_existing_v=True
-    )
+    # Optionally generate datasets. Default behavior preserved unless --skip-generate provided.
+    if not args.skip_generate:
+        Generator.generate_dataset(
+            config,
+            p_net=True,
+            v_nets=True,
+            save=True,
+            reuse_existing_p=True,
+            reuse_existing_v=True
+        )
 
-    run(config) 
-
-    #conda activate nfv-env
-    # source nfv-env/bin/activate
+    run(config)

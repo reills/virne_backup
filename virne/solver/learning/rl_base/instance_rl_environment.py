@@ -29,6 +29,12 @@ class InstanceRLEnv(RLBaseEnv):
         self.solution = Solution(v_net)
         # ranking strategy
         self.reusable = kwargs.get('reusable', False)
+        # Keep controller's reuse behavior in sync with env/solver config
+        # so zero-hop routing is handled consistently.
+        try:
+            self.controller.reusable = bool(self.reusable)
+        except Exception:
+            pass
         self.node_ranking_method = kwargs.get('node_ranking_method', 'order')
         self.link_ranking_method = kwargs.get('link_ranking_method', 'order')
         # node mapping

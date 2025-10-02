@@ -46,21 +46,24 @@ class VirtualNetworkRequestSimulator(object):
         distribution = arrival_cfg.get('distribution', 'poisson')
 
         if distribution == 'poisson':
-            lam = arrival_cfg['lam']
+            lam = float(arrival_cfg['lam'])
             if arrival_cfg.get('reciprocal', False):
-                lam = 1 / lam
-            self.aver_arrival_rate = lam 
+                # lam is MEAN inter-arrival time => rate = 1/lam
+                self.aver_arrival_rate = 1.0 / lam
+            else:
+                # lam is RATE λ
+                self.aver_arrival_rate = lam
         elif distribution == 'lognormal':
             mean = arrival_cfg['mean']
             sigma = arrival_cfg['sigma']
-            self.aver_arrival_rate = np.exp(mean + 0.5 * sigma**2) 
+            self.aver_arrival_rate = 1.0 / np.exp(mean + 0.5 * sigma**2)
         elif distribution == 'uniform':
             low = arrival_cfg['low']
             high = arrival_cfg['high']
-            self.aver_arrival_rate = (low + high) / 2 
+            self.aver_arrival_rate = 1.0 / ((low + high) / 2.0)
         elif distribution == 'exponential':
             scale = arrival_cfg['scale']  # mean of exponential
-            self.aver_arrival_rate = scale
+            self.aver_arrival_rate = 1.0 / scale
 
         else:
             raise NotImplementedError(f"Arrival distribution '{distribution}' is not supported.")

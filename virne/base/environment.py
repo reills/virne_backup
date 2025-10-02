@@ -94,11 +94,9 @@ class Environment:
         if self.recorder.if_temp_save_records and self.verbose >= 1:
             print(f'temp save record in {self.recorder.temp_save_path}\n')
 
-        self.v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(self.v_net_simulator.v_sim_setting)
-        #print(f'reset vnet yeah it is actually trying to generating them from: {self.v_nets_dataset_dir }')
-        #self.v_nets_dataset_dir =
+        # Use the dataset directory specified by the loaded v_sim_setting only.
+        # Do not override the dataset path with the run/log directory.
         self.v_nets_dataset_dir = self.v_net_simulator.v_sim_setting.get('save_dir')
-        self.v_nets_dataset_dir = vnet_path
         if self.renew_v_net_simulator:
             self.v_net_simulator.renew(v_nets=True, events=True, seed=seed)
             print(f'Generate virtual networks with seed {seed}') if self.verbose >= 1 else None

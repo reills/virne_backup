@@ -64,7 +64,10 @@ class Solver:
             'shortest_method': self.shortest_method,
             'k_shortest': self.k_shortest,
             'allow_rejection': self.allow_rejection,
-            'allow_revocable': self.allow_revocable, 
+            'allow_revocable': self.allow_revocable,
+            # Expose curriculum/phase to instance envs that support phased masking/pruning.
+            # Falls back to -1 (disabled) if not provided in kwargs.
+            'phase': kwargs.get('curriculum_phase', -1),
         }
         set_sim_info_to_object(kwargs, self)
 

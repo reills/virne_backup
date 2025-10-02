@@ -40,9 +40,9 @@ class AblationStudy:
         self.phase2_only = phase2_only
         
         # Experimental parameters
-        self.k_shortest_values = [1, 3, 5, 7, 10, 13, 15]
+        self.k_shortest_values = [1,2, 3, 4,5,6, 7,8,9, 10,11,12, 13,14, 15,16]
         self.num_train_epochs = 100
-        self.num_test_epochs = 10
+        self.num_test_epochs = 5
         self.conda_env = "nfv"
         self.solver_name = "a3c_gcn_pre_train_transformer"
         
@@ -913,3 +913,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#python batch_train_k_models.py --network-sizes small medium large --k-values 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 --concurrent 1 

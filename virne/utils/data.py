@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# data.py
 # ==============================================================================
 
 
@@ -36,10 +36,23 @@ def generate_data_with_distribution(size: int, distribution: str, dtype: str, **
         scale = kwargs.get('scale')
         data = np.random.exponential(scale, size)
     elif distribution == 'poisson':
+        # Simulate a Poisson *process*: produce exponential inter-arrival times.
         lam = kwargs.get('lam')
-        if kwargs.get('reciprocal', False):
-            lam = 1 / lam
-        data = np.random.poisson(lam, size)
+        reciprocal = kwargs.get('reciprocal', False)
+        if lam is None:
+            raise ValueError("arrival_rate.poisson requires 'lam'")
+        lam = float(lam)
+
+        if reciprocal:
+            # lam is MEAN inter-arrival time (1/λ)
+            mean_interarrival = lam
+        else:
+            # lam is RATE λ (events per unit time)
+            if lam <= 0:
+                raise ValueError("'lam' (rate) must be > 0")
+            mean_interarrival = 1.0 / lam
+
+        data = np.random.exponential(mean_interarrival, size)
     elif distribution == 'pareto':
         shape = kwargs.get('shape', 2.0)
         scale = kwargs.get('scale', 1.0)
