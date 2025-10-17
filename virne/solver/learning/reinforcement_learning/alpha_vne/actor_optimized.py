@@ -1,0 +1,827 @@
+"""
+Optimized Actor with Batched GPU Inference
+==========================================
+
+This is a drop-in replacement for actor.py that uses batched GPU evaluation
+for massive MCTS speedup.
+
+Key optimizations:
+1. Batched GPU worker for NN evaluations  
+2. Reduced computation budget
+3. Optional trajectory writing disable
+4. Memory-efficient observation caching
+"""
+from __future__ import annotations
+
+import math
+import os
+from typing import List
+
+import numpy as np
+import torch
+
+from virne.core import Solution
+from virne.solver.base_solver import Solver
+from .node import Node, State
+from .cpp_adapter import create_cpp_adapter
+from .trajectory_writer import TrajectoryWriter
+from .observation_builder import ObservationBuilder
+from .policy_network import PolicyNetwork
+from .node_expander import NodeExpander
+from .mcts_engine import MCTSEngine
+
+
+class OptimizedAlphaZeroActor(Solver):
+    """
+    Optimized Actor with batched GPU inference for MCTS.
+    
+    Key improvements over original Actor:
+    - Uses batched GPU worker for ~10x NN speedup
+    - Optional trajectory writing disable for training speed
+    - Memory-efficient observation preparation
+    - Configurable MCTS budget for speed/quality tradeoff
+    """
+
+    def __init__(self, controller, recorder, counter, logger, config,
+                 replay_dir: str = "replay_buffer", models_dir: str = None, 
+                 use_batched_gpu: bool = True, 
+                 disable_trajectory_writing: bool = False,
+                 **kwargs):
+        super().__init__(controller, recorder, counter, logger, config, **kwargs)
+        self.replay_dir = replay_dir
+        self.disable_trajectory_writing = disable_trajectory_writing
+
+        # Policy path should be in models directory, not replay buffer
+        if models_dir:
+            self.policy_path = os.path.join(models_dir, "policy_latest.pt")
+        else:
+            self.policy_path = os.path.join(self.replay_dir, "policy_latest.pt")
+
+        os.makedirs(self.replay_dir, exist_ok=True)
+        if models_dir:
+            os.makedirs(models_dir, exist_ok=True)
+
+        # Initialize trajectory writer
+        self.trajectory_writer = TrajectoryWriter(
+            config=config,
+            replay_dir=replay_dir,
+            policy_path=self.policy_path,
+            disable_trajectory_writing=disable_trajectory_writing
+        )
+
+        # Initialize observation builder (always use CPU for IPC safety)
+        self.obs_builder = ObservationBuilder(
+            controller=controller,
+            device=torch.device("cpu")
+        )
+
+        # MCTS configuration parameters from config
+        self.computation_budget = getattr(config.training, 'computation_budget', 5)  # Reduced default
+        self.c_puct = getattr(config.training, 'c_puct', 1.0)
+
+        # Dirichlet noise for root exploration (AlphaZero style)
+        self.dirichlet_epsilon = getattr(config.training, 'dirichlet_epsilon', 0.25)
+        self.dirichlet_alpha = getattr(config.training, 'dirichlet_alpha', 0.03)
+
+        # Temperature for action selection
+        self.temperature_train = getattr(config.training, 'temperature_train', 1.0)
+        self.temperature_eval = getattr(config.training, 'temperature_eval', 0.0)
+
+        # Link mapping parameters (inherited from MctsSolver)
+        self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')
+        self.k_shortest = kwargs.get('k_shortest', 10)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Ablation and instrumentation flags
+        self.use_nn_policy = getattr(config.training, 'use_nn_policy', True)
+        self.use_nn_value = getattr(config.training, 'use_nn_value', True)
+        self.uniform_prior = getattr(config.training, 'uniform_prior', False)
+
+        # Plain MCTS mode (vanilla MCTS without neural network)
+        self.use_neural_network = getattr(config.training, 'use_neural_network', True)
+        self.rollout_depth_limit = getattr(config.training, 'rollout_depth_limit', 100)
+
+        # Setup GPU evaluation
+        model_config = {
+            'p_net_num_nodes': config.simulation.p_net_setting_num_nodes,
+            'p_net_feature_dim': config.simulation.p_net_setting_num_node_resource_attrs,
+            'v_net_feature_dim': config.simulation.v_sim_setting_num_node_resource_attrs,
+            'p_net_edge_dim': config.simulation.p_net_setting_num_link_resource_attrs,
+            'embedding_dim': getattr(config.nn, 'embedding_dim', 96),
+            'n_heads': getattr(config.nn, 'n_heads', 6),
+            'n_layers': getattr(config.nn, 'transformer_layers', 2),
+            'dropout': getattr(config.nn, 'dropout_prob', 0.1),
+            'allow_rejection': getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
+        }
+
+        # Initialize PolicyNetwork wrapper
+        self.policy_network = PolicyNetwork(
+            model_config=model_config,
+            policy_path=self.policy_path,
+            device=self.device,
+            use_batched_gpu=use_batched_gpu and torch.cuda.is_available(),
+            batch_size=getattr(config.training, 'gpu_batch_size', 32),
+            gpu_timeout_ms=getattr(config.training, 'gpu_timeout_ms', 10),
+            logger=self.logger
+        )
+
+        # Load model weights
+        alphazero_model_path = getattr(config.training, 'alphazero_model_path', '')
+        resume_training = getattr(config.training, 'resume_training', True)
+        self.policy_network.load_weights(alphazero_model_path, resume_training)
+
+        # Backward compatibility: expose model and gpu_manager
+        self.policy = self.policy_network.model
+        self.gpu_manager = self.policy_network.gpu_manager
+        self.use_batched_gpu = self.policy_network.use_batched_gpu
+
+        # Initialize NodeExpander
+        self.node_expander = NodeExpander(
+            policy_network=self.policy_network,
+            observation_builder=self.obs_builder,
+            controller=self.controller,
+            dirichlet_alpha=self.dirichlet_alpha,
+            dirichlet_epsilon=self.dirichlet_epsilon,
+            use_nn_policy=self.use_nn_policy,
+            use_nn_value=self.use_nn_value,
+            uniform_prior=self.uniform_prior,
+            logger=self.logger
+        )
+
+        # Initialize MCTSEngine
+        self.mcts_engine = MCTSEngine(
+            node_expander=self.node_expander,
+            computation_budget=self.computation_budget,
+            c_puct=self.c_puct,
+            logger=self.logger
+        )
+
+        # Caches used during one solve episode
+        self._p_data = None
+        self._v_data = None
+        self._encoder_outputs = None
+
+        # Diagnostics accumulators
+        self._calib_n = 0
+        self._calib_sum_pred = 0.0
+        self._calib_sum_true = 0.0
+        self._calib_sum_pred2 = 0.0
+        self._calib_sum_true2 = 0.0
+        self._calib_sum_prod = 0.0
+        self._episode_rejects = 0
+        self._last_cuda_log_ts = 0.0
+
+        self.cpp_adapter = None
+        training_cfg = getattr(config, "training", None)
+        use_cpp_flag = False
+        if training_cfg is not None:
+            if isinstance(training_cfg, dict):
+                use_cpp_flag = bool(training_cfg.get("use_cpp_mcts", False))
+            else:
+                use_cpp_flag = bool(getattr(training_cfg, "use_cpp_mcts", False))
+
+        if use_cpp_flag:
+            try:
+                self.cpp_adapter = create_cpp_adapter(self, self.computation_budget)
+                if self.cpp_adapter is not None:
+                    self.logger.info("🧠 Using experimental C++ MCTS backend.")
+                else:
+                    self.logger.info("C++ MCTS backend not available; continuing with Python implementation.")
+            except Exception as exc:
+                self.logger.warning(f"Failed to initialize C++ MCTS backend: {exc}")
+                self.cpp_adapter = None
+
+
+    # ------------------------------------------------------------------
+    def solve(self, instance, training: bool = None):
+        """Run MCTS guided by the current policy and store the episode.
+
+        Args:
+            instance: Problem instance with v_net and p_net
+            training: If True, use training temperature (exploration); if False, use eval temperature (greedy).
+                     If None, infer from disable_trajectory_writing (False=train, True=eval)
+        """
+        v_net, p_net = instance["v_net"], instance["p_net"]
+
+        from virne.solver.learning.utils import load_pyg_data_from_network
+
+        # Keep data on CPU for pickle-safe IPC with batched GPU worker
+        self._p_data = load_pyg_data_from_network(p_net)
+        self._v_data = load_pyg_data_from_network(v_net)
+
+        # Always compute real encoder outputs (not dummy tensors)
+        # Move to device only for local encoding, then back to CPU for IPC
+        v_data_gpu = self._v_data.to(self.device)
+        encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
+        self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
+
+        # Set episode data in observation builder
+        self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+
+        # Determine temperature based on mode
+        if training is None:
+            training = not self.disable_trajectory_writing  # If writing trajectories, we're training
+        temperature = self.temperature_train if training else self.temperature_eval
+
+        # Create static environment data
+        static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
+
+        current_node = Node(
+            None,
+            State(
+                p_net,
+                v_net,
+                self.controller,
+                self.recorder,
+                self.counter,
+                link_params={
+                    'shortest_method': self.shortest_method,
+                    'k': self.k_shortest,
+                },
+            ),
+        )
+        solution = Solution.from_v_net(v_net)
+        trajectory: List[dict] = [] if not self.disable_trajectory_writing else None
+        allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
+
+        for v_node_idx in range(v_net.num_nodes):
+            # Run MCTS search to update current_node's children with visit statistics
+            # Pass actual virtual node id for current position
+            next_pos = current_node.state.v_node_id + 1
+            curr_v_id = current_node.state.v_order[next_pos]
+            self.search(current_node, curr_v_id)
+            # Log prior quality at root (feasible entropy and top5)
+            self._log_root_prior_stats(current_node, current_node.state, curr_v_id)
+
+            # Periodic CUDA mem log
+            try:
+                import time
+                now = time.time()
+                if self.device.type == 'cuda' and now - self._last_cuda_log_ts > 10.0:
+                    mem_alloc = torch.cuda.memory_allocated(self.device)
+                    mem_res = torch.cuda.memory_reserved(self.device)
+                    self.logger.info(f"Actor CUDA memory: alloc={mem_alloc/1e6:.1f}MB reserved={mem_res/1e6:.1f}MB")
+                    self._last_cuda_log_ts = now
+            except Exception:
+                pass
+            # Select the best child based on visit counts with appropriate temperature
+            best_child = self._select_best_child(current_node, temperature=temperature)
+            if best_child is None:
+                solution["place_result"] = False
+                self.logger.warning(
+                    f"MCTS failed to select child for v_node={curr_v_id} "
+                    f"(step={current_node.state.v_node_id + 1})"
+                )
+                break
+
+            # Handle REJECT action (always at index p_net.num_nodes)
+            reject_idx = current_node.state.p_net.num_nodes
+            if allow_rejection and best_child.state.p_node_id == reject_idx:
+                solution["place_result"] = False
+                solution["rejected"] = True
+                current_node = best_child  # advance to terminal rejected state for reward consistency
+                break
+            # Guard against invalid action (-1 or out of range). This can happen when a child
+            # has been marked terminal-bad by incremental feasibility checks.
+            if best_child.state.p_node_id < 0 or best_child.state.p_node_id >= reject_idx:
+                solution["place_result"] = False
+                self.logger.warning(
+                    f"Selected child with invalid p_node_id={best_child.state.p_node_id} "
+                    f"(reject_idx={reject_idx}) for v_node={curr_v_id}"
+                )
+                self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
+                break
+
+            # Store the action taken using stable ordering
+            placed_v = best_child.state.v_order[best_child.state.v_node_id]
+            solution["node_slots"].update({placed_v: best_child.state.p_node_id})
+            
+            # Create timestep data using the current root (before moving to child)
+            if not self.disable_trajectory_writing:
+                timestep_data = self._create_timestep_data(current_node, curr_v_id, best_child.state.p_node_id)
+                trajectory.append(timestep_data)
+            
+            # Promote the best child as the new root for next iteration
+            # Detach from parent to avoid memory buildup
+            best_child.parent = None
+            current_node = best_child
+
+        if solution.get("place_result", True) and not solution.get("rejected", False):
+            link_ok = self.controller.link_mapper.link_mapping(
+                v_net, p_net, solution=solution,
+                shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
+            if not link_ok:
+                solution["route_result"] = False
+        # Set final result flag for accurate reward accounting
+        solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
+
+        # Store episode only if enabled
+        if not self.disable_trajectory_writing:
+            final_reward = self._compute_final_reward(solution, v_net, p_net)
+            self._store_episode_new_format(static_environment, trajectory, final_reward)
+            
+        return solution
+
+    # ------------------------------------------------------------------
+    # AlphaZero MCTS Implementation (Optimized)
+    # ------------------------------------------------------------------
+    
+    def search(self, root_node: Node, v_node_id: int) -> None:
+        """Dispatch to C++ engine when available, otherwise use Python MCTSEngine."""
+        if getattr(self, "cpp_adapter", None) is not None:
+            try:
+                result = self.cpp_adapter.run_search(root_node, v_node_id)
+                if result is not None:
+                    return
+            except Exception as exc:
+                self.logger.warning(f"C++ MCTS search failed, falling back to Python: {exc}")
+        # Delegate to MCTSEngine
+        self.mcts_engine.search(root_node, v_node_id)
+
+    def _select_best_child(self, node: Node, temperature: float = 1.0) -> Node:
+        """Select best child based on visit counts (delegates to MCTSEngine)."""
+        return self.mcts_engine.select_best_child(node, temperature)
+
+    def get_num_actions(self) -> int:
+        """Get the number of actions in the action space (for cpp_adapter).
+
+        Returns:
+            Number of actions (physical nodes + optional reject action)
+        """
+        num_actions = getattr(self.policy.actor.decoder, 'num_actions', None)
+        if num_actions is not None:
+            return num_actions
+
+        # Fallback: compute from current _p_data if available
+        if self._p_data is not None and hasattr(self._p_data, 'x'):
+            num_nodes = self._p_data.x.size(0)
+            allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
+            return num_nodes + (1 if allow_rejection else 0)
+
+        return 0
+
+    def _log_root_diagnostics(self, root: Node, state: State, v_node_id: int, chosen_child: Node):
+        """Log candidate and search diagnostics at the root."""
+        try:
+            # Candidate diagnostics
+            v_target = v_node_id
+            candidates = self.controller.find_candidate_nodes(
+                v_net=state.v_net, p_net=state.p_net, v_node_id=v_target, filter=state.selected_p_net_nodes)
+            already_taken = 0
+            cpu_violation = 0
+            total_nodes = state.p_net.num_nodes
+            node_resource_names = [attr.name for attr in self.controller.node_resource_attrs]
+            reqs = {name: state.v_net.nodes[v_target].get(name, 0.0) for name in node_resource_names}
+            for p in range(total_nodes):
+                if p in state.selected_p_net_nodes:
+                    already_taken += 1
+                    continue
+                for name in node_resource_names:
+                    avail = state.p_net.nodes[p].get(name, 0.0)
+                    if avail < reqs[name]:
+                        cpu_violation += 1
+                        break
+            # Search diagnostics
+            branching = len(root.children)
+            eff = getattr(root, '_diag_effective_sims', 0)
+            # Root entropy and KL between root visits and NN priors
+            visits = np.array([child.visit_times for child in root.children], dtype=np.float64)
+            pi = visits / max(visits.sum(), 1.0)
+            if hasattr(root, '_diag_root_priors') and root._diag_root_priors:
+                q = np.array(root._diag_root_priors, dtype=np.float64)
+                # Keep only up to children count
+                m = min(len(pi), len(q))
+                pi_s = pi[:m]
+                q_s = q[:m]
+                # Sanitize: clamp to [0,1], renormalize; if degenerate, fallback to uniform
+                q_s = np.where(np.isfinite(q_s) & (q_s > 0.0), q_s, 0.0)
+                if q_s.sum() <= 1e-12:
+                    q_s = np.ones_like(q_s) / max(len(q_s), 1)
+                else:
+                    q_s = q_s / q_s.sum()
+                pi_s = np.where(np.isfinite(pi_s) & (pi_s >= 0.0), pi_s, 0.0)
+                if pi_s.sum() <= 1e-12:
+                    pi_s = np.ones_like(pi_s) / max(len(pi_s), 1)
+                else:
+                    pi_s = pi_s / pi_s.sum()
+                eps = 1e-8
+                kl = float((pi_s * (np.log(pi_s + eps) - np.log(q_s + eps))).sum())
+                entropy = float(-(q_s * np.log(q_s + eps)).sum())
+            else:
+                # Fallback diagnostics when priors unavailable
+                m = max(len(pi), 1)
+                pi_s = pi[:m]
+                pi_s = np.where(np.isfinite(pi_s) & (pi_s >= 0.0), pi_s, 0.0)
+                if pi_s.sum() <= 1e-12:
+                    pi_s = np.ones_like(pi_s) / m
+                else:
+                    pi_s = pi_s / pi_s.sum()
+                entropy = float(-(pi_s * np.log(pi_s + 1e-8)).sum())
+                kl = float('nan')
+            # Q vs U for chosen action at root
+            N = sum(child.visit_times for child in root.children)
+            sqrtN = math.sqrt(N + 1)
+            q_ch = float('nan')
+            u_ch = 0.0
+            if chosen_child is not None:
+                if chosen_child.visit_times > 0:
+                    q_ch = (chosen_child.value / chosen_child.visit_times)
+                u_ch = self.c_puct * chosen_child.prior * sqrtN / (1 + chosen_child.visit_times)
+            self.logger.debug(
+                f"Diag VNF[{v_target}] cand={len(candidates)} taken={already_taken} cpu_violate={cpu_violation} | "
+                f"branch={branching} eff_sims={eff} | H(root)={entropy:.3f} KL(pi||logit)={kl:.3f} | Q={q_ch:.3f} U={u_ch:.3f}")
+        except Exception as e:
+            self.logger.debug(f"Diagnostics logging skipped: {e}")
+
+    def _log_root_prior_stats(self, root: Node, state: State, v_node_id: int):
+        """Log entropy of NN prior over feasible actions, H/H*, top-5, and Spearman corr with visits."""
+        try:
+            candidate_states = state.get_candidate_states()
+            feas_ids = [st.p_node_id for st in candidate_states if 0 <= st.p_node_id < state.p_net.num_nodes]
+            num_feasible = len(feas_ids)
+            priors = getattr(root, '_diag_root_priors', None)
+            if not priors or num_feasible == 0:
+                self.logger.debug(f"PriorStats VNF[{v_node_id}] feasible={num_feasible} H(prior)=nan H*={np.log(max(num_feasible,1)):.3f} ratio=nan top5=[] spearman=nan")
+                return
+            q = np.array(priors, dtype=np.float64)
+            q = q[:len(candidate_states)]
+            # mask to feasible only (exclude reject and -1)
+            mask = np.array([0 <= st.p_node_id < state.p_net.num_nodes for st in candidate_states], dtype=bool)
+            q = q[mask]
+            q = q / max(q.sum(), 1e-8)
+            eps = 1e-8
+            H = float(-(q * np.log(q + eps)).sum())
+            H_star = float(np.log(max(num_feasible, 1)))
+            ratio = H / H_star if H_star > 0 else float('nan')
+            order = np.argsort(-q)[:5]
+            top5 = [(int(i), float(q[i])) for i in order]
+            # Spearman correlation between prior probs and child visit counts (after search)
+            try:
+                visits = np.array([child.visit_times for child in root.children], dtype=np.float64)
+                visits = visits[:len(candidate_states)][mask]
+                if visits.sum() > 0 and len(visits) == len(q):
+                    # rank transform
+                    def rankdata(a):
+                        # average ranks for ties
+                        temp = a.argsort()
+                        ranks = np.empty_like(temp, dtype=np.float64)
+                        ranks[temp] = np.arange(len(a))
+                        # handle ties
+                        _, inv, counts = np.unique(a, return_inverse=True, return_counts=True)
+                        sums = np.bincount(inv, ranks)
+                        avg = sums / counts
+                        return avg[inv]
+                    r_q = rankdata(q)
+                    r_v = rankdata(visits)
+                    r_q = (r_q - r_q.mean()) / (r_q.std() + 1e-8)
+                    r_v = (r_v - r_v.mean()) / (r_v.std() + 1e-8)
+                    spearman = float((r_q * r_v).mean())
+                else:
+                    spearman = float('nan')
+            except Exception:
+                spearman = float('nan')
+            self.logger.debug(f"PriorStats VNF[{v_node_id}] feasible={num_feasible} H(prior)={H:.3f} H*={H_star:.3f} ratio={ratio:.3f} top5={top5} spearman={spearman:.3f}")
+        except Exception as e:
+            self.logger.debug(f"PriorStats logging skipped: {e}")
+
+    # ------------------------------------------------------------------
+    def _state_to_obs(self, state: State, v_node_id: int = None) -> dict:
+        """Convert state to observation for NN evaluation.
+
+        Note: Returns observation with CPU tensors for pickle-safe IPC with batched GPU worker.
+        The GPU worker will handle moving tensors to device internally.
+        """
+        return self.obs_builder.build(state, self.policy, v_node_id)
+
+    # ------------------------------------------------------------------
+    # Utility methods (same as original)
+    # ------------------------------------------------------------------
+    
+    def _store_episode_new_format(self, static_environment: dict, trajectory: List[dict], final_reward: float) -> None:
+        """Store episode in new efficient JSON format."""
+        policy_state_dict = self.policy.state_dict() if self.policy is not None else None
+        self.trajectory_writer.save_episode(
+            static_environment=static_environment,
+            trajectory=trajectory,
+            final_reward=final_reward,
+            policy_state_dict=policy_state_dict
+        )
+
+    def _cleanup(self, keep: int = None) -> None:
+        """Clean up old replay buffer files, keeping only the most recent ones."""
+        self.trajectory_writer.cleanup(keep=keep)
+
+    def _create_static_environment(self, p_net, v_net) -> dict:
+        """Create static environment data containing unchanging network info."""
+        # Same as original implementation
+        physical_network = {
+            "nodes": [
+                {
+                    "id": node_id,
+                    "max_cpu": p_net.nodes[node_id].get("max_cpu", p_net.nodes[node_id].get("cpu", 0))
+                }
+                for node_id in p_net.nodes
+            ],
+            "links": [
+                {
+                    "source": u,
+                    "target": v,
+                    "max_bw": p_net.edges[u, v].get("max_bw", p_net.edges[u, v].get("bw", 0))
+                }
+                for u, v in p_net.edges
+            ]
+        }
+        
+        sfc_request = {
+            "nodes": [
+                {
+                    "id": node_id,
+                    "cpu_demand": v_net.nodes[node_id].get("cpu", 0)
+                }
+                for node_id in v_net.nodes
+            ],
+            "links": [
+                {
+                    "source": u,
+                    "target": v,
+                    "bw_demand": v_net.edges[u, v].get("bw", 0)
+                }
+                for u, v in v_net.edges
+            ]
+        }
+        
+        return {
+            "physical_network": physical_network,
+            "sfc_request": sfc_request
+        }
+    
+    def _create_timestep_data(self, node: Node, v_node_id: int, action_taken: int) -> dict:
+        """Create timestep data with full observation for learner consumption."""
+        state = node.state
+
+        # Get the exact observation dict used by the neural network
+        obs = self._state_to_obs(state, v_node_id)
+
+        # Convert PyG Data to CPU tensors for serialization
+        obs_cpu = self._obs_to_cpu(obs)
+
+        # Compute policy distribution over action space (only physical node placements)
+        num_actions = self.policy.actor.decoder.num_actions
+        policy = self._compute_policy_vector(node, num_actions)
+        # Fallback if no visits (all zeros): use NN prior over feasible actions or uniform
+        if sum(policy) == 0.0:
+            try:
+                priors = getattr(node, '_diag_root_priors', None)
+                if priors:
+                    # Map priors aligned to candidate order back into global action space length
+                    cand_states = state.get_candidate_states()
+                    cand_priors = priors[:len(cand_states)]
+                    pi = [0.0] * num_actions
+                    s = sum(max(0.0, float(p)) for p in cand_priors)
+                    if s <= 1e-8:
+                        raise ValueError('empty priors')
+                    for st, p in zip(cand_states, cand_priors):
+                        a = st.p_node_id
+                        if 0 <= a < num_actions:
+                            pi[a] = float(p) / s
+                    policy = pi
+                else:
+                    raise ValueError('no priors')
+            except Exception:
+                # Uniform over feasible
+                pi = [0.0] * num_actions
+                cand_nodes = self.controller.find_candidate_nodes(
+                    v_net=state.v_net, p_net=state.p_net, v_node_id=v_node_id, filter=state.selected_p_net_nodes)
+                if not cand_nodes:
+                    # If REJECT action exists, put full prob on reject; else uniform over all actions
+                    reject_idx = state.p_net.num_nodes
+                    if num_actions > reject_idx:
+                        pi[reject_idx] = 1.0
+                    else:
+                        # Avoid all-zero vector: uniform over all actions
+                        for a in range(num_actions):
+                            pi[a] = 1.0 / max(1, num_actions)
+                else:
+                    s = float(len(cand_nodes))
+                    for a in cand_nodes:
+                        if 0 <= a < num_actions:
+                            pi[a] = 1.0 / s
+                policy = pi
+
+        # Get value from root NN evaluation
+        value_root = self._compute_value(node, v_node_id)
+
+        # Action mask for loss masking (optional)
+        candidate_nodes = self.controller.find_candidate_nodes(
+            v_net=state.v_net,
+            p_net=state.p_net,
+            v_node_id=v_node_id,
+            filter=state.selected_p_net_nodes,
+        )
+        action_mask = [False] * num_actions
+        for node_id in candidate_nodes:
+            if 0 <= node_id < num_actions:
+                action_mask[node_id] = True
+        # REJECT action at last index if present
+        if num_actions > state.p_net.num_nodes:
+            action_mask[state.p_net.num_nodes] = True
+
+        return {
+            "observation": obs_cpu,        # Full observation dict (on CPU)
+            "pi": policy,                  # Visit-count distribution over num_actions
+            "v_root": value_root,          # NN value at root
+            "a_taken": action_taken,       # Picked action index
+            "mask": action_mask            # Action mask for loss masking
+        }
+    
+    def _obs_to_cpu(self, obs: dict) -> dict:
+        """Convert observation tensors to CPU for serialization."""
+        return self.obs_builder.obs_to_cpu(obs)
+
+    def _compute_policy_vector(self, node: Node, num_actions: int = None) -> List[float]:
+        """Compute normalized policy vector from MCTS visit counts.
+
+        Args:
+            node: MCTS node with children representing actions taken
+            num_actions: Total action space size (p_net_num_nodes for physical node placements)
+
+        Returns:
+            Policy vector of length num_actions with visit-count distribution
+        """
+        if num_actions is None:
+            num_actions = node.state.p_net.num_nodes
+
+        policy = [0.0] * num_actions
+
+        if not node.children:
+            return policy
+
+        total_visits = sum(child.visit_times for child in node.children)
+        if total_visits == 0:
+            return policy
+
+        for child in node.children:
+            p_node_id = child.state.p_node_id
+            # Map p_node_id to action index (1:1 mapping for physical nodes)
+            if 0 <= p_node_id < num_actions:
+                policy[p_node_id] = child.visit_times / total_visits
+
+        return policy
+    
+    def _compute_value(self, node: Node, v_node_id: int) -> float:
+        """Compute value estimate from MCTS root node."""
+        if node.visit_times == 0:
+            obs = self._state_to_obs(node.state, v_node_id)
+            _, value_float = self.policy_network.evaluate(obs, use_nn_value=True)
+            return value_float
+        return node.value / node.visit_times
+    
+    def _compute_final_reward(self, solution: Solution, v_net, p_net) -> float:
+        """Compute the final reward for the trajectory."""
+        if solution.get("result", False):
+            v_net_cost = self.counter.calculate_v_net_cost(v_net, solution)
+            v_net_revenue = self.counter.calculate_v_net_revenue(v_net)
+            return 1000 + v_net_revenue - v_net_cost
+        else:
+            return -1000.0
+
+    def solve_vnr_with_mcts(self, v_net, p_net, solution, controller, training: bool = None):
+        """Consolidated MCTS VNR solving method used by both solver and workers.
+
+        Args:
+            training: If True, use training temperature; if False, use eval temperature.
+                     If None, infer from disable_trajectory_writing.
+        """
+        # Same implementation as original, but with optimizations
+        from virne.solver.learning.utils import load_pyg_data_from_network
+
+        # Keep data on CPU for pickle-safe IPC with batched GPU worker
+        self._p_data = load_pyg_data_from_network(p_net)
+        self._v_data = load_pyg_data_from_network(v_net)
+
+        # Always compute real encoder outputs (move to device only temporarily)
+        v_data_gpu = self._v_data.to(self.device)
+        encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
+        self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
+
+        # Set episode data in observation builder
+        self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+
+        # Determine temperature based on mode
+        if training is None:
+            training = not self.disable_trajectory_writing
+        temperature = self.temperature_train if training else self.temperature_eval
+
+        current_node = Node(
+            None,
+            State(
+                p_net,
+                v_net,
+                controller,
+                self.recorder,
+                self.counter,
+                link_params={
+                    'shortest_method': self.shortest_method,
+                    'k': self.k_shortest,
+                },
+            ),
+        )
+
+        # Generate training data for this episode (optional)
+        static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
+        trajectory = [] if not self.disable_trajectory_writing else None
+        allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
+
+        for v_node_idx in range(v_net.num_nodes):
+            # Use actual virtual node id under stable ordering
+            next_pos = current_node.state.v_node_id + 1
+            curr_v_id = current_node.state.v_order[next_pos]
+            self.search(current_node, curr_v_id)
+
+            best_child = self._select_best_child(current_node, temperature=temperature)
+            if best_child is None:
+                self.logger.warning(
+                    f"Worker MCTS failed to select child for v_node={curr_v_id} "
+                    f"(step={current_node.state.v_node_id + 1})"
+                )
+                return False
+
+            # Handle REJECT
+            reject_idx = current_node.state.p_net.num_nodes
+            if allow_rejection and best_child.state.p_node_id == reject_idx:
+                self._episode_rejects += 1
+                self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
+                return False
+            # Guard against invalid action (-1 or out of range). This can happen when a child
+            # is pruned during incremental feasibility checks and marked as terminal-bad.
+            if best_child.state.p_node_id < 0 or best_child.state.p_node_id >= reject_idx:
+                self.logger.warning(
+                    f"Worker selected invalid p_node_id={best_child.state.p_node_id} "
+                    f"(reject_idx={reject_idx}) for v_node={curr_v_id}"
+                )
+                self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
+                return False
+
+            p_node_id = best_child.state.p_node_id
+            placed_v = best_child.state.v_order[best_child.state.v_node_id]
+            
+            place_result, place_info = controller.node_mapper.place(
+                v_net, p_net, placed_v, p_node_id, solution=solution
+            )
+            
+            if not place_result:
+                self.logger.warning(
+                    f"Controller rejected placement v_node={placed_v} -> "
+                    f"p_node={p_node_id} offsets={place_info}"
+                )
+                self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
+                return False
+                
+            if not self.disable_trajectory_writing:
+                timestep_data = self._create_timestep_data(current_node, curr_v_id, p_node_id)
+                trajectory.append(timestep_data)
+            # Log root diagnostics once per decision
+            self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
+            
+            best_child.parent = None
+            current_node = best_child
+
+        # Store episode for learning (optional)
+        if not self.disable_trajectory_writing:
+            final_reward = self._compute_final_reward(solution, v_net, p_net)
+            # Value calibration update using root prediction if available
+            root_pred = getattr(current_node, '_diag_root_value', None)
+            if root_pred is not None:
+                self._calib_n += 1
+                self._calib_sum_pred += root_pred
+                self._calib_sum_true += final_reward
+                self._calib_sum_pred2 += root_pred * root_pred
+                self._calib_sum_true2 += final_reward * final_reward
+                self._calib_sum_prod += root_pred * final_reward
+                if self._calib_n % 50 == 0:
+                    n = float(self._calib_n)
+                    cov = self._calib_sum_prod - (self._calib_sum_pred * self._calib_sum_true) / n
+                    varx = self._calib_sum_pred2 - (self._calib_sum_pred ** 2) / n
+                    vary = self._calib_sum_true2 - (self._calib_sum_true ** 2) / n
+                    corr = cov / max((varx * vary) ** 0.5, 1e-8)
+                    self.logger.info(f"Value calibration: n={self._calib_n} corr={corr:.3f}")
+            # Episode-level reject usage
+            if self._episode_rejects:
+                self.logger.info(f"Reject actions this episode: {self._episode_rejects}")
+            self._episode_rejects = 0
+            self._store_episode_new_format(static_environment, trajectory, final_reward)
+            self._cleanup()
+        
+        # Mark final result for downstream consumers
+        solution["result"] = True
+        return True
+
+    def shutdown(self):
+        """Cleanup method to shut down GPU worker."""
+        if hasattr(self, 'policy_network'):
+            self.policy_network.shutdown()
+
+    def __del__(self):
+        """Ensure GPU worker is shut down on deletion."""
+        if hasattr(self, 'policy_network'):
+            self.policy_network.shutdown()

@@ -186,7 +186,7 @@ class Critic(nn.Module):
 class AutoregressiveDecoder(nn.Module):
     """
     Transformer-based decoder for autoregressive action selection in SFC placement.
-    Computes per-node placement logits and context-based special action logits (revoke/reject).
+    Computes per-node placement logits for physical node assignments.
     """
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
                  n_heads=8, n_layers=4, dropout=0.1, is_actor=True,
@@ -196,11 +196,10 @@ class AutoregressiveDecoder(nn.Module):
         self.embedding_dim = embedding_dim
         self.use_amp = use_amp
         self.p_net_num_nodes = p_net_num_nodes
+        self.allow_rejection = bool(allow_rejection)
 
-        # Action indices
-        self.revoke_action_idx = p_net_num_nodes
-        self.reject_action_idx = p_net_num_nodes + 1
-        self.num_actions = p_net_num_nodes + 2
+        # Action space: physical node placements (+ optional REJECT)
+        self.num_actions = p_net_num_nodes + (1 if self.allow_rejection else 0)
         self.start_token = self.num_actions  # Used for history embeddings (start of sequence)
         self.pad_token = self.num_actions + 1  # Used for sequence padding
 
@@ -214,7 +213,7 @@ class AutoregressiveDecoder(nn.Module):
             MultiHeadGENLayer(
                 in_dim=p_net_feature_dim if i == 0 else embedding_dim,
                 out_dim=embedding_dim,
-                edge_dim=p_net_edge_dim
+                edge_dim=p_net_edge_dim if i == 0 else embedding_dim
             )
             for i in range(3)
         ])
@@ -233,10 +232,11 @@ class AutoregressiveDecoder(nn.Module):
         self.history_feature_dim = p_net_feature_dim
         self.history_embed = nn.Linear(self.history_feature_dim, self.embedding_dim)
     
-        # Learnable embeddings
-        self.revoke_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
-        self.reject_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
+        # Learnable embeddings (only start_embedding, special actions removed)
         self.start_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
+        # TODO: Add revoke_embedding and reject_embedding when implementing special actions
+        # self.revoke_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
+        # self.reject_embedding = nn.Parameter(torch.randn(self.history_feature_dim))
         
         # Actor heads
         self.is_actor = is_actor
@@ -254,12 +254,21 @@ class AutoregressiveDecoder(nn.Module):
                 nn.Linear(embedding_dim, 1)
             )
 
-            # Predict 2 scores from decoder context (revoke, reject)
-            self.special_action_head = nn.Sequential(
-                nn.Linear(embedding_dim, embedding_dim // 2),
-                nn.GELU(),
-                nn.Linear(embedding_dim // 2, 2)
-            )
+            # Optional special-action head for REJECT
+            if self.allow_rejection:
+                self.reject_head = nn.Sequential(
+                    nn.Linear(embedding_dim, embedding_dim // 2),
+                    nn.GELU(),
+                    nn.Linear(embedding_dim // 2, 1)
+                )
+
+            # Special actions removed for now (no revoke/reject)
+            # TODO: Implement special_action_head when adding revoke/reject support
+            # self.special_action_head = nn.Sequential(
+            #     nn.Linear(embedding_dim, embedding_dim // 2),
+            #     nn.GELU(),
+            #     nn.Linear(embedding_dim // 2, 2)
+            # )
             
             # Initialization
             nn.init.xavier_uniform_(self.history_embed.weight)
@@ -268,10 +277,11 @@ class AutoregressiveDecoder(nn.Module):
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight)
                     nn.init.zeros_(layer.bias)
-            for layer in self.special_action_head:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
+            if self.allow_rejection:
+                for layer in self.reject_head:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.xavier_uniform_(layer.weight)
+                        nn.init.zeros_(layer.bias)
 
         
 
@@ -295,7 +305,7 @@ class AutoregressiveDecoder(nn.Module):
 
         # Apply GAT layers
         for gat_layer in self.gat_layers:
-            node_features, _ = gat_layer(node_features, edge_index, edge_attr)
+            node_features, edge_attr = gat_layer(node_features, edge_index, edge_attr)
         graph_embedding = self.gat_projection(node_features)
 
         # Embed history  
@@ -355,39 +365,44 @@ class AutoregressiveDecoder(nn.Module):
 
         # Compute node scores
         combined = torch.cat([
-            F.normalize(graph_embedding, dim=-1),
-            F.normalize(attn_context_per_node, dim=-1),
+            F.normalize(graph_embedding, dim=-1, eps=1e-6),
+            F.normalize(attn_context_per_node, dim=-1, eps=1e-6),
         ], dim=-1)
         node_scores = self.node_score_head(combined).squeeze(-1)
 
-        # Compute special action scores
-        special_action_scores = self.special_action_head(final_context_embedding)  # (B, 2)
-
-        # Assemble final logits
-        raw_logits = torch.full((B, self.num_actions), -20.0, device=node_scores.device, dtype=node_scores.dtype)
-        padded_node_scores = torch.full((B, self.p_net_num_nodes), -20.0, device=node_scores.device)
+        # Assemble final logits for physical nodes
+        raw_logits_nodes = torch.full((B, self.p_net_num_nodes), -20.0, device=node_scores.device, dtype=node_scores.dtype)
 
         current_node_idx = 0
         for i in range(B):
             num_nodes = nodes_per_graph[i].item()
-            nodes_to_consider = min(num_nodes, self.p_net_num_nodes)
+            nodes_to_consider = min(num_nodes, self.num_actions)  # Clamp to action space size
             if nodes_to_consider > 0:
-                padded_node_scores[i, :nodes_to_consider] = node_scores[current_node_idx:current_node_idx + nodes_to_consider]
+                raw_logits_nodes[i, :nodes_to_consider] = node_scores[current_node_idx:current_node_idx + nodes_to_consider]
             current_node_idx += num_nodes
 
-        raw_logits[:, :self.p_net_num_nodes] = padded_node_scores
-        raw_logits[:, self.revoke_action_idx:self.reject_action_idx + 1] = special_action_scores
+        # Optional REJECT logit
+        if self.is_actor and self.allow_rejection:
+            reject_logit = self.reject_head(final_context_embedding)  # [B, 1]
+            raw_logits = torch.cat([raw_logits_nodes, reject_logit], dim=-1)  # [B, p_nodes + 1]
+        else:
+            raw_logits = raw_logits_nodes
 
         # Apply action mask and clamp 
         safe_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
         mask      = obs['action_mask'].bool()
-        minus_inf = -torch.finfo(raw_logits.dtype).max
-        final_logits = torch.where(mask, safe_logits, minus_inf)
+        # Use a dtype-safe large finite negative to avoid overflow under autocast
+        try:
+            finfo = torch.finfo(safe_logits.dtype)
+            neg_val = finfo.min * 0.5  # stay finite and within dtype range
+        except (TypeError, ValueError):
+            neg_val = -1e9
+        neg_large = torch.full_like(safe_logits, neg_val)
+        final_logits = torch.where(mask, safe_logits, neg_large)
 
         T = getattr(self, "temperature", 1.0)
         if T != 1.0:
-            valid = final_logits > minus_inf / 2
             final_logits = final_logits.clone()
-            final_logits[valid] = final_logits[valid] / T
+            final_logits[mask] = final_logits[mask] / T
         
         return final_logits  

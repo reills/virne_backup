@@ -3,6 +3,10 @@
 
 #datasets
 ablation_results
+benchmark_results/
+k_specific_training/
+sfc_datasets/
+sfc_study_results/
 results/*
 outputs/* 
 dataset/
@@ -20,6 +24,13 @@ p_net
 
 
 # build
+**/Makefile
+**/CMakeCache.txt
+**/cmake_install.cmake
+CMakeFiles/
+**/CMakeCache.txt
+**/*.cubin
+**/*.so
 virne.egg-info
 dist
 

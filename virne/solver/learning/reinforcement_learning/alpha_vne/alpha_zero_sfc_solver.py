@@ -1,7 +1,9 @@
+# ==============================================================================
+# alpha_zero_sfc_solver.py
+# ==============================================================================  
 from __future__ import annotations
 
 import os
-import copy
 import multiprocessing
 from multiprocessing import Process
 from typing import Optional, Tuple, Dict, Any
@@ -15,7 +17,6 @@ from virne.utils.config import get_run_id_dir
 
 from .actor_optimized import OptimizedAlphaZeroActor
 from .learner import AlphaZeroLearner
-from .node import Node, State
 
 
 
@@ -35,6 +36,13 @@ class AlphaZeroSFCSolver(RLSolver):
         batch_size: int = 32,
         **kwargs,
     ) -> None:
+        # Ensure spawn is the global start method for CUDA safety
+        try:
+            import multiprocessing as _mp
+            _mp.set_start_method('spawn', force=True)
+            logger.info("Multiprocessing start_method set to 'spawn'")
+        except Exception:
+            pass
         # AlphaZero uses its own neural network, provide required functions for RLSolver
         def make_policy(solver):
             from .net import ActorCritic
@@ -79,13 +87,17 @@ class AlphaZeroSFCSolver(RLSolver):
         self.policy_path = os.path.join(self.models_dir, "policy_latest.pt")
         
         # Standard VNE solver parameters
-        self.shortest_method = kwargs.get('shortest_method', 'k_shortest')
-        self.k_shortest = kwargs.get('k_shortest', 10)
+        # Honor global config.solver settings to enable ablations (e.g., k_shortest)
+        self.shortest_method = getattr(config.solver, 'shortest_method', getattr(self, 'shortest_method', 'k_shortest'))
+        self.k_shortest = getattr(config.solver, 'k_shortest', getattr(self, 'k_shortest', 10))
 
         # Use optimized actor with batched GPU inference
         use_batched_gpu = getattr(config.training, 'use_batched_gpu', True)
         disable_trajectory_writing = getattr(config.training, 'disable_trajectory_writing', False)
         
+        # Build the primary actor. Explicitly pass shortest_method/k_shortest so
+        # State.link_params used for feasibility checks and reward match the
+        # orchestrator's link-mapping config.
         self.actor = OptimizedAlphaZeroActor(
             controller,
             recorder,
@@ -96,6 +108,8 @@ class AlphaZeroSFCSolver(RLSolver):
             models_dir=self.models_dir,
             use_batched_gpu=use_batched_gpu,
             disable_trajectory_writing=disable_trajectory_writing,
+            shortest_method=self.shortest_method,
+            k_shortest=self.k_shortest,
             **kwargs,
         )
         
@@ -149,9 +163,28 @@ class AlphaZeroSFCSolver(RLSolver):
         self.logger.info(f"Learner terminated after {total_steps} training steps")
 
     def _start_learner(self) -> None:
+        """Start the learner in a CUDA-safe spawned process (rebuilds components in child)."""
         if self.learner_process is not None and self.learner_process.is_alive():
             return
-        self.learner_process = Process(target=self._learner_loop, daemon=True)
+        # Use saved config file for reconstruction
+        config_path = os.path.join(get_run_id_dir(self.config), 'config.yaml')
+        try:
+            import multiprocessing as mp
+            ctx = mp.get_context('spawn')
+            self.learner_process = ctx.Process(
+                target=_learner_process_entry,
+                args=(config_path, self.replay_dir, self.models_dir, self.batch_size),
+                daemon=True,
+            )
+            self.logger.info("Starting learner process with start_method=spawn")
+        except Exception:
+            # Fallback to default if spawn is unavailable
+            self.learner_process = Process(
+                target=_learner_process_entry,
+                args=(config_path, self.replay_dir, self.models_dir, self.batch_size),
+                daemon=True,
+            )
+            self.logger.warning("Falling back to default start_method (not spawn)")
         self.learner_process.start()
 
     # ------------------------------------------------------------------
@@ -197,9 +230,24 @@ class AlphaZeroSFCSolver(RLSolver):
             
         current_mtime = os.path.getmtime(self.policy_path)
         if self._cached_model_mtime != current_mtime:
-            self.actor.policy.load_state_dict(
-                torch.load(self.policy_path, map_location=self.actor.device)
-            )
+            state = torch.load(self.policy_path, map_location=self.actor.device)
+            self.actor.policy.load_state_dict(state)
+            # Ensure model is on correct device after loading
+            self.actor.policy.to(self.actor.device)
+            # Instrument: log checkpoint stats to prove non-zero weights
+            try:
+                import hashlib
+                h = hashlib.sha256()
+                with torch.no_grad():
+                    for n, p in self.actor.policy.state_dict().items():
+                        h.update(n.encode()); h.update(p.detach().cpu().numpy().tobytes())
+                sha = h.hexdigest()
+                n_params = sum(p.numel() for p in self.actor.policy.parameters())
+                first_lin = getattr(self.actor.policy.encoder, 'token_embed', None)
+                l2 = float(first_lin.weight.detach().norm().item()) if first_lin is not None else float('nan')
+                self.logger.info(f"Actor reloaded policy: path={self.policy_path} sha256={sha[:12]}.. params={n_params} token_embed_L2={l2:.3f}")
+            except Exception:
+                pass
             self._cached_model_mtime = current_mtime
 
     def _node_mapping_with_mcts(self, v_net, p_net, solution):
@@ -221,6 +269,9 @@ class AlphaZeroSFCSolver(RLSolver):
         self.logger.info(f"AlphaZero Training: {num_epochs} epochs x {total_vnrs} VNRs each")
         self.logger.info(f"Using distributed_training: {self.config.training.distributed_training}, num_workers: {self.config.training.num_workers}")
         
+        # Safety: warn if trajectory writing is disabled while training, which would starve the learner
+        if getattr(self.actor, 'disable_trajectory_writing', False):
+            self.logger.warning("Trajectory writing is disabled; the learner will not receive new episodes.")
         self._start_learner()
         
         # Use the standard RLSolver distributed training if enabled
@@ -403,6 +454,74 @@ class AlphaZeroSFCSolver(RLSolver):
 
 # Removed: _solve_vnr_with_mcts_worker - consolidated into actor.solve_vnr_with_mcts
 
+def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, batch_size: int):
+    """Spawn-safe learner entrypoint. Rebuilds environment and trains in a loop.
+
+    Args:
+        config_path: Path to saved Hydra config YAML for this run
+        replay_dir: Directory where actors write episodes
+        models_dir: Directory to write models/checkpoints
+        batch_size: Learner batch size
+    """
+    import os
+    import time
+    from omegaconf import OmegaConf
+    from virne.system.base_system import BaseSystem
+    from virne.core import Controller, Recorder, Counter, Logger
+    import multiprocessing as mp
+
+    config = OmegaConf.load(config_path)
+    logger = Logger(config=config)
+    logger.info(f"Learner spawned with config: {config_path}")
+    try:
+        logger.info(f"Start method (child) = {mp.get_start_method(default='spawn')}")
+    except Exception:
+        pass
+
+    # Build env components fresh (avoid pickling parent objects)
+    p_net, _ = BaseSystem.load_dataset(logger, config)
+    node_attrs_setting = config.v_sim_setting['node_attrs_setting']
+    link_attrs_setting = config.v_sim_setting['link_attrs_setting']
+    graph_attrs_setting = config.v_sim_setting.get('graph_attrs_setting', {})
+    counter = Counter(node_attrs_setting, link_attrs_setting, graph_attrs_setting, config)
+    controller = Controller(node_attrs_setting, link_attrs_setting, graph_attrs_setting, config)
+    recorder = Recorder(counter, config, worker_id=9999)
+
+    learner = AlphaZeroLearner(
+        controller,
+        recorder,
+        counter,
+        logger,
+        config,
+        replay_dir=replay_dir,
+        models_dir=models_dir,
+        batch_size=batch_size,
+    )
+
+    # Training loop with conditions from config
+    max_training_steps = getattr(config.training, 'max_training_steps', 10000)
+    min_buffer_size = getattr(config.training, 'min_buffer_size', 100)
+    max_empty_batches = getattr(config.training, 'max_empty_batches', 50)
+    steps_per_iter = getattr(config.training, 'num_train_steps_per_epoch', 100)
+
+    total_steps = 0
+    consecutive_empty = 0
+    while total_steps < max_training_steps:
+        files = [f for f in os.listdir(replay_dir) if f.endswith('.json')]
+        if len(files) < min_buffer_size:
+            consecutive_empty += 1
+            if consecutive_empty > max_empty_batches:
+                logger.warning(f"Stopping learner: insufficient data for {max_empty_batches} attempts")
+                break
+            time.sleep(1.0)
+            continue
+        consecutive_empty = 0
+        stats = learner.train_steps(steps_per_iter)
+        total_steps += steps_per_iter
+        if stats:
+            logger.info(f"Learner iter: +{steps_per_iter} steps, avg_total_loss={stats['avg_total_loss']:.4f}")
+    logger.info(f"Learner terminated after {total_steps} training steps")
+
 def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: str, policy_path: str):
     """Create environment components for a worker process."""
     # Set different random seed for each worker
@@ -436,14 +555,18 @@ def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: st
     
     # Create a minimal solver instance for this worker (just for solving, no training)
     # Use optimized actor but disable batching for workers (to avoid multiprocessing conflicts)
+    # Workers act as additional actors to collect episodes into the shared replay buffer.
+    # Keep batched GPU off to avoid CUDA contention across processes; write trajectories.
     worker_actor = OptimizedAlphaZeroActor(
         controller, recorder, counter, logger, config,
         replay_dir=replay_dir,
         models_dir=os.path.dirname(policy_path),
-        use_batched_gpu=False,  # Disable batching for worker processes
-        disable_trajectory_writing=True,  # Workers don't need to write trajectories
+        use_batched_gpu=False,
+        disable_trajectory_writing=False,
+        shortest_method=getattr(config.solver, 'shortest_method', getattr(controller, 'shortest_method', 'k_shortest')),
+        k_shortest=getattr(config.solver, 'k_shortest', 10),
     )
-    
+
     return env, controller, worker_actor
 
 def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, replay_dir: str, policy_path: str) -> None:
@@ -488,20 +611,21 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
             if os.path.exists(policy_path):
                 current_mtime = os.path.getmtime(policy_path)
                 if cached_model_mtime != current_mtime:
-                    worker_actor.policy.load_state_dict(
-                        torch.load(policy_path, map_location=worker_actor.device)
-                    )
+                    state_dict = torch.load(policy_path, map_location=worker_actor.device)
+                    worker_actor.policy.load_state_dict(state_dict)
+                    # Ensure model is on correct device after loading
+                    worker_actor.policy.to(worker_actor.device)
                     cached_model_mtime = current_mtime
             
             # Use MCTS to solve this VNR - simplified version for worker
             node_mapping_result = worker_actor.solve_vnr_with_mcts(v_net, p_net, solution, controller)
             
             if node_mapping_result:
-                # Standard link mapping using the controller
+                # Standard link mapping using the controller (respect config.solver.*)
                 link_mapping_result = controller.link_mapper.link_mapping(
                     v_net, p_net, solution=solution,
-                    shortest_method='k_shortest', 
-                    k=10, 
+                    shortest_method=getattr(config.solver, 'shortest_method', 'k_shortest'),
+                    k=getattr(config.solver, 'k_shortest', 10),
                     inplace=True
                 )
                 if link_mapping_result:

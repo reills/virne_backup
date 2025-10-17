@@ -106,6 +106,24 @@ class NodeMapper:
         """
         check_result, check_info = self.constraint_checker.check_node_level_constraints(v_net, p_net, v_node_id, p_node_id)
         if not check_result:
+            logger = logging.getLogger(__name__)
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    demand = {attr.name: v_net.nodes[v_node_id].get(attr.name, None) for attr in self.node_resource_attrs}
+                except Exception:
+                    demand = {}
+                try:
+                    supply = {attr.name: p_net.nodes[p_node_id].get(attr.name, None) for attr in self.node_resource_attrs}
+                except Exception:
+                    supply = {}
+                logger.debug(
+                    "NodeMapper::_safely_place rejected v_node=%s -> p_node=%s demand=%s supply=%s offsets=%s",
+                    v_node_id,
+                    p_node_id,
+                    demand,
+                    supply,
+                    check_info,
+                )
             return False, check_info
         used_node_resources = {n_attr.name: v_net.nodes[v_node_id][n_attr.name] for n_attr in self.node_resource_attrs}
         self.resource_updator.update_node_resources(p_net, p_node_id, used_node_resources, operator='-')

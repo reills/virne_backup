@@ -3,11 +3,13 @@ training:
   use_cuda: true
   gpu_id: 0
   distributed_training: true
+  num_epochs: 1
   num_train_epochs: 20
   num_workers: 4
   batch_size: 32
   log_interval: 1
   save_interval: 50
+  save_checkpoint_history: false
   eval_interval: 10
   learning_rate: 0.001  # only for non-rl training
   model_dir_name: models
@@ -32,6 +34,16 @@ training:
   gpu_batch_size: 32        # Batch size for GPU worker
   gpu_timeout_ms: 10        # Timeout for collecting batch requests
   disable_trajectory_writing: false  # Disable JSON writing for max speed (training only)
+  # NN usage / ablations
+  use_nn_policy: true
+  use_nn_value: true
+  uniform_prior: false
+  # Learner control
+  guaranteed_save_step: 50
+  learner_throttle_ms: 0
+  # C++ MCTS implementation toggle
+  use_cpp_mcts: true        # Use C++ implementation for MCTS (much faster)
+  use_neural_network: true  # Enable neural network usage
 
 inference:
   decode_strategy: greedy

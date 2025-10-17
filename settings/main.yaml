@@ -69,3 +69,5 @@ logger:
   backends: ['console', 'file', 'tensorboard']
   log_show_interval: 20
   log_file_name: 'running.log'  # if file backend is used
+
+use_fixed_dataset: false

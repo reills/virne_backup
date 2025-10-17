@@ -10,6 +10,7 @@ from typing import Any, Dict
 import numpy as np
 import pandas as pd
 from collections import defaultdict, OrderedDict
+import time
 
 from sympy import solve
 from virne import solver
@@ -104,7 +105,12 @@ class Recorder:
         if self.if_temp_save_records:
             if self.worker_id is not None:
                 # Use worker_id for parallel workers to avoid conflicts
-                temp_save_path = os.path.join(self.record_dir, f'temp-worker-{self.worker_id}.csv')
+                pid = os.getpid()
+                timestamp_ms = int(time.time() * 1000)
+                temp_save_path = os.path.join(
+                    self.record_dir,
+                    f'temp-worker-{self.worker_id}-{pid}-{timestamp_ms}.csv',
+                )
             else:
                 # Original logic for single worker
                 suffixes = 0

@@ -187,7 +187,8 @@ class Counter(object):
         # key
         summary_info['acceptance_rate'] = records.iloc[-1]['success_count'] / records.iloc[-1]['v_net_count']
         summary_info['avg_r2c_ratio'] = records.loc[records['event_type']==1, 'v_net_r2c_ratio'].mean()
-        summary_info['long_term_time_r2c_ratio'] = records.iloc[-1]['total_time_revenue'] / records.iloc[-1]['total_time_cost']
+        total_time_cost = records.iloc[-1]['total_time_cost']
+        summary_info['long_term_time_r2c_ratio'] = records.iloc[-1]['total_time_revenue'] / total_time_cost if total_time_cost != 0 else 0.0
         summary_info['long_term_avg_time_revenue'] = records.iloc[-1]['total_time_revenue'] / records.iloc[-1]['v_net_arrival_time']
         # ac rate
         summary_info['success_count'] = records.iloc[-1]['success_count']
@@ -199,7 +200,7 @@ class Counter(object):
         summary_info['total_revenue'] = records.iloc[-1]['total_revenue']
         summary_info['total_time_revenue'] = records.iloc[-1]['total_time_revenue']
         summary_info['total_time_cost'] = records.iloc[-1]['total_time_cost']
-        summary_info['long_term_r2c_ratio'] = summary_info['total_revenue'] / summary_info['total_cost']
+        summary_info['long_term_r2c_ratio'] = summary_info['total_revenue'] / summary_info['total_cost'] if summary_info['total_cost'] != 0 else 0.0
         # revenue / cost
         summary_info['total_simulation_time'] = records.iloc[-1]['v_net_arrival_time']
         summary_info['long_term_avg_revenue'] = summary_info['total_revenue'] / summary_info['total_simulation_time']
