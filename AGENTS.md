@@ -28,3 +28,10 @@ Always run Python tooling for this repository via the project conda environment 
 - Use `conda run -n virne pytest ...` for tests.
 - Use `conda run -n virne pip ...` for package inspection/install within this repo workflow.
 - Do **not** rely on `conda activate virne` in non-interactive shells.
+
+## Local Skills
+
+- `alpha-vne-cpp-build` (file: `skills/alpha-vne-cpp-build/SKILL.md`)
+  - Use when building/troubleshooting `alpha_vne` C++ extension.
+  - One-command rebuild: `bash skills/alpha-vne-cpp-build/scripts/rebuild_alpha_vne_cpp.sh`.
+  - Canonical underlying build command: `bash virne/solver/learning/reinforcement_learning/alpha_vne/cpp_core/build.sh`.
