@@ -19,6 +19,8 @@ public:
 
     void load(const std::string& model_path, torch::Device device = torch::kCUDA);
 
+    torch::Tensor encode(const torch::Tensor& v_net_x);
+
     [[nodiscard]] bool is_loaded() const noexcept { return loaded_; }
     [[nodiscard]] torch::Device device() const noexcept { return device_; }
 

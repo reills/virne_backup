@@ -79,7 +79,7 @@ void VNRState::initialise_virtual_order() {
         scores.emplace_back(v, node_sum + edge_sum);
     }
 
-    std::sort(scores.begin(), scores.end(), [](const auto& a, const auto& b) {
+    std::stable_sort(scores.begin(), scores.end(), [](const auto& a, const auto& b) {
         return a.second > b.second;
     });
 
@@ -192,12 +192,63 @@ double VNRState::lookup_allocation_delta(const std::shared_ptr<const AllocationD
     return total;
 }
 
+void VNRState::rebuild_allocation_totals_cache() const {
+    node_allocation_totals_cache_.clear();
+    link_allocation_totals_cache_.clear();
+
+    auto cursor = allocation_deltas_;
+    while (cursor) {
+        for (const auto& [node_id, resources] : cursor->node_allocations) {
+            auto& out = node_allocation_totals_cache_[node_id];
+            for (const auto& [attr, value] : resources) {
+                if (value <= 0.0) {
+                    continue;
+                }
+                out[attr] += value;
+            }
+        }
+        for (const auto& [edge_id, resources] : cursor->link_allocations) {
+            auto& out = link_allocation_totals_cache_[edge_id];
+            for (const auto& [attr, value] : resources) {
+                if (value <= 0.0) {
+                    continue;
+                }
+                out[attr] += value;
+            }
+        }
+        cursor = cursor->parent;
+    }
+    allocation_totals_cache_valid_ = true;
+}
+
 double VNRState::get_allocated_node_resource(int node_id, const std::string& attr) const {
-    return lookup_allocation_delta(allocation_deltas_, node_id, attr, true);
+    if (!allocation_totals_cache_valid_) {
+        rebuild_allocation_totals_cache();
+    }
+    auto node_it = node_allocation_totals_cache_.find(node_id);
+    if (node_it == node_allocation_totals_cache_.end()) {
+        return 0.0;
+    }
+    auto attr_it = node_it->second.find(attr);
+    if (attr_it == node_it->second.end()) {
+        return 0.0;
+    }
+    return attr_it->second;
 }
 
 double VNRState::get_allocated_link_resource(int edge_id, const std::string& attr) const {
-    return lookup_allocation_delta(allocation_deltas_, edge_id, attr, false);
+    if (!allocation_totals_cache_valid_) {
+        rebuild_allocation_totals_cache();
+    }
+    auto edge_it = link_allocation_totals_cache_.find(edge_id);
+    if (edge_it == link_allocation_totals_cache_.end()) {
+        return 0.0;
+    }
+    auto attr_it = edge_it->second.find(attr);
+    if (attr_it == edge_it->second.end()) {
+        return 0.0;
+    }
+    return attr_it->second;
 }
 
 std::vector<int> VNRState::get_candidate_nodes() const {
@@ -300,6 +351,9 @@ double VNRState::sum_link_allocations() const {
 VNRState VNRState::create_child(int p_node_id) const {
     VNRState child(*this);
     child.selected_p_nodes_cache_valid_ = false;
+    child.allocation_totals_cache_valid_ = false;
+    child.node_allocation_totals_cache_.clear();
+    child.link_allocation_totals_cache_.clear();
     child.v_node_index_ = v_node_index_ + 1;
     child.p_node_id_ = p_node_id;
 
@@ -403,12 +457,45 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         return false;
     }
 
-    const auto& best_path = paths.front().nodes;
-    if (best_path.size() < 2) {
+    const std::vector<int>* selected_path = nullptr;
+    for (const auto& candidate : paths) {
+        if (candidate.nodes.size() < 2) {
+            continue;
+        }
+        bool feasible = true;
+        auto links = path_to_links(candidate.nodes);
+        for (const auto& [u, v] : links) {
+            auto edge_lookup = p_net_->edge_index.find({u, v});
+            if (edge_lookup == p_net_->edge_index.end()) {
+                feasible = false;
+                break;
+            }
+            int edge_id = edge_lookup->second;
+            for (const auto& [attr, demand] : demands) {
+                if (demand <= 0.0) {
+                    continue;
+                }
+                double available = target.get_available_link_resource(edge_id, attr);
+                if (available + kEpsilon < demand) {
+                    feasible = false;
+                    break;
+                }
+            }
+            if (!feasible) {
+                break;
+            }
+        }
+        if (feasible) {
+            selected_path = &candidate.nodes;
+            break;
+        }
+    }
+
+    if (selected_path == nullptr) {
         return false;
     }
 
-    auto links = path_to_links(best_path);
+    auto links = path_to_links(*selected_path);
     for (const auto& [u, v] : links) {
         auto edge_lookup = p_net_->edge_index.find({u, v});
         if (edge_lookup == p_net_->edge_index.end()) {
@@ -454,20 +541,10 @@ double VNRState::get_available_link_resource(int u, int v, const std::string& at
 }
 
 VNRState::SparseResourceAllocations VNRState::get_allocated_node_resources() const {
-    SparseResourceAllocations merged;
-    auto cursor = allocation_deltas_;
-    while (cursor) {
-        for (const auto& [node_id, resources] : cursor->node_allocations) {
-            auto& out = merged[node_id];
-            for (const auto& [attr, value] : resources) {
-                if (value <= 0.0) {
-                    continue;
-                }
-                out[attr] += value;
-            }
-        }
-        cursor = cursor->parent;
+    if (!allocation_totals_cache_valid_) {
+        rebuild_allocation_totals_cache();
     }
+    auto merged = node_allocation_totals_cache_;
 
     for (auto it = merged.begin(); it != merged.end();) {
         auto& resources = it->second;
@@ -488,20 +565,10 @@ VNRState::SparseResourceAllocations VNRState::get_allocated_node_resources() con
 }
 
 VNRState::SparseResourceAllocations VNRState::get_allocated_link_resources() const {
-    SparseResourceAllocations merged;
-    auto cursor = allocation_deltas_;
-    while (cursor) {
-        for (const auto& [edge_id, resources] : cursor->link_allocations) {
-            auto& out = merged[edge_id];
-            for (const auto& [attr, value] : resources) {
-                if (value <= 0.0) {
-                    continue;
-                }
-                out[attr] += value;
-            }
-        }
-        cursor = cursor->parent;
+    if (!allocation_totals_cache_valid_) {
+        rebuild_allocation_totals_cache();
     }
+    auto merged = link_allocation_totals_cache_;
 
     for (auto it = merged.begin(); it != merged.end();) {
         auto& resources = it->second;

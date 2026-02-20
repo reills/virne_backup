@@ -1,6 +1,8 @@
 # ==============================================================================
 # net.py  (Enhanced Transformer with Deeper GAT and Improved Aggregation)
 # ==============================================================================  
+from typing import Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,7 +40,8 @@ class MultiHeadGENLayer(nn.Module):
         out_x = self.dropout(out_x)
 
         # Compute edge features: concat endpoint node features
-        row, col = edge_index
+        row = edge_index[0]
+        col = edge_index[1]
         edge_feat = torch.cat([out_x[row], out_x[col]], dim=1)
         out_e = self.edge_mlp(edge_feat)
 
@@ -72,10 +75,12 @@ class ActorCritic(nn.Module):
     def encode(self, obs):
         return self.encoder(obs['v_net_x'])
 
+    @torch.jit.ignore
     def act(self, obs, training=False):
         return self.actor(obs, training=training)
 
 
+    @torch.jit.ignore
     def evaluate(self, obs):
         return self.critic(obs)
 
@@ -134,6 +139,7 @@ class Actor(nn.Module):
             **kwargs
         )
 
+    @torch.jit.ignore
     def forward(self, obs, training=False):
         return self.decoder(obs, training=training)
 
@@ -166,6 +172,7 @@ class Critic(nn.Module):
             nn.Linear(embedding_dim // 2, 1)
         )
 
+    @torch.jit.ignore
     def forward(self, obs):
         # Get full decoder sequence and GAT-processed physical node features
         decoder_outputs, graph_embedding = self.decoder(
@@ -181,6 +188,34 @@ class Critic(nn.Module):
 
         # Combine and estimate value
         combined = torch.cat([seq_summary, graph_summary], dim=-1)  # [B, 2D]
+        return self.value_head(combined)
+
+    def forward_from_tensors(
+        self,
+        p_net_x: torch.Tensor,
+        p_net_edge_index: torch.Tensor,
+        p_net_edge_attr: torch.Tensor,
+        p_net_batch: torch.Tensor,
+        history_features: torch.Tensor,
+        encoder_outputs: torch.Tensor,
+        curr_v_node_id: torch.Tensor,
+        vnfs_remaining: torch.Tensor,
+    ) -> torch.Tensor:
+        """TorchScript-friendly critic forward for single-graph inputs."""
+        decoder_outputs, graph_embedding = self.decoder.embeddings_from_tensors(
+            p_net_x=p_net_x,
+            p_net_edge_index=p_net_edge_index,
+            p_net_edge_attr=p_net_edge_attr,
+            p_net_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
+        )
+        seq_summary = decoder_outputs.mean(dim=1)
+        # Single graph mean pool
+        graph_summary = graph_embedding.mean(dim=0, keepdim=True)
+        combined = torch.cat([seq_summary, graph_summary], dim=-1)
         return self.value_head(combined)
 
 
@@ -200,6 +235,7 @@ class AutoregressiveDecoder(nn.Module):
         self.use_amp = use_amp
         self.p_net_num_nodes = p_net_num_nodes
         self.allow_rejection = bool(allow_rejection)
+        self.temperature = 1.0
 
         # Action space: physical node placements (+ optional REJECT)
         self.num_actions = p_net_num_nodes + (1 if self.allow_rejection else 0)
@@ -258,6 +294,7 @@ class AutoregressiveDecoder(nn.Module):
             )
 
             # Optional special-action head for REJECT
+            self.reject_head: Optional[nn.Module] = None
             if self.allow_rejection:
                 self.reject_head = nn.Sequential(
                     nn.Linear(embedding_dim, embedding_dim // 2),
@@ -280,7 +317,7 @@ class AutoregressiveDecoder(nn.Module):
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight)
                     nn.init.zeros_(layer.bias)
-            if self.allow_rejection:
+            if self.allow_rejection and self.reject_head is not None:
                 for layer in self.reject_head:
                     if isinstance(layer, nn.Linear):
                         nn.init.xavier_uniform_(layer.weight)
@@ -289,6 +326,7 @@ class AutoregressiveDecoder(nn.Module):
         
 
 
+    @torch.jit.ignore
     def forward(self, obs, return_last_embed=False, return_all_embeds=False, return_gat_embedding=False, training=False):
 
 
@@ -318,13 +356,12 @@ class AutoregressiveDecoder(nn.Module):
         
         # Transformer decoder
         batch_size, seq_len, _ = combined_target.shape
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=combined_target.device), diagonal=1).bool()
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=combined_target.device), diagonal=1
+        ).to(dtype=torch.bool)
         padding_mask = torch.all(history_features == 0, dim=-1)
 
         encoder_outputs = obs['encoder_outputs']
-        if not isinstance(encoder_outputs, torch.Tensor):
-            encoder_outputs = torch.as_tensor(encoder_outputs, dtype=torch.float32, device=combined_target.device)
-
         decoder_output = self.transformer_decoder(
             tgt=combined_target,
             memory=encoder_outputs,
@@ -385,7 +422,7 @@ class AutoregressiveDecoder(nn.Module):
             current_node_idx += num_nodes
 
         # Optional REJECT logit
-        if self.is_actor and self.allow_rejection:
+        if self.is_actor and self.allow_rejection and self.reject_head is not None:
             reject_logit = self.reject_head(final_context_embedding)  # [B, 1]
             raw_logits = torch.cat([raw_logits_nodes, reject_logit], dim=-1)  # [B, p_nodes + 1]
         else:
@@ -395,12 +432,7 @@ class AutoregressiveDecoder(nn.Module):
         safe_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
         mask      = obs['action_mask'].bool()
         # Use a dtype-safe large finite negative to avoid overflow under autocast
-        try:
-            finfo = torch.finfo(safe_logits.dtype)
-            neg_val = finfo.min * 0.5  # stay finite and within dtype range
-        except (TypeError, ValueError):
-            neg_val = -1e9
-        neg_large = torch.full_like(safe_logits, neg_val)
+        neg_large = torch.full_like(safe_logits, -1e9)
         final_logits = torch.where(mask, safe_logits, neg_large)
 
         T = getattr(self, "temperature", 1.0)
@@ -409,3 +441,189 @@ class AutoregressiveDecoder(nn.Module):
             final_logits[mask] = final_logits[mask] / T
         
         return final_logits  
+
+    def embeddings_from_tensors(
+        self,
+        p_net_x: torch.Tensor,
+        p_net_edge_index: torch.Tensor,
+        p_net_edge_attr: torch.Tensor,
+        p_net_batch: torch.Tensor,
+        history_features: torch.Tensor,
+        encoder_outputs: torch.Tensor,
+        curr_v_node_id: torch.Tensor,
+        vnfs_remaining: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return decoder and graph embeddings from raw tensors."""
+        node_features = p_net_x.float()
+        edge_index = p_net_edge_index
+        edge_attr = p_net_edge_attr
+
+        for gat_layer in self.gat_layers:
+            node_features, edge_attr = gat_layer(node_features, edge_index, edge_attr)
+        graph_embedding = self.gat_projection(node_features)
+
+        action_embeddings = self.history_embed(history_features)
+        combined_target = action_embeddings
+
+        _, seq_len, _ = combined_target.shape
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=combined_target.device), diagonal=1
+        ).to(dtype=torch.bool)
+        padding_mask = torch.all(history_features == 0, dim=-1)
+
+        decoder_output = self.transformer_decoder(
+            tgt=combined_target,
+            memory=encoder_outputs,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=padding_mask,
+        )
+        return decoder_output, graph_embedding
+
+    def forward_from_tensors(
+        self,
+        p_net_x: torch.Tensor,
+        p_net_edge_index: torch.Tensor,
+        p_net_edge_attr: torch.Tensor,
+        p_net_batch: torch.Tensor,
+        history_features: torch.Tensor,
+        encoder_outputs: torch.Tensor,
+        curr_v_node_id: torch.Tensor,
+        vnfs_remaining: torch.Tensor,
+        action_mask: torch.Tensor,
+        return_last_embed: bool = False,
+    ) -> torch.Tensor:
+        """TorchScript-friendly forward that accepts raw tensors instead of PyG Data.
+
+        This path is used for C++ inference. It assumes a single-graph batch
+        (node batch values are all zero) and avoids Python-side objects.
+        """
+        decoder_output, graph_embedding = self.embeddings_from_tensors(
+            p_net_x=p_net_x,
+            p_net_edge_index=p_net_edge_index,
+            p_net_edge_attr=p_net_edge_attr,
+            p_net_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
+        )
+
+        last_decoder_output = decoder_output[:, -1, :]
+
+        # Add step and remaining count context
+        step_emb = self.step_embedding(curr_v_node_id)
+        remaining_emb = self.remaining_embedding(vnfs_remaining)
+        final_context_embedding = self.norm(last_decoder_output + step_emb + remaining_emb)
+
+        if return_last_embed or not self.is_actor:
+            return final_context_embedding
+
+        # Cross-attend to nodes (single graph batch)
+        node_batch = p_net_batch
+        padded_nodes = graph_embedding.unsqueeze(0)
+        node_padding_mask = torch.zeros((1, graph_embedding.size(0)), dtype=torch.bool, device=graph_embedding.device)
+
+        query = final_context_embedding.unsqueeze(0)
+        key = value = padded_nodes.transpose(0, 1)
+        attn_output, _ = self.node_cross_attention(query=query, key=key, value=value, key_padding_mask=node_padding_mask)
+        attn_context = attn_output.squeeze(0)
+        attn_context_per_node = attn_context.index_select(0, node_batch)
+
+        # Compute node scores
+        combined = torch.cat([
+            F.normalize(graph_embedding, dim=-1, eps=1e-6),
+            F.normalize(attn_context_per_node, dim=-1, eps=1e-6),
+        ], dim=-1)
+        node_scores = self.node_score_head(combined).squeeze(-1)
+
+        # Assemble final logits for physical nodes
+        raw_logits_nodes = torch.full(
+            (1, self.p_net_num_nodes), -20.0, device=node_scores.device, dtype=node_scores.dtype
+        )
+        nodes_to_consider = node_scores.size(0)
+        if nodes_to_consider > self.num_actions:
+            nodes_to_consider = self.num_actions
+        if nodes_to_consider > 0:
+            raw_logits_nodes[0, :nodes_to_consider] = node_scores[:nodes_to_consider]
+
+        if self.is_actor and self.allow_rejection and self.reject_head is not None:
+            reject_logit = self.reject_head(final_context_embedding)
+            raw_logits = torch.cat([raw_logits_nodes, reject_logit], dim=-1)
+        else:
+            raw_logits = raw_logits_nodes
+
+        safe_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
+        mask = action_mask.to(dtype=torch.bool)
+        neg_large = torch.full_like(safe_logits, -1e9)
+        final_logits = torch.where(mask, safe_logits, neg_large)
+
+        T = self.temperature
+        if T != 1.0:
+            final_logits = final_logits.clone()
+            final_logits[mask] = final_logits[mask] / T
+
+        return final_logits
+
+
+class ActorCriticScriptWrapper(nn.Module):
+    """TorchScript-friendly wrapper around ActorCritic for C++ inference."""
+
+    def __init__(self, model: ActorCritic):
+        super().__init__()
+        self.model = model
+
+    @torch.jit.export
+    def encode(self, v_net_x: torch.Tensor) -> torch.Tensor:
+        """Encode virtual network features."""
+        return self.model.encoder(v_net_x)
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute policy logits and value from tensor inputs.
+
+        Expected keys:
+            p_net_x, p_net_edge_index, p_net_edge_attr, p_net_batch,
+            selected_p_nodes, encoder_outputs, curr_v_node_id,
+            vnfs_remaining, action_mask
+        """
+        p_net_x = inputs["p_net_x"]
+        p_net_edge_index = inputs["p_net_edge_index"]
+        p_net_edge_attr = inputs["p_net_edge_attr"]
+        p_net_batch = inputs["p_net_batch"]
+        selected_p_nodes = inputs["selected_p_nodes"]
+        encoder_outputs = inputs["encoder_outputs"]
+        curr_v_node_id = inputs["curr_v_node_id"]
+        vnfs_remaining = inputs["vnfs_remaining"]
+        action_mask = inputs["action_mask"]
+
+        history_len = selected_p_nodes.size(0) + 1
+        history_features = torch.zeros(
+            (1, history_len, p_net_x.size(1)),
+            device=p_net_x.device,
+            dtype=p_net_x.dtype,
+        )
+        history_features[0, 0, :] = self.model.actor.decoder.start_embedding.to(p_net_x.dtype)
+        gathered = torch.index_select(p_net_x, 0, selected_p_nodes)
+        history_features[0, 1:history_len, :] = gathered
+
+        logits = self.model.actor.decoder.forward_from_tensors(
+            p_net_x=p_net_x,
+            p_net_edge_index=p_net_edge_index,
+            p_net_edge_attr=p_net_edge_attr,
+            p_net_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
+            action_mask=action_mask,
+        )
+        value = self.model.critic.forward_from_tensors(
+            p_net_x=p_net_x,
+            p_net_edge_index=p_net_edge_index,
+            p_net_edge_attr=p_net_edge_attr,
+            p_net_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
+        )
+        return logits, value

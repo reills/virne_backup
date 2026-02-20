@@ -128,6 +128,7 @@ class AlphaZeroSFCSolver(RLSolver):
         self.learner_process: Optional[Process] = None
         self._stop_signal = None
         self._num_train_steps = getattr(config.training, "num_train_steps_per_epoch", 100)
+        self._sync_learner: Optional[AlphaZeroLearner] = None
         
         # Cache for model weights to avoid repeated loading
         self._cached_model_mtime = None
@@ -178,6 +179,8 @@ class AlphaZeroSFCSolver(RLSolver):
                 self.logger.info("Async learner disabled; running in inference-only mode.")
                 self._learner_disabled_logged = True
             return
+        if self._sync_learner is not None:
+            return
         if self.learner_process is not None and self.learner_process.is_alive():
             return
         # Use saved config file for reconstruction
@@ -190,10 +193,26 @@ class AlphaZeroSFCSolver(RLSolver):
         except Exception:
             mp_ctx = None
         if stop_event is None:
-            if mp_ctx is not None:
-                stop_event = mp_ctx.Event()
-            else:
-                stop_event = multiprocessing.Event()
+            try:
+                if mp_ctx is not None:
+                    stop_event = mp_ctx.Event()
+                else:
+                    stop_event = multiprocessing.Event()
+            except PermissionError as exc:
+                self.logger.warning(
+                    f"Async learner IPC unavailable ({exc}); falling back to in-process learner."
+                )
+                self._sync_learner = AlphaZeroLearner(
+                    self.controller,
+                    self.recorder,
+                    self.counter,
+                    self.logger,
+                    self.config,
+                    replay_dir=self.replay_dir,
+                    models_dir=self.models_dir,
+                    batch_size=self.batch_size,
+                )
+                return
             self._stop_signal = stop_event
         else:
             stop_event.clear()
@@ -217,7 +236,24 @@ class AlphaZeroSFCSolver(RLSolver):
                 daemon=True,
             )
             self.logger.warning("Falling back to default start_method (not spawn)")
-        self.learner_process.start()
+        try:
+            self.learner_process.start()
+        except PermissionError as exc:
+            self.logger.warning(
+                f"Failed to start async learner process ({exc}); falling back to in-process learner."
+            )
+            self.learner_process = None
+            self._stop_signal = None
+            self._sync_learner = AlphaZeroLearner(
+                self.controller,
+                self.recorder,
+                self.counter,
+                self.logger,
+                self.config,
+                replay_dir=self.replay_dir,
+                models_dir=self.models_dir,
+                batch_size=self.batch_size,
+            )
 
     # ------------------------------------------------------------------
     def solve(self, instance):
@@ -313,13 +349,30 @@ class AlphaZeroSFCSolver(RLSolver):
             return
         
         # Use the standard RLSolver distributed training if enabled
-        if self.config.training.distributed_training:
+        if self._sync_learner is not None and self.config.training.distributed_training:
+            self.logger.warning(
+                "In-process learner fallback does not support distributed actor workers; "
+                "switching to single-worker training."
+            )
+            self.learn_singly(env, num_epochs, **kwargs)
+        elif self.config.training.distributed_training:
             self.learn_distributedly(env, num_epochs, **kwargs)
         else:
             self.learn_singly(env, num_epochs, **kwargs)
         
         if self._stop_signal is not None and self._stop_signal.is_set():
             self.logger.info("Learner stop signal acknowledged; actor loops ended early.")
+
+        # Guarantee a discoverable checkpoint for orchestration even when the learner
+        # did not emit one (e.g., no replay data or early process termination).
+        try:
+            if not os.path.exists(self.policy_path) or os.path.getsize(self.policy_path) <= 0:
+                torch.save(self.actor.policy.state_dict(), self.policy_path)
+                self.logger.warning(
+                    f"No learner checkpoint found; wrote fallback actor weights to {self.policy_path}"
+                )
+        except Exception as exc:
+            self.logger.warning(f"Failed to write fallback actor checkpoint: {exc}")
 
         self.logger.info(f"Training completed! Model saved to {self.policy_path}")
         self.logger.info(f"Now ready for evaluation phase (num_simulations = inference-only runs)")
@@ -453,6 +506,17 @@ class AlphaZeroSFCSolver(RLSolver):
                     self.logger.warning(f"   {warning}")
             else:
                 self.logger.info("All metrics look healthy!")
+
+            if self._sync_learner is not None:
+                learner_stats = self._sync_learner.train_steps(self._num_train_steps)
+                if learner_stats is not None:
+                    self.logger.info(
+                        "Synchronous learner: "
+                        f"steps={learner_stats['num_training_steps']} "
+                        f"avg_total_loss={learner_stats['avg_total_loss']:.4f}"
+                    )
+                # Refresh actor weights if learner updated checkpoint.
+                self._load_model_if_changed()
                 
             self.logger.info("=" * 80)
         
@@ -465,6 +529,13 @@ class AlphaZeroSFCSolver(RLSolver):
             self.learner_process.join()
             self.learner_process = None
             self.logger.info("Learner process terminated")
+        if self._sync_learner is not None:
+            try:
+                self._sync_learner.writer.close()
+            except Exception:
+                pass
+            self._sync_learner = None
+            self.logger.info("In-process learner terminated")
         
         # Shutdown GPU worker
         if hasattr(self, 'actor') and self.actor:

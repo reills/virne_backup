@@ -51,18 +51,20 @@ class AlphaZeroLearner:
         n_layers = getattr(config.nn, 'transformer_layers', 2)
         gnn_layers = getattr(config.nn, 'num_gnn_layers', 3)
         dropout = getattr(config.nn, 'dropout_prob', 0.1)
-        self.policy = ActorCritic(
-            p_net_num_nodes=config.simulation.p_net_setting_num_nodes,
-            p_net_feature_dim=config.simulation.p_net_setting_num_node_resource_attrs,
-            v_net_feature_dim=config.simulation.v_sim_setting_num_node_resource_attrs,
-            p_net_edge_dim=config.simulation.p_net_setting_num_link_resource_attrs,
-            embedding_dim=embedding_dim,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            gnn_layers=gnn_layers,
-            dropout=dropout,
-            allow_rejection=getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
-        ).to(self.device)
+        self.model_config = {
+            'p_net_num_nodes': config.simulation.p_net_setting_num_nodes,
+            'p_net_feature_dim': config.simulation.p_net_setting_num_node_resource_attrs,
+            'v_net_feature_dim': config.simulation.v_sim_setting_num_node_resource_attrs,
+            'p_net_edge_dim': config.simulation.p_net_setting_num_link_resource_attrs,
+            'embedding_dim': embedding_dim,
+            'n_heads': n_heads,
+            'n_layers': n_layers,
+            'gnn_layers': gnn_layers,
+            'dropout': dropout,
+            'allow_rejection': getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
+            'max_seq_len': getattr(config.nn, 'max_seq_len', 15),
+        }
+        self.policy = ActorCritic(**self.model_config).to(self.device)
         
         # Load pretrained weights if specified
         model_loaded = False
@@ -273,6 +275,10 @@ class AlphaZeroLearner:
         tmp = self.policy_path + '.tmp'
         torch.save(state, tmp)
         self._atomic_rename(tmp, self.policy_path)
+        try:
+            self._export_torchscript()
+        except Exception as e:
+            self.logger.warning(f"Failed to export TorchScript policy: {e}")
 
     def _save_full_checkpoint(self, step: int = None):
         """Save full checkpoint (model+optimizer+meta) with step in filename, atomically."""
@@ -291,6 +297,55 @@ class AlphaZeroLearner:
         tmp = fname + '.tmp'
         torch.save(meta, tmp)
         self._atomic_rename(tmp, fname)
+
+    def _export_torchscript(self):
+        """Export a TorchScript model for C++ inference."""
+        from .net import ActorCritic, ActorCriticScriptWrapper
+
+        ts_path = os.path.join(os.path.dirname(self.policy_path), "policy_latest.ts")
+        tmp = ts_path + ".tmp"
+
+        model = ActorCritic(**self.model_config).cpu()
+        model.load_state_dict(self.policy.state_dict())
+        model.eval()
+        wrapper = ActorCriticScriptWrapper(model)
+        wrapper.eval()
+
+        try:
+            scripted = torch.jit.script(wrapper)
+        except Exception:
+            # Fallback: trace with nominal shapes (may fix shapes to config)
+            num_nodes = self.model_config['p_net_num_nodes']
+            p_feat = self.model_config['p_net_feature_dim']
+            p_edge_feat = self.model_config['p_net_edge_dim']
+            v_feat = self.model_config['v_net_feature_dim']
+            max_seq_len = self.model_config.get('max_seq_len', 15)
+
+            p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32)
+            edge_index = torch.zeros((2, max(1, num_nodes - 1)), dtype=torch.long)
+            edge_attr = torch.zeros((edge_index.size(1), p_edge_feat), dtype=torch.float32)
+            p_batch = torch.zeros((num_nodes,), dtype=torch.long)
+            selected_p_nodes = torch.zeros((0,), dtype=torch.long)
+            encoder_outputs = torch.zeros((1, max_seq_len, model.actor.decoder.embedding_dim), dtype=torch.float32)
+            curr_v_node_id = torch.zeros((1,), dtype=torch.long)
+            vnfs_remaining = torch.zeros((1,), dtype=torch.long)
+            action_mask = torch.ones((1, model.actor.decoder.num_actions), dtype=torch.bool)
+
+            example = {
+                "p_net_x": p_net_x,
+                "p_net_edge_index": edge_index,
+                "p_net_edge_attr": edge_attr,
+                "p_net_batch": p_batch,
+                "selected_p_nodes": selected_p_nodes,
+                "encoder_outputs": encoder_outputs,
+                "curr_v_node_id": curr_v_node_id,
+                "vnfs_remaining": vnfs_remaining,
+                "action_mask": action_mask,
+            }
+            scripted = torch.jit.trace(wrapper, example, check_trace=False)
+
+        scripted.save(tmp)
+        self._atomic_rename(tmp, ts_path)
 
     def _obs_to_device(self, obs: dict) -> dict:
         """Convert observation tensors from CPU to target device."""

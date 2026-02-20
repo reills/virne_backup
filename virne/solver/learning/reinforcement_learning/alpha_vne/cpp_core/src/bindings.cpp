@@ -1,6 +1,7 @@
 #include "mcts_engine.hpp"
 #include "policy_network.hpp"
 #include "network.hpp"
+#include "solver.hpp"
 #include "vnr_state.hpp"
 #include "state.hpp"
 
@@ -123,6 +124,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
     py::class_<az::SearchResult>(m, "SearchResult")
         .def_readonly("visit_counts", &az::SearchResult::visit_counts)
         .def_readonly("policy", &az::SearchResult::policy)
+        .def_readonly("root_priors", &az::SearchResult::root_priors)
         .def_readonly("value", &az::SearchResult::value);
 
     py::class_<az::MCTSEngine>(m, "MCTSEngine")
@@ -189,5 +191,90 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
              },
              py::arg("model_path"),
              py::arg("device") = py::none())
-        .def("evaluate", &az::PolicyNetwork::evaluate, py::arg("features"));
+        .def("evaluate", &az::PolicyNetwork::evaluate, py::arg("features"))
+        .def("encode", &az::PolicyNetwork::encode, py::arg("v_net_x"));
+
+    m.def(
+        "solve",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           az::VNRConfig vnr_config,
+           az::SearchConfig search_config,
+           const std::string& policy_path,
+           const std::string& device,
+           py::object seed_obj,
+           float temperature,
+           bool use_nn_policy,
+           bool use_nn_value) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            std::optional<unsigned int> seed;
+            if (!seed_obj.is_none()) {
+                seed = seed_obj.cast<unsigned int>();
+            }
+
+            auto result = az::solve_vnr(
+                p_net,
+                v_net,
+                vnr_config,
+                search_config,
+                policy_path,
+                device,
+                seed,
+                temperature,
+                use_nn_policy,
+                use_nn_value
+            );
+
+            py::dict out;
+            out["actions"] = result.actions;
+            out["policies"] = result.policies;
+            out["values"] = result.values;
+            out["rejected"] = result.rejected;
+            out["place_result"] = result.place_result;
+            out["final_reward"] = result.final_reward;
+            py::dict metrics;
+            metrics["total_simulations"] = result.metrics.total_simulations;
+            metrics["steps"] = result.metrics.steps;
+            metrics["total_time_ms"] = result.metrics.total_time_ms;
+            out["metrics"] = metrics;
+            return out;
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("vnr_config"),
+        py::arg("search_config"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu",
+        py::arg("seed") = py::none(),
+        py::arg("temperature") = 1.0f,
+        py::arg("use_nn_policy") = true,
+        py::arg("use_nn_value") = true
+    );
 }

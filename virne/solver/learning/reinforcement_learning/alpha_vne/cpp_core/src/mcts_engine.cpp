@@ -75,6 +75,18 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
         }
     }
 
+    // Align with Python MCTS semantics: expand the root once before the budgeted
+    // simulations so a budget of 1 can still assign visits to a child action.
+    bool root_terminal = false;
+    if (root_state && root_state->domain_state) {
+        root_terminal = root_state->domain_state->is_terminal();
+    } else if (terminal_check_fn_) {
+        root_terminal = terminal_check_fn_(root_state);
+    }
+    if (!root_terminal && !root.has_children()) {
+        (void)expand(root);
+    }
+
     for (int sim = 0; sim < config_.simulations; ++sim) {
         TreeNode* leaf = select(root);
         if (!leaf) {
@@ -111,9 +123,16 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
         policy /= total_visits;
     }
 
+    auto root_priors = torch::zeros({num_actions}, torch::kFloat32);
+    for (const auto& [action, child] : root_children) {
+        if (child && action >= 0 && action < root_priors.size(0)) {
+            root_priors[action] = child->prior();
+        }
+    }
+
     float root_value = root_state->value.defined() ? root_state->value.item<float>() : 0.0f;
 
-    return {visit_counts, policy, root_value};
+    return {visit_counts, policy, root_priors, root_value};
 }
 
 TreeNode* MCTSEngine::select(TreeNode& root) {
@@ -281,19 +300,33 @@ void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
                     : torch::ones_like(logits, torch::TensorOptions().dtype(torch::kBool));
     auto priors = masked_softmax(logits, mask);
 
+    std::vector<int64_t> valid_actions;
+    valid_actions.reserve(root.children_ref().size());
+    for (const auto& [action, child] : root.children_ref()) {
+        (void)child;
+        if (action >= 0 && action < priors.size(0)) {
+            valid_actions.push_back(action);
+        }
+    }
+    if (valid_actions.empty()) {
+        return;
+    }
+
     std::gamma_distribution<float> gamma(config_.dirichlet_alpha, 1.0f);
     auto noise = torch::zeros_like(priors);
-
     float noise_sum = 0.0f;
-    for (int64_t i = 0; i < priors.size(0); ++i) {
+    for (int64_t action : valid_actions) {
         float n = gamma(rng_);
-        noise[i] = n;
+        noise[action] = n;
         noise_sum += n;
     }
     if (noise_sum <= 0.0f) {
         return;
     }
-    noise /= noise_sum;
+
+    for (int64_t action : valid_actions) {
+        noise[action] = noise[action].item<float>() / noise_sum;
+    }
 
     auto mixed = (1.0f - config_.dirichlet_epsilon) * priors + config_.dirichlet_epsilon * noise;
     state->policy_logits = torch::log(mixed + 1e-8f);

@@ -1,6 +1,7 @@
 """Adapter that wires the C++ MCTS core into the Python AlphaZero actor."""
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -16,10 +17,20 @@ except ImportError:  # pragma: no cover - optional dependency
 class _LazyCppStateProxy:
     """Lightweight Python view over a C++ VNRState that materializes on demand."""
 
-    def __init__(self, adapter: "CppMCTSAdapter", parent: State, cpp_state: "cpp_core.VNRState", cache_key):
+    def __init__(
+        self,
+        adapter: "CppMCTSAdapter",
+        parent: State,
+        cache_key,
+        cpp_state: "cpp_core.VNRState" | None = None,
+        parent_cpp_state: "cpp_core.VNRState" | None = None,
+        action: int | None = None,
+    ):
         self._adapter = adapter
         self._parent_state = parent
         self._cpp_state = cpp_state
+        self._cpp_parent_state = parent_cpp_state
+        self._cpp_action = int(action) if action is not None else None
         self._cpp_network_cache_key = cache_key
         self._materialized_state: State | None = None
 
@@ -32,17 +43,35 @@ class _LazyCppStateProxy:
         self.link_params = parent.link_params
         self.v_order = list(getattr(parent, "v_order", []))
         self.v_pos = dict(getattr(parent, "v_pos", {}))
-        self.selected_p_net_nodes = list(cpp_state.selected_physical_nodes)
-        self.v_node_id = int(cpp_state.current_virtual_index)
-        self.p_node_id = int(cpp_state.last_physical_node)
-        self.rejected = bool(cpp_state.rejected)
         self.allow_rejection = getattr(parent, "allow_rejection", False)
         self.reject_penalty = getattr(parent, "reject_penalty", 50.0)
-        self.max_expansion = max(len(cpp_state.get_candidate_nodes()), 1)
+        reject_idx = self._original_p_net.num_nodes
+
+        if self._cpp_state is not None:
+            self.selected_p_net_nodes = list(self._cpp_state.selected_physical_nodes)
+            self.v_node_id = int(self._cpp_state.current_virtual_index)
+            self.p_node_id = int(self._cpp_state.last_physical_node)
+            self.rejected = bool(self._cpp_state.rejected)
+        else:
+            p_node = int(self._cpp_action) if self._cpp_action is not None else -1
+            selected = list(getattr(parent, "selected_p_net_nodes", []))
+            if 0 <= p_node < reject_idx:
+                selected.append(p_node)
+            self.selected_p_net_nodes = selected
+            self.v_node_id = int(getattr(parent, "v_node_id", -1)) + 1
+            self.p_node_id = p_node
+            self.rejected = bool(self.allow_rejection and p_node == reject_idx)
+
+        # Keep this cheap; avoid invoking get_candidate_nodes() during reconstruction.
+        self.max_expansion = max(int(getattr(parent, "max_expansion", 1)), 1)
         self._prune_log_count = getattr(parent, "_prune_log_count", 0)
 
     def materialize(self) -> State:
+        if self._cpp_state is None and self._cpp_parent_state is not None and self._cpp_action is not None:
+            self._cpp_state = self._cpp_parent_state.create_child(int(self._cpp_action))
         if self._materialized_state is None:
+            if self._cpp_state is None:
+                raise RuntimeError("Lazy C++ proxy has no source state to materialize.")
             child = self._adapter._python_state_from_cpp(self._parent_state, self._cpp_state)
             child._cpp_state = self._cpp_state
             child._cpp_network_cache_key = self._cpp_network_cache_key
@@ -243,28 +272,31 @@ class CppMCTSAdapter:
                 priors_map[action] = priors_map[action] / total_prior
 
         valid_children = 0
+        reject_idx = root_state._original_p_net.num_nodes
+        allow_rejection = bool(getattr(root_state, "allow_rejection", False))
         for action in actions_to_reconstruct:
-            child_cpp_state = cpp_state.create_child(int(action))
-            child_state = _LazyCppStateProxy(
-                adapter=self,
-                parent=root_state,
-                cpp_state=child_cpp_state,
-                cache_key=self._active_network_cache_key,
-            )
-            reject_idx = child_state._original_p_net.num_nodes
-            is_reject_action = child_state.rejected or child_state.p_node_id == reject_idx
-            is_invalid = child_state.p_node_id < 0 and not is_reject_action
-            reject_not_allowed = child_state.p_node_id == reject_idx and not getattr(child_state, "allow_rejection", False)
-            out_of_range = child_state.p_node_id > reject_idx
+            p_node_id = int(action)
+            is_reject_action = p_node_id == reject_idx
+            is_invalid = p_node_id < 0 and not is_reject_action
+            reject_not_allowed = is_reject_action and not allow_rejection
+            out_of_range = p_node_id > reject_idx
             if is_invalid or reject_not_allowed or out_of_range:
                 if logger is not None:
                     logger.debug(
                         "Skipping invalid child action="
-                        f"{action} p_node_id={child_state.p_node_id} reject_idx={reject_idx} "
-                        f"allow_rejection={getattr(child_state, 'allow_rejection', False)} "
-                        f"rejected={child_state.rejected}"
+                        f"{action} p_node_id={p_node_id} reject_idx={reject_idx} "
+                        f"allow_rejection={allow_rejection}"
                     )
                 continue
+
+            child_state = _LazyCppStateProxy(
+                adapter=self,
+                parent=root_state,
+                cache_key=self._active_network_cache_key,
+                cpp_state=None,
+                parent_cpp_state=cpp_state,
+                action=p_node_id,
+            )
 
             prior = priors_map.get(int(action), 0.0)
             child = Node(root_node, child_state, prior=prior)
@@ -434,6 +466,17 @@ class CppMCTSAdapter:
         if cached is not None and cached_key != self._active_network_cache_key:
             root_state._cpp_state = None
 
+        parent_cpp_state = getattr(root_state, "_cpp_parent_state", None)
+        parent_action = getattr(root_state, "_cpp_action", None)
+        if (
+            parent_cpp_state is not None
+            and parent_action is not None
+            and cached_key == self._active_network_cache_key
+        ):
+            child_cpp_state = parent_cpp_state.create_child(int(parent_action))
+            root_state._cpp_state = child_cpp_state
+            return child_cpp_state
+
         if self._cpp_p_network is None or self._cpp_v_network is None or self._root_cpp_config is None:
             raise RuntimeError("C++ networks are not initialised before building state.")
 
@@ -596,3 +639,193 @@ def create_cpp_adapter(actor, computation_budget: int):
         rollout_depth_limit=getattr(actor, "rollout_depth_limit", 100),
     )
     return adapter
+
+
+def create_cpp_full_solver(actor, computation_budget: int):
+    """Factory for the full C++ solve path."""
+    if cpp_core is None or not hasattr(cpp_core, "solve"):
+        return None
+    return CppFullSolver(actor, computation_budget)
+
+
+class CppFullSolver:
+    """Full C++ solve path (single call per request)."""
+
+    def __init__(self, actor, computation_budget: int):
+        if cpp_core is None or not hasattr(cpp_core, "solve"):
+            raise RuntimeError("alpha_zero_cpp_core.solve is not available.")
+        self.actor = actor
+        self.computation_budget = int(computation_budget)
+        self._node_resource_names = [
+            getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "node_resource_attrs", [])
+        ]
+        self._link_resource_names = [
+            getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "link_resource_attrs", [])
+        ]
+
+    def _build_network_payload(self, net, node_resource_names: list, link_resource_names: list):
+        node_attrs = []
+        for node_id in net.nodes:
+            attrs = {}
+            data = net.nodes[node_id]
+            for name in node_resource_names:
+                value = data.get(name, 0.0)
+                if isinstance(value, (int, float, bool)):
+                    attrs[str(name)] = float(value)
+            node_attrs.append(attrs)
+
+        edges = list(net.links)
+        edge_attrs = []
+        for (u, v) in edges:
+            attrs = {}
+            data = net.links[(u, v)]
+            for name in link_resource_names:
+                value = data.get(name, 0.0)
+                if isinstance(value, (int, float, bool)):
+                    attrs[str(name)] = float(value)
+            edge_attrs.append(attrs)
+
+        directed = False
+        try:
+            directed = bool(net.is_directed())
+        except Exception:
+            directed = False
+
+        return node_attrs, edges, edge_attrs, directed
+
+    def _build_search_config(self) -> "cpp_core.SearchConfig":
+        cfg = cpp_core.SearchConfig()
+        cfg.simulations = int(self.computation_budget)
+        cfg.c_puct = float(getattr(self.actor, "c_puct", 1.0))
+        cfg.dirichlet_alpha = float(getattr(self.actor, "dirichlet_alpha", 0.03))
+        cfg.dirichlet_epsilon = float(getattr(self.actor, "dirichlet_epsilon", 0.25))
+        cfg.use_neural_network = bool(getattr(self.actor, "use_neural_network", True))
+        cfg.rollout_depth_limit = int(getattr(self.actor, "rollout_depth_limit", 100))
+        return cfg
+
+    def _build_vnr_config(self) -> "cpp_core.VNRConfig":
+        cfg = cpp_core.VNRConfig()
+        cfg.node_resource_names = list(self._node_resource_names)
+        cfg.link_resource_names = list(self._link_resource_names)
+        allow_rejection = False
+        try:
+            allow_rejection = bool(getattr(self.actor.policy.actor.decoder, "allow_rejection", False))
+        except Exception:
+            pass
+        cfg.allow_rejection = allow_rejection
+        reject_penalty = 50.0
+        try:
+            cfg_obj = getattr(self.actor, "config", None)
+            if cfg_obj is not None:
+                rp = getattr(getattr(cfg_obj, "solver", {}), "reject_penalty", None)
+                if rp is None:
+                    rp = getattr(cfg_obj, "reject_penalty", None)
+                if rp is not None:
+                    reject_penalty = float(rp)
+        except Exception:
+            pass
+        cfg.reject_penalty = float(reject_penalty)
+        cfg.shortest_method = getattr(self.actor, "shortest_method", "bfs_shortest")
+        cfg.k_shortest = int(getattr(self.actor, "k_shortest", 1))
+        return cfg
+
+    def solve(self, p_net, v_net, training: bool = None) -> dict:
+        if training is None:
+            training = not getattr(self.actor, "disable_trajectory_writing", False)
+        temperature = getattr(self.actor, "temperature_train", 1.0) if training else getattr(self.actor, "temperature_eval", 0.0)
+
+        p_node_attrs, p_edges, p_edge_attrs, p_directed = self._build_network_payload(
+            p_net, self._node_resource_names, self._link_resource_names
+        )
+        v_node_attrs, v_edges, v_edge_attrs, v_directed = self._build_network_payload(
+            v_net, self._node_resource_names, self._link_resource_names
+        )
+
+        vnr_cfg = self._build_vnr_config()
+        search_cfg = self._build_search_config()
+
+        policy_ts_path = None
+        try:
+            policy_ts_path = self.actor.policy_path.replace(".pt", ".ts")
+        except Exception:
+            policy_ts_path = None
+        if not policy_ts_path:
+            raise RuntimeError("Could not resolve TorchScript policy path.")
+
+        if not os.path.exists(policy_ts_path):
+            self._export_torchscript(policy_ts_path)
+
+        device = "cuda" if getattr(self.actor, "device", torch.device("cpu")).type == "cuda" else "cpu"
+        seed = None
+        try:
+            seed = int(getattr(getattr(self.actor, "config", None).experiment, "seed", None))
+        except Exception:
+            seed = None
+
+        return cpp_core.solve(
+            p_node_attrs,
+            p_edges,
+            p_edge_attrs,
+            p_directed,
+            v_node_attrs,
+            v_edges,
+            v_edge_attrs,
+            v_directed,
+            vnr_cfg,
+            search_cfg,
+            policy_ts_path,
+            device,
+            seed,
+            float(temperature),
+            bool(getattr(self.actor, "use_nn_policy", True)),
+            bool(getattr(self.actor, "use_nn_value", True)),
+        )
+
+    def _export_torchscript(self, policy_ts_path: str) -> None:
+        from .net import ActorCritic, ActorCriticScriptWrapper
+
+        model_config = getattr(self.actor.policy_network, "model_config", None)
+        if model_config is None:
+            raise RuntimeError("Policy model config is unavailable for TorchScript export.")
+
+        model = ActorCritic(**model_config).cpu()
+        model.load_state_dict(self.actor.policy.state_dict())
+        model.eval()
+        wrapper = ActorCriticScriptWrapper(model)
+        wrapper.eval()
+
+        tmp = policy_ts_path + ".tmp"
+        try:
+            scripted = torch.jit.script(wrapper)
+        except Exception:
+            # Fallback to trace with nominal shapes
+            num_nodes = model_config['p_net_num_nodes']
+            p_feat = model_config['p_net_feature_dim']
+            p_edge_feat = model_config['p_net_edge_dim']
+            v_feat = model_config['v_net_feature_dim']
+            max_seq_len = model_config.get('max_seq_len', 15)
+
+            p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32)
+            edge_index = torch.zeros((2, max(1, num_nodes - 1)), dtype=torch.long)
+            edge_attr = torch.zeros((edge_index.size(1), p_edge_feat), dtype=torch.float32)
+            p_batch = torch.zeros((num_nodes,), dtype=torch.long)
+            selected_p_nodes = torch.zeros((0,), dtype=torch.long)
+            encoder_outputs = torch.zeros((1, max_seq_len, model.actor.decoder.embedding_dim), dtype=torch.float32)
+            curr_v_node_id = torch.zeros((1,), dtype=torch.long)
+            vnfs_remaining = torch.zeros((1,), dtype=torch.long)
+            action_mask = torch.ones((1, model.actor.decoder.num_actions), dtype=torch.bool)
+
+            example = {
+                "p_net_x": p_net_x,
+                "p_net_edge_index": edge_index,
+                "p_net_edge_attr": edge_attr,
+                "p_net_batch": p_batch,
+                "selected_p_nodes": selected_p_nodes,
+                "encoder_outputs": encoder_outputs,
+                "curr_v_node_id": curr_v_node_id,
+                "vnfs_remaining": vnfs_remaining,
+                "action_mask": action_mask,
+            }
+            scripted = torch.jit.trace(wrapper, example, check_trace=False)
+        scripted.save(tmp)
+        os.replace(tmp, policy_ts_path)

@@ -23,7 +23,7 @@ import torch
 from virne.core import Solution
 from virne.solver.base_solver import Solver
 from .node import Node, State
-from .cpp_adapter import create_cpp_adapter
+from .cpp_adapter import create_cpp_adapter, create_cpp_full_solver
 from .trajectory_writer import TrajectoryWriter
 from .observation_builder import ObservationBuilder
 from .policy_network import PolicyNetwork
@@ -113,6 +113,7 @@ class OptimizedAlphaZeroActor(Solver):
             'gnn_layers': getattr(config.nn, 'num_gnn_layers', 3),
             'dropout': getattr(config.nn, 'dropout_prob', 0.1),
             'allow_rejection': getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
+            'max_seq_len': getattr(config.nn, 'max_seq_len', 15),
         }
 
         # Initialize PolicyNetwork wrapper
@@ -173,6 +174,7 @@ class OptimizedAlphaZeroActor(Solver):
         self._last_cuda_log_ts = 0.0
 
         self.cpp_adapter = None
+        self.cpp_full_solver = None
         training_cfg = getattr(config, "training", None)
         use_cpp_flag = False
         if training_cfg is not None:
@@ -183,20 +185,28 @@ class OptimizedAlphaZeroActor(Solver):
 
         if use_cpp_flag:
             try:
+                self.cpp_full_solver = create_cpp_full_solver(self, self.computation_budget)
+                if self.cpp_full_solver is not None:
+                    self.logger.info("🧠 Using full C++ solve backend.")
+            except Exception as exc:
+                self.logger.warning(f"C++ full solve backend unavailable: {exc}")
+
+        if use_cpp_flag and self.cpp_full_solver is None:
+            try:
                 self.cpp_adapter = create_cpp_adapter(self, self.computation_budget)
                 if self.cpp_adapter is not None:
-                    self.logger.info("🧠 Using experimental C++ MCTS backend.")
+                    self.logger.info("🧠 Using hybrid C++ MCTS backend.")
                 else:
-                    raise RuntimeError(
+                    self.logger.warning(
                         "C++ MCTS backend requested but the alpha_zero_cpp_core extension is not available. "
-                        "Build it under virne/solver/learning/reinforcement_learning/mcts_solver/cpp_core "
+                        "Build it under virne/solver/learning/reinforcement_learning/alpha_vne/cpp_core "
                         "or set training.use_cpp_mcts=false to use the Python implementation."
                     )
             except Exception as exc:
-                raise RuntimeError(
+                self.logger.warning(
                     "Failed to initialize C++ MCTS backend despite training.use_cpp_mcts=true. "
-                    "Ensure the alpha_zero_cpp_core extension is built and importable."
-                ) from exc
+                    f"Reason: {exc}"
+                )
 
 
     # ------------------------------------------------------------------
@@ -209,6 +219,12 @@ class OptimizedAlphaZeroActor(Solver):
                      If None, infer from disable_trajectory_writing (False=train, True=eval)
         """
         v_net, p_net = instance["v_net"], instance["p_net"]
+
+        if getattr(self, "cpp_full_solver", None) is not None:
+            try:
+                return self._solve_with_cpp_full(instance, training)
+            except Exception as exc:
+                self.logger.warning(f"C++ full solve failed, falling back to Python: {exc}")
 
         from virne.solver.learning.utils import load_pyg_data_from_network
 
@@ -766,6 +782,12 @@ class OptimizedAlphaZeroActor(Solver):
     
     def _compute_value(self, node: Node, v_node_id: int) -> float:
         """Compute value estimate from MCTS root node."""
+        diag_root_value = getattr(node, "_diag_root_value", None)
+        if diag_root_value is not None:
+            try:
+                return float(diag_root_value)
+            except Exception:
+                pass
         if node.visit_times == 0:
             if not self.use_neural_network:
                 return 0.0
@@ -783,6 +805,115 @@ class OptimizedAlphaZeroActor(Solver):
         else:
             return -1000.0
 
+    def _solve_with_cpp_full(self, instance, training: bool = None):
+        """Solve a request using the full C++ backend and rebuild trajectory in Python."""
+        v_net, p_net = instance["v_net"], instance["p_net"]
+
+        if training is None:
+            training = not self.disable_trajectory_writing
+
+        static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
+
+        cpp_result = self.cpp_full_solver.solve(p_net, v_net, training=training)
+        metrics = cpp_result.get("metrics", {}) if isinstance(cpp_result, dict) else {}
+        if metrics and self.logger is not None:
+            try:
+                self.logger.info(
+                    "C++ solve metrics: steps=%s sims=%s total_time_ms=%.2f",
+                    metrics.get("steps"),
+                    metrics.get("total_simulations"),
+                    float(metrics.get("total_time_ms", 0.0)),
+                )
+            except Exception:
+                pass
+        actions = list(cpp_result.get("actions", []))
+        policies = list(cpp_result.get("policies", []))
+        values = list(cpp_result.get("values", []))
+        rejected = bool(cpp_result.get("rejected", False))
+        place_result = bool(cpp_result.get("place_result", True))
+
+        solution = Solution.from_v_net(v_net)
+        trajectory: List[dict] = [] if not self.disable_trajectory_writing else None
+
+        # Rebuild trajectory with Python observations for replay compatibility
+        state = State(
+            p_net,
+            v_net,
+            self.controller,
+            self.recorder,
+            self.counter,
+            link_params={
+                'shortest_method': self.shortest_method,
+                'k': self.k_shortest,
+            },
+        )
+        num_actions = self.policy.actor.decoder.num_actions
+        reject_idx = self._state_num_nodes(state)
+
+        for step, action_taken in enumerate(actions):
+            if action_taken < 0 or action_taken >= num_actions:
+                place_result = False
+                break
+
+            next_pos = state.v_node_id + 1
+            if next_pos < 0 or next_pos >= len(state.v_order):
+                place_result = False
+                break
+            curr_v_id = state.v_order[next_pos]
+
+            solution["node_slots"].update({curr_v_id: action_taken})
+
+            if not self.disable_trajectory_writing:
+                obs = self._state_to_obs(state, curr_v_id)
+                obs_cpu = self._obs_to_cpu(obs)
+
+                policy = policies[step] if step < len(policies) else [0.0] * num_actions
+                if len(policy) != num_actions:
+                    # Pad or trim to action space size
+                    policy = (policy + [0.0] * num_actions)[:num_actions]
+                value_root = float(values[step]) if step < len(values) else 0.0
+
+                candidate_nodes = self._candidate_actions(state, curr_v_id)
+                action_mask = [False] * num_actions
+                for node_id in candidate_nodes:
+                    if 0 <= node_id < num_actions:
+                        action_mask[node_id] = True
+                if num_actions > reject_idx:
+                    action_mask[reject_idx] = True
+
+                trajectory.append({
+                    "observation": obs_cpu,
+                    "pi": policy,
+                    "v_root": value_root,
+                    "a_taken": action_taken,
+                    "mask": action_mask,
+                })
+
+            state = state.next_state(action_taken)
+            if state.p_node_id == -1:
+                place_result = False
+                break
+
+        if rejected:
+            solution["place_result"] = False
+            solution["rejected"] = True
+        else:
+            solution["place_result"] = place_result
+
+        if solution.get("place_result", True) and not solution.get("rejected", False):
+            link_ok = self.controller.link_mapper.link_mapping(
+                v_net, p_net, solution=solution,
+                shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
+            if not link_ok:
+                solution["route_result"] = False
+        solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
+
+        if not self.disable_trajectory_writing:
+            final_reward = self._compute_final_reward(solution, v_net, p_net)
+            self._store_episode_new_format(static_environment, trajectory, final_reward)
+
+        return solution
+
     def solve_vnr_with_mcts(self, v_net, p_net, solution, controller, training: bool = None):
         """Consolidated MCTS VNR solving method used by both solver and workers.
 
@@ -790,6 +921,11 @@ class OptimizedAlphaZeroActor(Solver):
             training: If True, use training temperature; if False, use eval temperature.
                      If None, infer from disable_trajectory_writing.
         """
+        if getattr(self, "cpp_full_solver", None) is not None:
+            try:
+                return self._solve_with_cpp_full({"v_net": v_net, "p_net": p_net}, training=training)
+            except Exception as exc:
+                self.logger.warning(f"C++ full solve failed in worker path, falling back: {exc}")
         # Same implementation as original, but with optimizations
         from virne.solver.learning.utils import load_pyg_data_from_network
 
@@ -834,6 +970,22 @@ class OptimizedAlphaZeroActor(Solver):
         trajectory = [] if not self.disable_trajectory_writing else None
         allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
 
+        def _finalize_failure(node: Node, v_id: int, action_taken: int = -1) -> bool:
+            solution["place_result"] = False
+            solution["route_result"] = False
+            solution["result"] = False
+            if not self.disable_trajectory_writing:
+                try:
+                    timestep_data = self._create_timestep_data(node, v_id, action_taken)
+                    trajectory.append(timestep_data)
+                except Exception:
+                    # Keep failure-path robust even when diagnostics/timestep extraction fails.
+                    pass
+                final_reward = self._compute_final_reward(solution, v_net, p_net)
+                self._store_episode_new_format(static_environment, trajectory, final_reward)
+                self._cleanup()
+            return False
+
         for v_node_idx in range(v_net.num_nodes):
             # Use actual virtual node id under stable ordering
             next_pos = current_node.state.v_node_id + 1
@@ -847,21 +999,20 @@ class OptimizedAlphaZeroActor(Solver):
                     f"Worker MCTS produced zero-visit children for v_node={curr_v_id} "
                     f"(step={current_node.state.v_node_id + 1}): {exc}"
                 )
-                solution["place_result"] = False
-                return False
+                return _finalize_failure(current_node, curr_v_id, -1)
             if best_child is None:
                 self.logger.warning(
                     f"Worker MCTS failed to select child for v_node={curr_v_id} "
                     f"(step={current_node.state.v_node_id + 1})"
                 )
-                return False
+                return _finalize_failure(current_node, curr_v_id, -1)
 
             # Handle REJECT
             reject_idx = self._state_num_nodes(current_node.state)
             if allow_rejection and best_child.state.p_node_id == reject_idx:
                 self._episode_rejects += 1
                 self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
-                return False
+                return _finalize_failure(current_node, curr_v_id, reject_idx)
             # Guard against invalid action (-1 or out of range). This can happen when a child
             # is pruned during incremental feasibility checks and marked as terminal-bad.
             if best_child.state.p_node_id < 0 or best_child.state.p_node_id >= reject_idx:
@@ -870,7 +1021,7 @@ class OptimizedAlphaZeroActor(Solver):
                     f"(reject_idx={reject_idx}) for v_node={curr_v_id}"
                 )
                 self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
-                return False
+                return _finalize_failure(current_node, curr_v_id, best_child.state.p_node_id)
 
             p_node_id = best_child.state.p_node_id
             placed_v = curr_v_id
@@ -885,7 +1036,7 @@ class OptimizedAlphaZeroActor(Solver):
                     f"p_node={p_node_id} offsets={place_info}"
                 )
                 self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
-                return False
+                return _finalize_failure(current_node, curr_v_id, p_node_id)
                 
             if not self.disable_trajectory_writing:
                 timestep_data = self._create_timestep_data(current_node, curr_v_id, p_node_id)

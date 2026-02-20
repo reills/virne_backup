@@ -170,6 +170,7 @@ set(CPP_CORE_SOURCES
     src/node.cpp
     src/mcts_engine.cpp
     src/policy_network.cpp
+    src/solver.cpp
     src/bindings.cpp
 )
 

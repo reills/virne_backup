@@ -18,6 +18,14 @@ void PolicyNetwork::load(const std::string& model_path, torch::Device device) {
     loaded_ = true;
 }
 
+torch::Tensor PolicyNetwork::encode(const torch::Tensor& v_net_x) {
+    if (!loaded_) {
+        throw std::runtime_error("PolicyNetwork::encode called before load().");
+    }
+    auto output = module_.run_method("encode", v_net_x.to(device_));
+    return output.toTensor().detach();
+}
+
 EvaluationResult PolicyNetwork::evaluate(const StateView::TensorMap& inputs) {
     if (!loaded_) {
         throw std::runtime_error("PolicyNetwork::evaluate called before load().");

@@ -108,6 +108,9 @@ private:
 
     double total_node_demand_{0.0};
     double total_v_revenue_{0.0};
+    mutable bool allocation_totals_cache_valid_{false};
+    mutable SparseResourceAllocations node_allocation_totals_cache_;
+    mutable SparseResourceAllocations link_allocation_totals_cache_;
 
     ShortestPathFinder path_finder_;
 
@@ -125,6 +128,7 @@ private:
                                           int item_id,
                                           const std::string& attr,
                                           bool node_resource);
+    void rebuild_allocation_totals_cache() const;
     double get_allocated_node_resource(int node_id, const std::string& attr) const;
     double get_allocated_link_resource(int edge_id, const std::string& attr) const;
     void update_node_allocations(int p_node_id, int v_node_id, AllocationDelta& delta) const;

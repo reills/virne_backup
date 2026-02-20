@@ -27,6 +27,7 @@ struct SearchConfig {
 struct SearchResult {
     torch::Tensor visit_counts;
     torch::Tensor policy;
+    torch::Tensor root_priors;
     float value = 0.0f;
 };
 

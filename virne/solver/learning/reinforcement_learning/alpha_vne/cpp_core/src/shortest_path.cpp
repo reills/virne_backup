@@ -130,10 +130,14 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
         return bfs_results;
     };
 
-    if (normalised_method == "bfs_shortest" ||
-        normalised_method == "first_shortest" ||
-        normalised_method == "available_shortest") {
+    if (normalised_method == "bfs_shortest") {
         return bfs_single_path(/*enforce_capacity=*/true);
+    }
+    if (normalised_method == "available_shortest") {
+        return bfs_single_path(/*enforce_capacity=*/true);
+    }
+    if (normalised_method == "first_shortest") {
+        return bfs_single_path(/*enforce_capacity=*/false);
     }
 
     struct Candidate {
@@ -173,10 +177,12 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
     std::priority_queue<FrontierEntry, std::vector<FrontierEntry>, FrontierCompare> frontier;
     frontier.push({0.0, 1, 0});
 
-    std::unordered_map<int, double> best_cost_to_node;
-    best_cost_to_node[source] = 0.0;
+    std::unordered_map<std::uint64_t, double> best_cost_to_node_depth;
+    best_cost_to_node_depth[(static_cast<std::uint64_t>(static_cast<std::uint32_t>(source)) << 32U) | 1U] = 0.0;
 
     double best_goal_cost = std::numeric_limits<double>::infinity();
+
+    const bool enforce_capacity = (normalised_method == "available_shortest");
 
     while (!frontier.empty()) {
         FrontierEntry current_entry = frontier.top();
@@ -229,7 +235,7 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
             if (bit_is_set(current_visited, neighbor)) {
                 continue;
             }
-            if (!has_capacity(state, edge_id, link_demands)) {
+            if (enforce_capacity && !has_capacity(state, edge_id, link_demands)) {
                 continue;
             }
 
@@ -241,9 +247,12 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
             expanded.visited_bits = current_visited;
             set_bit(expanded.visited_bits, neighbor);
 
-            auto it = best_cost_to_node.find(neighbor);
-            if (it == best_cost_to_node.end() || expanded.cost <= it->second + 1e-6) {
-                best_cost_to_node[neighbor] = expanded.cost;
+            const std::uint64_t key =
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(neighbor)) << 32U)
+                | static_cast<std::uint64_t>(expanded.depth);
+            auto it = best_cost_to_node_depth.find(key);
+            if (it == best_cost_to_node_depth.end() || expanded.cost <= it->second + 1e-6) {
+                best_cost_to_node_depth[key] = expanded.cost;
                 int expanded_index = static_cast<int>(arena.size());
                 arena.push_back(std::move(expanded));
                 frontier.push({arena[expanded_index].cost, arena[expanded_index].depth, expanded_index});
