@@ -17,6 +17,29 @@ torch::Tensor masked_softmax(const torch::Tensor& logits, const torch::Tensor& m
     return torch::softmax(masked_logits, -1);
 }
 
+int64_t infer_action_space_size(const std::shared_ptr<StateView>& state) {
+    if (!state) {
+        return 0;
+    }
+    auto from_mask = state->num_actions();
+    if (from_mask > 0) {
+        return from_mask;
+    }
+    if (state->domain_state) {
+        return state->domain_state->action_space_size();
+    }
+    return 0;
+}
+
+template <typename Container>
+int64_t find_max_action_id(const Container& entries) {
+    int64_t max_action = -1;
+    for (const auto& item : entries) {
+        max_action = std::max<int64_t>(max_action, item.first);
+    }
+    return max_action;
+}
+
 std::atomic<std::int64_t> g_state_id_counter{1};
 }  // namespace
 
@@ -26,8 +49,8 @@ MCTSEngine::MCTSEngine(SearchConfig config)
 
 SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state, std::optional<unsigned int> seed) {
     bool has_domain_state = root_state && root_state->domain_state;
-    if (!evaluate_fn_) {
-        throw std::runtime_error("MCTSEngine requires an evaluation callback.");
+    if (config_.use_neural_network && !evaluate_fn_) {
+        throw std::runtime_error("MCTSEngine requires an evaluation callback when use_neural_network=true.");
     }
     if (!has_domain_state) {
         if (!expand_fn_ || !terminal_value_fn_ || !terminal_check_fn_) {
@@ -43,11 +66,13 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
 
     TreeNode root(nullptr, root_state, std::nullopt);
 
-    // Ensure root evaluation is ready
-    if (!root_state->policy_logits.defined() || !root_state->value.defined()) {
-        auto eval = evaluate_fn_(root_state);
-        root_state->policy_logits = eval.policy_logits;
-        root_state->value = eval.value;
+    // Ensure root evaluation is ready only when NN guidance is enabled
+    if (config_.use_neural_network) {
+        if (!root_state->policy_logits.defined() || !root_state->value.defined()) {
+            auto eval = evaluate_fn_(root_state);
+            root_state->policy_logits = eval.policy_logits;
+            root_state->value = eval.value;
+        }
     }
 
     for (int sim = 0; sim < config_.simulations; ++sim) {
@@ -59,10 +84,20 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
         backpropagate(leaf, value);
     }
 
-    auto root_children = root.children();
-    auto num_actions = root_state->num_actions();
+    const auto& root_children = root.children_ref();
+    auto num_actions = infer_action_space_size(root_state);
+    auto max_child_action = find_max_action_id(root_children);
+    if (max_child_action >= 0) {
+        num_actions = std::max<int64_t>(num_actions, max_child_action + 1);
+    }
     if (num_actions <= 0) {
         num_actions = static_cast<int64_t>(root_children.size());
+        if (max_child_action >= 0) {
+            num_actions = std::max<int64_t>(num_actions, max_child_action + 1);
+        }
+    }
+    if (num_actions <= 0) {
+        num_actions = 1;
     }
     auto visit_counts = torch::zeros({num_actions}, torch::kFloat32);
     for (const auto& [action, child] : root_children) {
@@ -96,8 +131,7 @@ TreeNode* MCTSEngine::select(TreeNode& root) {
             return node;
         }
 
-        auto children = node->children();
-        if (children.empty()) {
+        if (!node->has_children()) {
             return node;
         }
 
@@ -176,12 +210,29 @@ float MCTSEngine::expand(TreeNode& node) {
         }
         priors = masked_softmax(logits, mask);
     } else {
-        // Uniform priors for plain MCTS
-        int num_actions = static_cast<int>(options.size());
-        if (state->num_actions() > 0) {
-            num_actions = static_cast<int>(state->num_actions());
+        // Uniform priors for plain MCTS aligned with global action indices
+        auto max_action = find_max_action_id(options);
+        int64_t num_actions = infer_action_space_size(state);
+        if (max_action >= 0) {
+            num_actions = std::max<int64_t>(num_actions, max_action + 1);
         }
-        priors = torch::ones({num_actions}, torch::kFloat32) / static_cast<float>(num_actions);
+        if (num_actions <= 0) {
+            num_actions = std::max<int64_t>(1, static_cast<int64_t>(options.size()));
+            if (max_action >= 0) {
+                num_actions = std::max<int64_t>(num_actions, max_action + 1);
+            }
+        }
+        priors = torch::zeros({num_actions}, torch::kFloat32);
+        if (!options.empty()) {
+            float uniform = 1.0f / static_cast<float>(options.size());
+            for (const auto& [action, _] : options) {
+                if (action >= 0 && action < priors.size(0)) {
+                    priors[action] = uniform;
+                }
+            }
+        } else {
+            priors.fill_(1.0f / static_cast<float>(num_actions));
+        }
     }
 
     for (auto& [action, child_state] : options) {
@@ -247,7 +298,7 @@ void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
     auto mixed = (1.0f - config_.dirichlet_epsilon) * priors + config_.dirichlet_epsilon * noise;
     state->policy_logits = torch::log(mixed + 1e-8f);
 
-    for (auto [action, child] : root.children()) {
+    for (const auto& [action, child] : root.children_ref()) {
         if (child && action >= 0 && action < mixed.size(0)) {
             child->set_prior(mixed[action].item<float>());
         }

@@ -97,9 +97,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
              py::overload_cast<int, const std::string&>(&az::VNRState::get_available_link_resource, py::const_))
         .def("get_available_link_resource",
              py::overload_cast<int, int, const std::string&>(&az::VNRState::get_available_link_resource, py::const_))
+        .def("get_allocated_node_resources", &az::VNRState::get_allocated_node_resources)
+        .def("get_allocated_link_resources", &az::VNRState::get_allocated_link_resources)
         .def_property_readonly("selected_physical_nodes", &az::VNRState::selected_physical_nodes)
         .def_property_readonly("virtual_order", &az::VNRState::virtual_order)
         .def_property_readonly("current_virtual_index", &az::VNRState::current_virtual_index)
+        .def_property_readonly("last_physical_node", &az::VNRState::last_physical_node)
         .def_property_readonly("rejected", &az::VNRState::rejected);
 
     py::class_<az::EvaluationResult>(m, "EvaluationResult")
@@ -167,6 +170,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
                 if (!seed_obj.is_none()) {
                     seed = seed_obj.cast<unsigned int>();
                 }
+                py::gil_scoped_release release;
                 return engine.run_search(root_state, seed);
             },
             py::arg("root_state"),
@@ -175,6 +179,15 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
     py::class_<az::PolicyNetwork>(m, "PolicyNetwork")
         .def(py::init<>())
         .def(py::init<const std::string&, torch::Device>())
-        .def("load", &az::PolicyNetwork::load, py::arg("model_path"), py::arg("device") = torch::kCUDA)
+        .def("load",
+             [](az::PolicyNetwork& self, const std::string& model_path, py::object device_obj) {
+                 torch::Device device = torch::kCUDA;
+                 if (!device_obj.is_none()) {
+                     device = device_obj.cast<torch::Device>();
+                 }
+                 self.load(model_path, device);
+             },
+             py::arg("model_path"),
+             py::arg("device") = py::none())
         .def("evaluate", &az::PolicyNetwork::evaluate, py::arg("features"));
 }

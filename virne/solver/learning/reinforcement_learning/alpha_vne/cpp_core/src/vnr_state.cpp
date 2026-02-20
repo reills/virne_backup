@@ -35,7 +35,8 @@ VNRState::VNRState(std::shared_ptr<const Network> physical,
                    VNRConfig config)
     : p_net_(std::move(physical)),
       v_net_(std::move(virtual_net)),
-      config_(std::move(config)) {
+      config_(std::move(config)),
+      allocation_deltas_(std::make_shared<AllocationDelta>()) {
     if (!p_net_) {
         throw std::invalid_argument("VNRState requires a valid physical network reference.");
     }
@@ -43,9 +44,11 @@ VNRState::VNRState(std::shared_ptr<const Network> physical,
         throw std::invalid_argument("VNRState requires a valid virtual network reference.");
     }
 
-    node_allocations_.assign(p_net_->num_nodes, {});
-    link_allocations_.assign(p_net_->num_edges, {});
-    placement_map_.assign(v_net_->num_nodes, -1);
+    std::size_t mask_words = static_cast<std::size_t>((p_net_->num_nodes + 63) / 64);
+    if (mask_words == 0) {
+        mask_words = 1;
+    }
+    selected_p_mask_.assign(mask_words, std::uint64_t{0});
 
     reject_action_id_ = p_net_->num_nodes;
     p_node_id_ = reject_action_id_;
@@ -114,6 +117,89 @@ void VNRState::initialise_virtual_order() {
     total_v_revenue_ = total_node_demand_ + total_link_demand;
 }
 
+bool VNRState::selected_mask_contains(const std::vector<std::uint64_t>& mask, int node_id) noexcept {
+    if (node_id < 0) {
+        return false;
+    }
+    const std::size_t idx = static_cast<std::size_t>(node_id);
+    const std::size_t word = idx >> 6U;
+    if (word >= mask.size()) {
+        return false;
+    }
+    const std::size_t bit = idx & 63U;
+    return (mask[word] & (std::uint64_t{1} << bit)) != 0U;
+}
+
+void VNRState::selected_mask_set(std::vector<std::uint64_t>& mask, int node_id) noexcept {
+    if (node_id < 0) {
+        return;
+    }
+    const std::size_t idx = static_cast<std::size_t>(node_id);
+    const std::size_t word = idx >> 6U;
+    if (word >= mask.size()) {
+        return;
+    }
+    const std::size_t bit = idx & 63U;
+    mask[word] |= (std::uint64_t{1} << bit);
+}
+
+bool VNRState::is_physical_selected(int p_node_id) const noexcept {
+    return selected_mask_contains(selected_p_mask_, p_node_id);
+}
+
+void VNRState::mark_physical_selected(int p_node_id) {
+    selected_mask_set(selected_p_mask_, p_node_id);
+}
+
+int VNRState::lookup_placement(int v_node_id) const {
+    auto cursor = placement_deltas_;
+    while (cursor) {
+        if (cursor->v_node_id == v_node_id) {
+            return cursor->p_node_id;
+        }
+        cursor = cursor->parent;
+    }
+    return -1;
+}
+
+void VNRState::add_allocation_delta(AllocationDelta::SparseAllocations& allocations,
+                                    int item_id,
+                                    const std::string& attr,
+                                    double value) {
+    if (value <= 0.0) {
+        return;
+    }
+    allocations[item_id][attr] += value;
+}
+
+double VNRState::lookup_allocation_delta(const std::shared_ptr<const AllocationDelta>& delta_root,
+                                         int item_id,
+                                         const std::string& attr,
+                                         bool node_resource) {
+    double total = 0.0;
+    auto cursor = delta_root;
+    while (cursor) {
+        const auto& allocations = node_resource ? cursor->node_allocations : cursor->link_allocations;
+        auto item_it = allocations.find(item_id);
+        if (item_it != allocations.end()) {
+            auto value_it = item_it->second.find(attr);
+            if (value_it != item_it->second.end()) {
+                total += value_it->second;
+            }
+        }
+        cursor = cursor->parent;
+    }
+    return total;
+}
+
+double VNRState::get_allocated_node_resource(int node_id, const std::string& attr) const {
+    return lookup_allocation_delta(allocation_deltas_, node_id, attr, true);
+}
+
+double VNRState::get_allocated_link_resource(int edge_id, const std::string& attr) const {
+    return lookup_allocation_delta(allocation_deltas_, edge_id, attr, false);
+}
+
 std::vector<int> VNRState::get_candidate_nodes() const {
     std::vector<int> candidates;
     int next_index = v_node_index_ + 1;
@@ -128,7 +214,7 @@ std::vector<int> VNRState::get_candidate_nodes() const {
     const auto& v_attrs = v_net_->node_attrs[v_target];
 
     for (int p = 0; p < p_net_->num_nodes; ++p) {
-        if (std::find(selected_p_nodes_.begin(), selected_p_nodes_.end(), p) != selected_p_nodes_.end()) {
+        if (is_physical_selected(p)) {
             continue;
         }
 
@@ -171,6 +257,25 @@ bool VNRState::is_terminal() const {
     return v_node_index_ == (v_net_->num_nodes - 1);
 }
 
+const std::vector<int>& VNRState::selected_physical_nodes() const {
+    if (selected_p_nodes_cache_valid_) {
+        return selected_p_nodes_cache_;
+    }
+
+    selected_p_nodes_cache_.clear();
+    if (selected_count_ > 0) {
+        selected_p_nodes_cache_.reserve(static_cast<std::size_t>(selected_count_));
+    }
+    auto cursor = selection_deltas_;
+    while (cursor) {
+        selected_p_nodes_cache_.push_back(cursor->p_node_id);
+        cursor = cursor->parent;
+    }
+    std::reverse(selected_p_nodes_cache_.begin(), selected_p_nodes_cache_.end());
+    selected_p_nodes_cache_valid_ = true;
+    return selected_p_nodes_cache_;
+}
+
 float VNRState::compute_final_reward() const {
     if (rejected_) {
         return static_cast<float>(-config_.reject_penalty);
@@ -178,7 +283,7 @@ float VNRState::compute_final_reward() const {
     if (p_node_id_ == -1) {
         return -1000.0f;
     }
-    if (static_cast<int>(selected_p_nodes_.size()) != v_net_->num_nodes) {
+    if (selected_count_ != v_net_->num_nodes) {
         return -1000.0f;
     }
 
@@ -189,17 +294,12 @@ float VNRState::compute_final_reward() const {
 }
 
 double VNRState::sum_link_allocations() const {
-    double total = 0.0;
-    for (const auto& edge_map : link_allocations_) {
-        for (const auto& [_, value] : edge_map) {
-            total += value;
-        }
-    }
-    return total;
+    return total_link_allocation_;
 }
 
 VNRState VNRState::create_child(int p_node_id) const {
     VNRState child(*this);
+    child.selected_p_nodes_cache_valid_ = false;
     child.v_node_index_ = v_node_index_ + 1;
     child.p_node_id_ = p_node_id;
 
@@ -217,41 +317,60 @@ VNRState VNRState::create_child(int p_node_id) const {
         return child;
     }
 
-    child.selected_p_nodes_.push_back(p_node_id);
+    auto step_delta = std::make_shared<AllocationDelta>();
+    step_delta->parent = allocation_deltas_;
+    child.allocation_deltas_ = step_delta;
+
+    auto selection_delta = std::make_shared<SelectionDelta>();
+    selection_delta->parent = selection_deltas_;
+    selection_delta->p_node_id = p_node_id;
+    child.selection_deltas_ = std::move(selection_delta);
+    child.selected_count_ = selected_count_ + 1;
+    child.mark_physical_selected(p_node_id);
+
     if (child.v_node_index_ < static_cast<int>(child.v_order_.size())) {
         int v_target = child.v_order_[child.v_node_index_];
-        child.placement_map_[v_target] = p_node_id;
-        child.update_node_allocations(p_node_id, v_target, child);
-        if (!child.reserve_link_resources(v_target, p_node_id, child)) {
+        auto placement_delta = std::make_shared<PlacementDelta>();
+        placement_delta->parent = placement_deltas_;
+        placement_delta->v_node_id = v_target;
+        placement_delta->p_node_id = p_node_id;
+        child.placement_deltas_ = std::move(placement_delta);
+        child.update_node_allocations(p_node_id, v_target, *step_delta);
+        if (!child.reserve_link_resources(v_target, p_node_id, child, *step_delta)) {
             child.p_node_id_ = -1;
         }
     }
+    child.total_link_allocation_ = total_link_allocation_ + step_delta->link_allocation_total;
 
     return child;
 }
 
-void VNRState::update_node_allocations(int p_node_id, int v_node_id, VNRState& target) const {
+void VNRState::update_node_allocations(int p_node_id, int v_node_id, AllocationDelta& delta) const {
     const auto& v_attrs = v_net_->node_attrs[v_node_id];
     for (const auto& attr_name : config_.node_resource_names) {
         double demand = safe_lookup(v_attrs, attr_name);
         if (demand <= 0.0) {
             continue;
         }
-        target.node_allocations_[p_node_id][attr_name] += demand;
+        add_allocation_delta(delta.node_allocations, p_node_id, attr_name, demand);
     }
 }
 
-bool VNRState::reserve_link_resources(int new_virtual_node, int new_physical_node, VNRState& target) const {
+bool VNRState::reserve_link_resources(int new_virtual_node,
+                                      int new_physical_node,
+                                      VNRState& target,
+                                      AllocationDelta& delta) const {
     for (const auto& [neighbor, edge_id] : v_net_->adjacency[new_virtual_node]) {
+        (void)edge_id;
         int neighbor_pos = target.v_pos_[neighbor];
         if (neighbor_pos > target.v_node_index_) {
             continue;
         }
-        int mapped_neighbor = target.placement_map_[neighbor];
+        int mapped_neighbor = target.lookup_placement(neighbor);
         if (mapped_neighbor < 0) {
             continue;
         }
-        if (!reserve_path_for_virtual_edge(new_virtual_node, neighbor, new_physical_node, mapped_neighbor, target)) {
+        if (!reserve_path_for_virtual_edge(new_virtual_node, neighbor, new_physical_node, mapped_neighbor, target, delta)) {
             return false;
         }
     }
@@ -262,7 +381,8 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
                                              int v_dst,
                                              int p_src,
                                              int p_dst,
-                                             VNRState& target) const {
+                                             VNRState& target,
+                                             AllocationDelta& delta) const {
     auto it = v_net_->edge_index.find({v_src, v_dst});
     if (it == v_net_->edge_index.end()) {
         it = v_net_->edge_index.find({v_dst, v_src});
@@ -299,7 +419,8 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
             if (demand <= 0.0) {
                 continue;
             }
-            target.link_allocations_[edge_id][attr] += demand;
+            add_allocation_delta(delta.link_allocations, edge_id, attr, demand);
+            delta.link_allocation_total += demand;
         }
     }
 
@@ -311,7 +432,7 @@ double VNRState::get_available_node_resource(int node_id, const std::string& att
         return 0.0;
     }
     double capacity = safe_lookup(p_net_->node_attrs[node_id], attr);
-    double used = safe_lookup(node_allocations_[node_id], attr);
+    double used = get_allocated_node_resource(node_id, attr);
     return capacity - used;
 }
 
@@ -320,7 +441,7 @@ double VNRState::get_available_link_resource(int edge_id, const std::string& att
         return 0.0;
     }
     double capacity = safe_lookup(p_net_->edge_attrs[edge_id], attr);
-    double used = safe_lookup(link_allocations_[edge_id], attr);
+    double used = get_allocated_link_resource(edge_id, attr);
     return capacity - used;
 }
 
@@ -330,6 +451,74 @@ double VNRState::get_available_link_resource(int u, int v, const std::string& at
         return 0.0;
     }
     return get_available_link_resource(it->second, attr);
+}
+
+VNRState::SparseResourceAllocations VNRState::get_allocated_node_resources() const {
+    SparseResourceAllocations merged;
+    auto cursor = allocation_deltas_;
+    while (cursor) {
+        for (const auto& [node_id, resources] : cursor->node_allocations) {
+            auto& out = merged[node_id];
+            for (const auto& [attr, value] : resources) {
+                if (value <= 0.0) {
+                    continue;
+                }
+                out[attr] += value;
+            }
+        }
+        cursor = cursor->parent;
+    }
+
+    for (auto it = merged.begin(); it != merged.end();) {
+        auto& resources = it->second;
+        for (auto attr_it = resources.begin(); attr_it != resources.end();) {
+            if (attr_it->second <= kEpsilon) {
+                attr_it = resources.erase(attr_it);
+            } else {
+                ++attr_it;
+            }
+        }
+        if (resources.empty()) {
+            it = merged.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return merged;
+}
+
+VNRState::SparseResourceAllocations VNRState::get_allocated_link_resources() const {
+    SparseResourceAllocations merged;
+    auto cursor = allocation_deltas_;
+    while (cursor) {
+        for (const auto& [edge_id, resources] : cursor->link_allocations) {
+            auto& out = merged[edge_id];
+            for (const auto& [attr, value] : resources) {
+                if (value <= 0.0) {
+                    continue;
+                }
+                out[attr] += value;
+            }
+        }
+        cursor = cursor->parent;
+    }
+
+    for (auto it = merged.begin(); it != merged.end();) {
+        auto& resources = it->second;
+        for (auto attr_it = resources.begin(); attr_it != resources.end();) {
+            if (attr_it->second <= kEpsilon) {
+                attr_it = resources.erase(attr_it);
+            } else {
+                ++attr_it;
+            }
+        }
+        if (resources.empty()) {
+            it = merged.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return merged;
 }
 
 float VNRState::run_random_rollout(std::mt19937& rng, int depth_limit) const {

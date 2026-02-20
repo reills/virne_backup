@@ -33,8 +33,24 @@ def add_simulation_into_config(config: DictConfig):
         if "simulation" not in config:
             config.simulation = OmegaConf.create()
         # Update simulation settings
-        config.simulation.p_net_dataset_dir = get_p_net_dataset_dir_from_setting(config.p_net_setting, config.experiment.seed)
-        config.simulation.v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(config.v_sim_setting, config.experiment.seed)
+        def _needs_value(container, key):
+            if key not in container:
+                return True
+            value = container.get(key)
+            if value in ("", None):
+                return True
+            try:
+                from omegaconf import OmegaConf
+                if OmegaConf.is_missing(container, key):  # type: ignore[attr-defined]
+                    return True
+            except Exception:
+                pass
+            return False
+
+        if _needs_value(config.simulation, "p_net_dataset_dir"):
+            config.simulation.p_net_dataset_dir = get_p_net_dataset_dir_from_setting(config.p_net_setting, config.experiment.seed)
+        if _needs_value(config.simulation, "v_nets_dataset_dir"):
+            config.simulation.v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(config.v_sim_setting, config.experiment.seed)
         config.simulation.p_net_setting_num_nodes = config.p_net_setting.topology.num_nodes
         config.simulation.p_net_setting_num_node_attrs = len(config.p_net_setting.node_attrs_setting)
         config.simulation.p_net_setting_num_link_attrs = len(config.p_net_setting.link_attrs_setting)
@@ -61,4 +77,3 @@ def get_run_id_dir(config: DictConfig) -> str:
     with open_dict(config):
         config.experiment.save_run_id_dir = os.path.join(config.experiment.save_root_dir, config.solver.solver_name, config.experiment.run_id)
     return config.experiment.save_run_id_dir
-

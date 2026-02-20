@@ -50,9 +50,11 @@ class AlphaZeroSFCSolver(RLSolver):
                 p_net_num_nodes=solver.config.simulation.p_net_setting_num_nodes,
                 p_net_feature_dim=solver.config.simulation.p_net_setting_num_node_resource_attrs,
                 v_net_feature_dim=solver.config.simulation.v_sim_setting_num_node_resource_attrs,
+                p_net_edge_dim=solver.config.simulation.p_net_setting_num_link_resource_attrs,
                 embedding_dim=getattr(solver.config.nn, 'embedding_dim', 128),
-                n_heads=8,  # Fixed reasonable default
-                n_layers=getattr(solver.config.nn, 'num_gnn_layers', 3),
+                n_heads=getattr(solver.config.nn, 'n_heads', 8),
+                n_layers=getattr(solver.config.nn, 'transformer_layers', 4),
+                gnn_layers=getattr(solver.config.nn, 'num_gnn_layers', 3),
                 dropout=getattr(solver.config.nn, 'dropout_prob', 0.1),
                 allow_revocable=getattr(solver.config.solver, 'allow_revocable', False),
                 allow_rejection=getattr(solver.config.solver, 'allow_rejection', False),
@@ -94,6 +96,12 @@ class AlphaZeroSFCSolver(RLSolver):
         # Use optimized actor with batched GPU inference
         use_batched_gpu = getattr(config.training, 'use_batched_gpu', True)
         disable_trajectory_writing = getattr(config.training, 'disable_trajectory_writing', False)
+
+        self.inference_only = bool(getattr(config.training, 'inference_only', False))
+        self.enable_async_learner = bool(getattr(config.training, 'enable_async_learner', True))
+        if self.inference_only:
+            self.enable_async_learner = False
+        self._learner_disabled_logged = False
         
         # Build the primary actor. Explicitly pass shortest_method/k_shortest so
         # State.link_params used for feasibility checks and reward match the
@@ -118,6 +126,7 @@ class AlphaZeroSFCSolver(RLSolver):
         else:
             logger.info("⚠️  Using OptimizedAlphaZeroActor without batching (slower)")
         self.learner_process: Optional[Process] = None
+        self._stop_signal = None
         self._num_train_steps = getattr(config.training, "num_train_steps_per_epoch", 100)
         
         # Cache for model weights to avoid repeated loading
@@ -164,24 +173,47 @@ class AlphaZeroSFCSolver(RLSolver):
 
     def _start_learner(self) -> None:
         """Start the learner in a CUDA-safe spawned process (rebuilds components in child)."""
+        if not self.enable_async_learner:
+            if not self._learner_disabled_logged:
+                self.logger.info("Async learner disabled; running in inference-only mode.")
+                self._learner_disabled_logged = True
+            return
         if self.learner_process is not None and self.learner_process.is_alive():
             return
         # Use saved config file for reconstruction
         config_path = os.path.join(get_run_id_dir(self.config), 'config.yaml')
+        # Ensure stop signal exists and is cleared for a fresh training run
+        stop_event = self._stop_signal
+        mp_ctx = None
         try:
-            import multiprocessing as mp
-            ctx = mp.get_context('spawn')
-            self.learner_process = ctx.Process(
+            mp_ctx = multiprocessing.get_context('spawn')
+        except Exception:
+            mp_ctx = None
+        if stop_event is None:
+            if mp_ctx is not None:
+                stop_event = mp_ctx.Event()
+            else:
+                stop_event = multiprocessing.Event()
+            self._stop_signal = stop_event
+        else:
+            stop_event.clear()
+        try:
+            if mp_ctx is None:
+                raise RuntimeError("spawn context unavailable")
+            self.learner_process = mp_ctx.Process(
                 target=_learner_process_entry,
-                args=(config_path, self.replay_dir, self.models_dir, self.batch_size),
+                args=(config_path, self.replay_dir, self.models_dir, self.batch_size, self._stop_signal),
                 daemon=True,
             )
             self.logger.info("Starting learner process with start_method=spawn")
         except Exception:
             # Fallback to default if spawn is unavailable
+            if mp_ctx is not None:
+                # Recreate stop signal with default context to match fallback process start method
+                self._stop_signal = multiprocessing.Event()
             self.learner_process = Process(
                 target=_learner_process_entry,
-                args=(config_path, self.replay_dir, self.models_dir, self.batch_size),
+                args=(config_path, self.replay_dir, self.models_dir, self.batch_size, self._stop_signal),
                 daemon=True,
             )
             self.logger.warning("Falling back to default start_method (not spawn)")
@@ -272,7 +304,13 @@ class AlphaZeroSFCSolver(RLSolver):
         # Safety: warn if trajectory writing is disabled while training, which would starve the learner
         if getattr(self.actor, 'disable_trajectory_writing', False):
             self.logger.warning("Trajectory writing is disabled; the learner will not receive new episodes.")
+        if self.inference_only or num_epochs <= 0:
+            self.logger.info("Inference-only mode enabled or zero epochs requested; skipping training loop.")
+            return
         self._start_learner()
+        if not self.enable_async_learner:
+            self.logger.info("Async learner disabled; skipping background learner startup.")
+            return
         
         # Use the standard RLSolver distributed training if enabled
         if self.config.training.distributed_training:
@@ -280,6 +318,9 @@ class AlphaZeroSFCSolver(RLSolver):
         else:
             self.learn_singly(env, num_epochs, **kwargs)
         
+        if self._stop_signal is not None and self._stop_signal.is_set():
+            self.logger.info("Learner stop signal acknowledged; actor loops ended early.")
+
         self.logger.info(f"Training completed! Model saved to {self.policy_path}")
         self.logger.info(f"Now ready for evaluation phase (num_simulations = inference-only runs)")
 
@@ -294,8 +335,15 @@ class AlphaZeroSFCSolver(RLSolver):
         # TensorBoard writer for VNE metrics
         tb_log_dir = os.path.join(get_run_id_dir(self.config), "logs")
         writer = SummaryWriter(tb_log_dir)
+        stop_event = getattr(self, "_stop_signal", None)
+        stop_logged = False
         
         for epoch in range(num_epochs):
+            if stop_event is not None and stop_event.is_set():
+                if not stop_logged:
+                    self.logger.info("Learner signaled completion; exiting training loop.")
+                    stop_logged = True
+                break
             self.logger.info(f"Training Epoch {epoch + 1}/{num_epochs} - Processing {total_vnrs} VNRs")
             
             # Reset metrics tracking
@@ -319,6 +367,11 @@ class AlphaZeroSFCSolver(RLSolver):
             )
             
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    if not stop_logged:
+                        self.logger.info("Learner signaled completion; stopping current epoch early.")
+                        stop_logged = True
+                    break
                 solution = self.solve(instance)
                 next_instance, _, done, info = env.step(solution)
                 vnr_count += 1
@@ -336,12 +389,19 @@ class AlphaZeroSFCSolver(RLSolver):
                     epoch_metrics['rejected'] += 1
                 
                 pbar.update(1)
+                if stop_event is not None and stop_event.is_set():
+                    if not stop_logged:
+                        self.logger.info("Learner signaled completion; stopping current epoch early.")
+                        stop_logged = True
+                    break
                 
                 if done:
                     break
                 instance = next_instance
             
             pbar.close()
+            if stop_event is not None and stop_event.is_set():
+                break
             
             # Calculate epoch summary metrics
             acceptance_rate = epoch_metrics['accepted'] / (epoch_metrics['accepted'] + epoch_metrics['rejected']) * 100
@@ -439,7 +499,7 @@ class AlphaZeroSFCSolver(RLSolver):
             # Pass config instead of environment - worker will create its own
             process = mp.Process(
                 target=_worker_training_loop,
-                args=(worker_id, self.config, epochs_per_worker, worker_seed, self.replay_dir, self.policy_path)
+                args=(worker_id, self.config, epochs_per_worker, worker_seed, self.replay_dir, self.policy_path, self._stop_signal)
             )
             processes.append(process)
             process.start()
@@ -454,7 +514,7 @@ class AlphaZeroSFCSolver(RLSolver):
 
 # Removed: _solve_vnr_with_mcts_worker - consolidated into actor.solve_vnr_with_mcts
 
-def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, batch_size: int):
+def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, batch_size: int, stop_event):
     """Spawn-safe learner entrypoint. Rebuilds environment and trains in a loop.
 
     Args:
@@ -473,6 +533,11 @@ def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, b
     config = OmegaConf.load(config_path)
     logger = Logger(config=config)
     logger.info(f"Learner spawned with config: {config_path}")
+    try:
+        if stop_event is not None:
+            stop_event.clear()
+    except Exception:
+        logger.warning("Learner failed to clear stop_event on startup")
     try:
         logger.info(f"Start method (child) = {mp.get_start_method(default='spawn')}")
     except Exception:
@@ -505,22 +570,51 @@ def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, b
     steps_per_iter = getattr(config.training, 'num_train_steps_per_epoch', 100)
 
     total_steps = 0
+    trained_any_steps = False
     consecutive_empty = 0
-    while total_steps < max_training_steps:
-        files = [f for f in os.listdir(replay_dir) if f.endswith('.json')]
-        if len(files) < min_buffer_size:
-            consecutive_empty += 1
-            if consecutive_empty > max_empty_batches:
-                logger.warning(f"Stopping learner: insufficient data for {max_empty_batches} attempts")
-                break
-            time.sleep(1.0)
-            continue
-        consecutive_empty = 0
-        stats = learner.train_steps(steps_per_iter)
-        total_steps += steps_per_iter
-        if stats:
-            logger.info(f"Learner iter: +{steps_per_iter} steps, avg_total_loss={stats['avg_total_loss']:.4f}")
-    logger.info(f"Learner terminated after {total_steps} training steps")
+    try:
+        while total_steps < max_training_steps:
+            files = [f for f in os.listdir(replay_dir) if f.endswith('.json')]
+            if len(files) < min_buffer_size:
+                consecutive_empty += 1
+                if consecutive_empty > max_empty_batches:
+                    # Do not stop before the first successful training batch.
+                    # Actors may still be generating trajectories, and exiting here
+                    # would leave no checkpoint for downstream eval.
+                    if not trained_any_steps:
+                        logger.warning(
+                            f"Replay buffer still below min_buffer_size={min_buffer_size} "
+                            f"after {max_empty_batches} checks; waiting for actors to populate data."
+                        )
+                        consecutive_empty = 0
+                    else:
+                        logger.warning(f"Stopping learner: insufficient data for {max_empty_batches} attempts")
+                        break
+                time.sleep(1.0)
+                continue
+            consecutive_empty = 0
+            stats = learner.train_steps(steps_per_iter)
+            trained_any_steps = True
+            total_steps += steps_per_iter
+            if stats:
+                logger.info(f"Learner iter: +{steps_per_iter} steps, avg_total_loss={stats['avg_total_loss']:.4f}")
+    finally:
+        # Guarantee at least one usable checkpoint for orchestration resume/eval.
+        try:
+            if not os.path.exists(learner.policy_path) or os.path.getsize(learner.policy_path) <= 0:
+                learner._save_model_atomically()
+                learner._save_full_checkpoint()
+                logger.warning(
+                    f"Learner emitted fallback checkpoint at {learner.policy_path} "
+                    "(no non-empty checkpoint was present at shutdown)."
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to emit fallback checkpoint on learner shutdown: {exc}")
+        logger.info(f"Learner terminated after {total_steps} training steps")
+        # Only signal actors after at least one learner step, to avoid
+        # prematurely stopping data collection when the replay buffer is still warming up.
+        if stop_event is not None and trained_any_steps:
+            stop_event.set()
 
 def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: str, policy_path: str):
     """Create environment components for a worker process."""
@@ -569,7 +663,7 @@ def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: st
 
     return env, controller, worker_actor
 
-def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, replay_dir: str, policy_path: str) -> None:
+def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, replay_dir: str, policy_path: str, stop_event) -> None:
     """Training loop for a single worker process."""
     import tqdm
     
@@ -584,6 +678,8 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
     total_vnrs = env.v_net_simulator.v_sim_setting['num_v_nets']
     
     for epoch in range(num_epochs):
+        if stop_event is not None and stop_event.is_set():
+            break
         global_epoch = worker_id * num_epochs + epoch + 1
         # print(f"Worker {worker_id}: Epoch {epoch + 1}/{num_epochs} (Global: {global_epoch})")
         
@@ -601,6 +697,8 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
         )
         
         while True:
+            if stop_event is not None and stop_event.is_set():
+                break
             # Solve using MCTS (same as main solver)
             v_net, p_net = instance['v_net'], instance['p_net']
             from virne.core import Solution
@@ -641,12 +739,16 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
             vnr_count += 1
             
             pbar.update(1)
+            if stop_event is not None and stop_event.is_set():
+                break
             
             if done:
                 break
             instance = next_instance
         
         pbar.close()
+        if stop_event is not None and stop_event.is_set():
+            break
         # Worker completion logging - could be moved to logger if needed
     
     # Worker completion logging

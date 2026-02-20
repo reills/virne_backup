@@ -49,6 +49,7 @@ class AlphaZeroLearner:
         embedding_dim = getattr(config.nn, 'embedding_dim', 96)
         n_heads = getattr(config.nn, 'n_heads', 6)
         n_layers = getattr(config.nn, 'transformer_layers', 2)
+        gnn_layers = getattr(config.nn, 'num_gnn_layers', 3)
         dropout = getattr(config.nn, 'dropout_prob', 0.1)
         self.policy = ActorCritic(
             p_net_num_nodes=config.simulation.p_net_setting_num_nodes,
@@ -58,6 +59,7 @@ class AlphaZeroLearner:
             embedding_dim=embedding_dim,
             n_heads=n_heads,
             n_layers=n_layers,
+            gnn_layers=gnn_layers,
             dropout=dropout,
             allow_rejection=getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
         ).to(self.device)
@@ -334,8 +336,20 @@ class AlphaZeroLearner:
         batch_masks = []
 
         for fname in batch_files:
-            with open(os.path.join(self.replay_dir, fname), 'r') as f:
-                data = json.load(f)
+            episode_path = os.path.join(self.replay_dir, fname)
+            try:
+                with open(episode_path, 'r') as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                # Actors may still be writing this episode; skip and continue.
+                self.logger.debug(f"Skipping malformed/incomplete replay episode: {episode_path}")
+                continue
+            except FileNotFoundError:
+                # Episode can disappear due to buffer cleanup races.
+                continue
+            except Exception as exc:
+                self.logger.debug(f"Skipping unreadable replay episode {episode_path}: {exc}")
+                continue
 
             # Process standardized episode format
             trajectory = data.get('trajectory', [])

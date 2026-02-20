@@ -10,6 +10,8 @@ sfc_study_results/
 results/*
 outputs/* 
 dataset/
+legacy
+datasets/
 poisson_test/
 dataset/results*
 dataset/april15_results
@@ -46,6 +48,7 @@ exp_srl_vne_data
 docs/build/
 docs/source/_autosummary/
 docs/source/generated/
+confrence_paper
 
 # cache
 *.log

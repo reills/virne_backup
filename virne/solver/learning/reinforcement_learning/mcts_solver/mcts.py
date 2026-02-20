@@ -7,6 +7,11 @@ import copy
 import math
 from threading import Thread
 
+try:
+    from . import mcts_cpp_core
+except ImportError:  # pragma: no cover - optional dependency
+    mcts_cpp_core = None
+
 from virne.core import Solution
 from virne.core.environment import SolutionStepEnvironment
 from .node import Node, State
@@ -27,38 +32,164 @@ class MctsSolver(Solver):
     """
     def __init__(self,  controller, recorder, counter, logger, config, **kwargs):
         super(MctsSolver, self).__init__(controller, recorder, counter, logger, config, **kwargs)
-        self.computation_budget = kwargs.get('computation_budget', 5)
-        self.exploration_constant = kwargs.get('exploration_constant', 0.5)
+        training_cfg = getattr(config, 'training', None)
+
+        def _cfg_get(obj, key, default=None):
+            if obj is None:
+                return default
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        default_budget = _cfg_get(training_cfg, 'computation_budget', 5)
+        self.computation_budget = kwargs.get('computation_budget', default_budget)
+
+        default_exploration = _cfg_get(training_cfg, 'exploration_constant', None)
+        if default_exploration is None:
+            default_exploration = _cfg_get(training_cfg, 'c_puct', 0.5)
+        self.exploration_constant = kwargs.get('exploration_constant', default_exploration)
         # ranking strategy
         self.reusable = kwargs.get('reusable', False)
         # node mapping
         self.matching_mathod = kwargs.get('matching_mathod', 'greedy')
         # link mapping
-        self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')
-        self.k_shortest = kwargs.get('k_shortest', 10)
+        self.shortest_method = kwargs.get(
+            'shortest_method',
+            getattr(config.solver, 'shortest_method', self.shortest_method),
+        )
+        self.k_shortest = int(
+            kwargs.get(
+                'k_shortest',
+                getattr(config.solver, 'k_shortest', self.k_shortest),
+            )
+        )
+        requested_cpp = bool(_cfg_get(training_cfg, 'use_cpp_mcts', False) or kwargs.get('use_cpp_mcts', False))
+        experiment_cfg = getattr(config, 'experiment', None)
+        self._cpp_seed = getattr(experiment_cfg, 'seed', None)
+        self._use_cpp_backend = requested_cpp and mcts_cpp_core is not None
+        if self._use_cpp_backend:
+            logger.info("Using C++ backend for MCTS solver.")
+        elif requested_cpp and mcts_cpp_core is None:
+            logger.warning("C++ MCTS backend requested but extension not found; falling back to pure Python.")
 
     def solve(self, instance):
+        if self._use_cpp_backend:
+            try:
+                return self._solve_cpp(instance)
+            except Exception as exc:  # pragma: no cover - fallback path
+                self.logger.exception("C++ MCTS backend failed; reverting to Python implementation.")
+        return self._solve_python(instance)
+
+    def _solve_python(self, instance):
         v_net, p_net = instance['v_net'], instance['p_net']
-        init_state = State(p_net, v_net, self.controller, self.recorder, self.counter)
+        link_params = {'shortest_method': self.shortest_method, 'k': self.k_shortest}
+        init_state = State(p_net, v_net, self.controller, self.recorder, self.counter, link_params=link_params)
         current_node = Node(None, init_state)
         solution = Solution.from_v_net(v_net)
 
-        # node mapping
-        for v_node_id in range(v_net.num_nodes):
-            current_node = self.search(current_node)
-            if current_node is None:
+        # MCTS selects placements in demand-sorted order
+        for _ in range(v_net.num_nodes):
+            next_node = self.search(current_node)
+            if next_node is None:
                 solution['place_result'] = False
+                solution['result'] = False
                 return solution
-            p_node_id = current_node.state.p_node_id
-            if p_node_id == -1:
+
+            state = next_node.state
+            if getattr(state, 'rejected', False):
+                solution['early_rejection'] = True
                 solution['place_result'] = False
+                solution['result'] = False
                 return solution
-            # place
-            place_result, place_info = self.controller.node_mapper.place(v_net, p_net, v_node_id, p_node_id, solution=solution)
+
+            if state.p_node_id == -1:
+                solution['place_result'] = False
+                solution['result'] = False
+                return solution
+
+            current_node = next_node
+
+        final_state = current_node.state
+
+        if getattr(final_state, 'rejected', False):
+            solution['early_rejection'] = True
+            solution['place_result'] = False
+            solution['result'] = False
+            return solution
+
+        if len(final_state.selected_p_net_nodes) != v_net.num_nodes:
+            solution['place_result'] = False
+            solution['result'] = False
+            return solution
+
+        # Apply placements to the environment following cached order
+        for idx, p_node_id in enumerate(final_state.selected_p_net_nodes):
+            v_node_id = final_state.v_order[idx]
+            place_result, _ = self.controller.node_mapper.place(
+                v_net, p_net, v_node_id, p_node_id, solution=solution
+            )
+            if not place_result:
+                solution['place_result'] = False
+                solution['result'] = False
+                return solution
+
+        solution['selected_actions'] = list(final_state.selected_p_net_nodes)
 
         # link mapping
         link_mapping_result = self.controller.link_mapper.link_mapping(v_net, p_net, solution=solution, 
                                                         shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
+        if not link_mapping_result:
+            solution['route_result'] = False
+            solution['result'] = False
+            return solution
+        solution['result'] = True
+        return solution
+
+    def _solve_cpp(self, instance):
+        v_net, p_net = instance['v_net'], instance['p_net']
+        solution = Solution.from_v_net(v_net)
+        placements = mcts_cpp_core.run_mcts(
+            self.controller,
+            self.counter,
+            v_net,
+            p_net,
+            int(self.computation_budget),
+            float(self.exploration_constant),
+            self._cpp_seed,
+            self.shortest_method,
+            int(self.k_shortest),
+        )
+        if not placements or len(placements) != v_net.num_nodes:
+            solution['place_result'] = False
+            return solution
+
+        for v_node_id, p_node_id in enumerate(placements):
+            if p_node_id == p_net.num_nodes:
+                solution['early_rejection'] = True
+                solution['place_result'] = False
+                solution['result'] = False
+                return solution
+            if p_node_id < 0 or p_node_id >= p_net.num_nodes:
+                solution['place_result'] = False
+                solution['result'] = False
+                return solution
+            place_result, _ = self.controller.node_mapper.place(
+                v_net, p_net, v_node_id, int(p_node_id), solution=solution
+            )
+            if not place_result:
+                solution['place_result'] = False
+                return solution
+
+        solution['selected_actions'] = list(placements)
+
+        link_mapping_result = self.controller.link_mapper.link_mapping(
+            v_net,
+            p_net,
+            solution=solution,
+            shortest_method=self.shortest_method,
+            k=self.k_shortest,
+            inplace=True,
+        )
         if not link_mapping_result:
             solution['route_result'] = False
             return solution

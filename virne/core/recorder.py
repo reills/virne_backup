@@ -297,11 +297,76 @@ class Recorder:
         """Save the summary to a csv file."""
         summary_path = os.path.join(self.summary_dir,  fname)
         def write_csv(path, data):
-            head = None if os.path.exists(path) else list(data.keys())
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            row_dict = dict(data)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                header = list(row_dict.keys())
+                with open(path, 'w', newline='') as csv_file:
+                    writer = csv.writer(csv_file, dialect='excel', delimiter=',')
+                    writer.writerow(header)
+                    writer.writerow([row_dict.get(k, "") for k in header])
+                return
+
+            with open(path, 'r', newline='') as csv_file:
+                reader = list(csv.reader(csv_file))
+            if not reader:
+                header = list(row_dict.keys())
+                with open(path, 'w', newline='') as csv_file:
+                    writer = csv.writer(csv_file, dialect='excel', delimiter=',')
+                    writer.writerow(header)
+                    writer.writerow([row_dict.get(k, "") for k in header])
+                return
+
+            header = reader[0]
+            rows = reader[1:]
+            new_keys = [k for k in row_dict.keys() if k not in header]
+
+            # Detect existing rows that have more columns than header.
+            max_extra_cols = 0
+            for r in rows:
+                if len(r) > len(header):
+                    max_extra_cols = max(max_extra_cols, len(r) - len(header))
+
+            extra_keys = []
+            if max_extra_cols > 0:
+                # If the extra columns align with new keys, map them directly.
+                if new_keys and max_extra_cols == len(new_keys):
+                    extra_keys = new_keys[:]
+                else:
+                    extra_keys = [f"extra_col_{i+1}" for i in range(max_extra_cols)]
+
+            extended_header = header[:]
+            for k in new_keys:
+                if k not in extended_header:
+                    extended_header.append(k)
+            for k in extra_keys:
+                if k not in extended_header:
+                    extended_header.append(k)
+
+            needs_rewrite = bool(new_keys or max_extra_cols > 0)
+            if needs_rewrite:
+                normalized_rows = []
+                for r in rows:
+                    base = r[:len(header)]
+                    extras = r[len(header):]
+                    row_map = {k: v for k, v in zip(header, base)}
+                    if extras and extra_keys:
+                        for k, v in zip(extra_keys, extras):
+                            row_map[k] = v
+                    normalized_rows.append([row_map.get(k, "") for k in extended_header])
+
+                with open(path, 'w', newline='') as csv_file:
+                    writer = csv.writer(csv_file, dialect='excel', delimiter=',')
+                    writer.writerow(extended_header)
+                    for r in normalized_rows:
+                        writer.writerow(r)
+                    writer.writerow([row_dict.get(k, "") for k in extended_header])
+                return
+
+            # Append in existing header order.
             with open(path, 'a+', newline='') as csv_file:
                 writer = csv.writer(csv_file, dialect='excel', delimiter=',')
-                if head is not None: writer.writerow(head)
-                writer.writerow(list(data.values()))
+                writer.writerow([row_dict.get(k, "") for k in header])
         write_csv(summary_path, summary_info)
         #     if_use_node_status_flags: true
         #     if_use_aggregated_link_attrs: true

@@ -110,10 +110,18 @@ class MCTSEngine:
         Returns:
             Selected child node
         """
+        def _num_nodes(state) -> int:
+            original = getattr(state, "_original_p_net", None)
+            if original is not None:
+                return int(getattr(original, "num_nodes", 0))
+            return int(state.p_net.num_nodes)
+
+        num_nodes = _num_nodes(node.state)
+
         def _is_selectable(child: Node) -> bool:
             pid = child.state.p_node_id
             # Allow normal placements and explicit reject (num_nodes). Treat -1 as fallback.
-            return (0 <= pid < node.state.p_net.num_nodes) or pid == node.state.p_net.num_nodes or pid == -1
+            return (0 <= pid < num_nodes) or pid == num_nodes or pid == -1
 
         selectable_children = [child for child in node.children if _is_selectable(child)]
         if not selectable_children:
@@ -162,9 +170,17 @@ class MCTSEngine:
         Returns:
             Selected child node
         """
+        def _num_nodes(state) -> int:
+            original = getattr(state, "_original_p_net", None)
+            if original is not None:
+                return int(getattr(original, "num_nodes", 0))
+            return int(state.p_net.num_nodes)
+
+        num_nodes = _num_nodes(node.state)
+
         def _is_selectable(child: Node) -> bool:
             pid = child.state.p_node_id
-            return (0 <= pid < node.state.p_net.num_nodes) or pid == node.state.p_net.num_nodes or pid == -1
+            return (0 <= pid < num_nodes) or pid == num_nodes or pid == -1
 
         selectable_children = [child for child in node.children if _is_selectable(child)]
         if not selectable_children:

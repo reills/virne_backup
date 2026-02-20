@@ -5,7 +5,6 @@
 #include <torch/torch.h>
 
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -41,12 +40,12 @@ public:
 
     TreeNode* best_child(float c_puct);
     TreeNode* child_for_action(int64_t action);
+    [[nodiscard]] bool has_children() const noexcept;
+    const std::unordered_map<int64_t, std::unique_ptr<TreeNode>>& children_ref() const noexcept { return children_; }
 
     std::shared_ptr<StateView> state() const { return state_; }
     std::optional<int64_t> action_from_parent() const { return action_from_parent_; }
     TreeNode* parent() const noexcept { return parent_; }
-
-    std::vector<std::pair<int64_t, TreeNode*>> children();
 
 private:
     TreeNode* parent_{nullptr};
@@ -60,7 +59,6 @@ private:
     bool terminal_{false};
 
     std::unordered_map<int64_t, std::unique_ptr<TreeNode>> children_;
-    mutable std::mutex mutex_;
 };
 
 }  // namespace azsfc

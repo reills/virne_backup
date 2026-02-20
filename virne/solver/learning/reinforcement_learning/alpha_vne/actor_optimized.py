@@ -110,6 +110,7 @@ class OptimizedAlphaZeroActor(Solver):
             'embedding_dim': getattr(config.nn, 'embedding_dim', 96),
             'n_heads': getattr(config.nn, 'n_heads', 6),
             'n_layers': getattr(config.nn, 'transformer_layers', 2),
+            'gnn_layers': getattr(config.nn, 'num_gnn_layers', 3),
             'dropout': getattr(config.nn, 'dropout_prob', 0.1),
             'allow_rejection': getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
         }
@@ -186,10 +187,16 @@ class OptimizedAlphaZeroActor(Solver):
                 if self.cpp_adapter is not None:
                     self.logger.info("🧠 Using experimental C++ MCTS backend.")
                 else:
-                    self.logger.info("C++ MCTS backend not available; continuing with Python implementation.")
+                    raise RuntimeError(
+                        "C++ MCTS backend requested but the alpha_zero_cpp_core extension is not available. "
+                        "Build it under virne/solver/learning/reinforcement_learning/mcts_solver/cpp_core "
+                        "or set training.use_cpp_mcts=false to use the Python implementation."
+                    )
             except Exception as exc:
-                self.logger.warning(f"Failed to initialize C++ MCTS backend: {exc}")
-                self.cpp_adapter = None
+                raise RuntimeError(
+                    "Failed to initialize C++ MCTS backend despite training.use_cpp_mcts=true. "
+                    "Ensure the alpha_zero_cpp_core extension is built and importable."
+                ) from exc
 
 
     # ------------------------------------------------------------------
@@ -209,14 +216,19 @@ class OptimizedAlphaZeroActor(Solver):
         self._p_data = load_pyg_data_from_network(p_net)
         self._v_data = load_pyg_data_from_network(v_net)
 
-        # Always compute real encoder outputs (not dummy tensors)
-        # Move to device only for local encoding, then back to CPU for IPC
-        v_data_gpu = self._v_data.to(self.device)
-        encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
-        self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
-
-        # Set episode data in observation builder
-        self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+        if self.use_neural_network or self.cpp_adapter is None:
+            # Compute encoder outputs once per episode (required for NN-guided policies)
+            v_data_gpu = self._v_data.to(self.device)
+            encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
+            self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
+            # Set episode data in observation builder
+            self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+        else:
+            # Plain MCTS mode does not require encoder features
+            self._encoder_outputs = None
+            self.obs_builder.clear_episode_data()
+        if self.cpp_adapter is not None:
+            self.cpp_adapter.begin_request(p_net, v_net)
 
         # Determine temperature based on mode
         if training is None:
@@ -265,7 +277,15 @@ class OptimizedAlphaZeroActor(Solver):
             except Exception:
                 pass
             # Select the best child based on visit counts with appropriate temperature
-            best_child = self._select_best_child(current_node, temperature=temperature)
+            try:
+                best_child = self._select_best_child(current_node, temperature=temperature)
+            except ValueError as exc:
+                solution["place_result"] = False
+                self.logger.warning(
+                    f"MCTS search produced zero-visit children for v_node={curr_v_id} "
+                    f"(step={current_node.state.v_node_id + 1}): {exc}"
+                )
+                break
             if best_child is None:
                 solution["place_result"] = False
                 self.logger.warning(
@@ -275,7 +295,7 @@ class OptimizedAlphaZeroActor(Solver):
                 break
 
             # Handle REJECT action (always at index p_net.num_nodes)
-            reject_idx = current_node.state.p_net.num_nodes
+            reject_idx = self._state_num_nodes(current_node.state)
             if allow_rejection and best_child.state.p_node_id == reject_idx:
                 solution["place_result"] = False
                 solution["rejected"] = True
@@ -293,7 +313,7 @@ class OptimizedAlphaZeroActor(Solver):
                 break
 
             # Store the action taken using stable ordering
-            placed_v = best_child.state.v_order[best_child.state.v_node_id]
+            placed_v = curr_v_id
             solution["node_slots"].update({placed_v: best_child.state.p_node_id})
             
             # Create timestep data using the current root (before moving to child)
@@ -339,7 +359,28 @@ class OptimizedAlphaZeroActor(Solver):
         self.mcts_engine.search(root_node, v_node_id)
 
     def _select_best_child(self, node: Node, temperature: float = 1.0) -> Node:
-        """Select best child based on visit counts (delegates to MCTSEngine)."""
+        """Select best child with guardrails for invalid zero-visit states."""
+        num_nodes = self._state_num_nodes(node.state)
+        selectable_children = [
+            child for child in node.children
+            if (0 <= child.state.p_node_id < num_nodes)
+            or child.state.p_node_id == num_nodes
+            or child.state.p_node_id == -1
+        ]
+        if not selectable_children:
+            return None
+
+        visit_counts = [child.visit_times for child in selectable_children]
+        if visit_counts and all(count == 0 for count in visit_counts):
+            msg = (
+                f"All children have zero visits at step={node.state.v_node_id + 1} "
+                f"(num_children={len(selectable_children)})"
+            )
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.error(msg)
+            raise ValueError(msg)
+
         return self.mcts_engine.select_best_child(node, temperature)
 
     def get_num_actions(self) -> int:
@@ -435,31 +476,58 @@ class OptimizedAlphaZeroActor(Solver):
 
     def _log_root_prior_stats(self, root: Node, state: State, v_node_id: int):
         """Log entropy of NN prior over feasible actions, H/H*, top-5, and Spearman corr with visits."""
+        # This is diagnostics only. It must not trigger expensive candidate-state materialization,
+        # especially on large p_nets (e.g. wx500), where `State.get_candidate_states()` can run
+        # incremental k-shortest feasibility checks for every candidate.
         try:
-            candidate_states = state.get_candidate_states()
-            feas_ids = [st.p_node_id for st in candidate_states if 0 <= st.p_node_id < state.p_net.num_nodes]
-            num_feasible = len(feas_ids)
-            priors = getattr(root, '_diag_root_priors', None)
-            if not priors or num_feasible == 0:
-                self.logger.debug(f"PriorStats VNF[{v_node_id}] feasible={num_feasible} H(prior)=nan H*={np.log(max(num_feasible,1)):.3f} ratio=nan top5=[] spearman=nan")
+            import logging
+            logger = getattr(self, "logger", None) or logging.getLogger(__name__)
+            if not getattr(logger, "isEnabledFor", lambda lvl: False)(logging.DEBUG):
                 return
-            q = np.array(priors, dtype=np.float64)
-            q = q[:len(candidate_states)]
-            # mask to feasible only (exclude reject and -1)
-            mask = np.array([0 <= st.p_node_id < state.p_net.num_nodes for st in candidate_states], dtype=bool)
-            q = q[mask]
+        except Exception:
+            # If we cannot reliably detect the log level, default to skipping diagnostics.
+            return
+
+        try:
+            # Cheap feasibility proxy: node-capacity-only candidates (no link checks).
+            feas_ids = self._candidate_actions(state, v_node_id)
+            num_feasible = len(feas_ids)
+
+            priors = getattr(root, "_diag_root_priors", None)
+            action_ids = getattr(root, "_diag_root_action_ids", None)
+            if not priors or not action_ids or num_feasible == 0:
+                logger.debug(
+                    f"PriorStats VNF[{v_node_id}] feasible={num_feasible} "
+                    f"H(prior)=nan H*={np.log(max(num_feasible,1)):.3f} ratio=nan top5=[] spearman=nan"
+                )
+                return
+
+            # Align priors with action ids and keep only physical-node actions.
+            q_full = np.array(priors, dtype=np.float64)
+            a_full = np.array(action_ids, dtype=np.int64)
+            mask_phys = (a_full >= 0) & (a_full < self._state_num_nodes(state))
+            q = q_full[mask_phys]
+            a = a_full[mask_phys]
+            if q.size == 0:
+                logger.debug(
+                    f"PriorStats VNF[{v_node_id}] feasible={num_feasible} "
+                    f"H(prior)=nan H*={np.log(max(num_feasible,1)):.3f} ratio=nan top5=[] spearman=nan"
+                )
+                return
             q = q / max(q.sum(), 1e-8)
             eps = 1e-8
             H = float(-(q * np.log(q + eps)).sum())
             H_star = float(np.log(max(num_feasible, 1)))
             ratio = H / H_star if H_star > 0 else float('nan')
             order = np.argsort(-q)[:5]
-            top5 = [(int(i), float(q[i])) for i in order]
-            # Spearman correlation between prior probs and child visit counts (after search)
+            top5 = [(int(a[i]), float(q[i])) for i in order]
+
+            # Spearman correlation between prior probs and child visit counts (after search).
+            # Only uses reconstructed children (usually visited actions), so treat as indicative.
             try:
-                visits = np.array([child.visit_times for child in root.children], dtype=np.float64)
-                visits = visits[:len(candidate_states)][mask]
-                if visits.sum() > 0 and len(visits) == len(q):
+                child_visits = {int(child.state.p_node_id): float(child.visit_times) for child in root.children}
+                visits = np.array([child_visits.get(int(act), 0.0) for act in a.tolist()], dtype=np.float64)
+                if visits.sum() > 0 and visits.size == q.size:
                     # rank transform
                     def rankdata(a):
                         # average ranks for ties
@@ -480,9 +548,15 @@ class OptimizedAlphaZeroActor(Solver):
                     spearman = float('nan')
             except Exception:
                 spearman = float('nan')
-            self.logger.debug(f"PriorStats VNF[{v_node_id}] feasible={num_feasible} H(prior)={H:.3f} H*={H_star:.3f} ratio={ratio:.3f} top5={top5} spearman={spearman:.3f}")
+            logger.debug(
+                f"PriorStats VNF[{v_node_id}] feasible={num_feasible} "
+                f"H(prior)={H:.3f} H*={H_star:.3f} ratio={ratio:.3f} top5={top5} spearman={spearman:.3f}"
+            )
         except Exception as e:
-            self.logger.debug(f"PriorStats logging skipped: {e}")
+            try:
+                logger.debug(f"PriorStats logging skipped: {e}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def _state_to_obs(self, state: State, v_node_id: int = None) -> dict:
@@ -491,7 +565,34 @@ class OptimizedAlphaZeroActor(Solver):
         Note: Returns observation with CPU tensors for pickle-safe IPC with batched GPU worker.
         The GPU worker will handle moving tensors to device internally.
         """
+        cpp_state = getattr(state, "_cpp_state", None)
+        if cpp_state is not None and self.cpp_adapter is not None:
+            try:
+                return self.cpp_adapter.build_obs_from_cpp_state(cpp_state)
+            except Exception:
+                pass
         return self.obs_builder.build(state, self.policy, v_node_id)
+
+    @staticmethod
+    def _state_num_nodes(state: State) -> int:
+        original = getattr(state, "_original_p_net", None)
+        if original is not None:
+            return int(getattr(original, "num_nodes", 0))
+        return int(state.p_net.num_nodes)
+
+    def _candidate_actions(self, state: State, v_node_id: int) -> List[int]:
+        cpp_state = getattr(state, "_cpp_state", None)
+        if cpp_state is not None:
+            try:
+                return [int(action) for action in cpp_state.get_candidate_nodes()]
+            except Exception:
+                pass
+        return self.controller.find_candidate_nodes(
+            v_net=state.v_net,
+            p_net=state.p_net,
+            v_node_id=v_node_id,
+            filter=state.selected_p_net_nodes,
+        )
 
     # ------------------------------------------------------------------
     # Utility methods (same as original)
@@ -572,16 +673,16 @@ class OptimizedAlphaZeroActor(Solver):
         if sum(policy) == 0.0:
             try:
                 priors = getattr(node, '_diag_root_priors', None)
-                if priors:
-                    # Map priors aligned to candidate order back into global action space length
-                    cand_states = state.get_candidate_states()
-                    cand_priors = priors[:len(cand_states)]
+                action_ids = getattr(node, '_diag_root_action_ids', None)
+                if priors and action_ids:
+                    # Map priors aligned to reconstructed action ids back into global action space.
+                    pairs = list(zip(action_ids, priors))
                     pi = [0.0] * num_actions
-                    s = sum(max(0.0, float(p)) for p in cand_priors)
+                    s = sum(max(0.0, float(p)) for _, p in pairs)
                     if s <= 1e-8:
                         raise ValueError('empty priors')
-                    for st, p in zip(cand_states, cand_priors):
-                        a = st.p_node_id
+                    for a, p in pairs:
+                        a = int(a)
                         if 0 <= a < num_actions:
                             pi[a] = float(p) / s
                     policy = pi
@@ -590,11 +691,10 @@ class OptimizedAlphaZeroActor(Solver):
             except Exception:
                 # Uniform over feasible
                 pi = [0.0] * num_actions
-                cand_nodes = self.controller.find_candidate_nodes(
-                    v_net=state.v_net, p_net=state.p_net, v_node_id=v_node_id, filter=state.selected_p_net_nodes)
+                cand_nodes = self._candidate_actions(state, v_node_id)
+                reject_idx = self._state_num_nodes(state)
                 if not cand_nodes:
                     # If REJECT action exists, put full prob on reject; else uniform over all actions
-                    reject_idx = state.p_net.num_nodes
                     if num_actions > reject_idx:
                         pi[reject_idx] = 1.0
                     else:
@@ -612,19 +712,15 @@ class OptimizedAlphaZeroActor(Solver):
         value_root = self._compute_value(node, v_node_id)
 
         # Action mask for loss masking (optional)
-        candidate_nodes = self.controller.find_candidate_nodes(
-            v_net=state.v_net,
-            p_net=state.p_net,
-            v_node_id=v_node_id,
-            filter=state.selected_p_net_nodes,
-        )
+        candidate_nodes = self._candidate_actions(state, v_node_id)
+        reject_idx = self._state_num_nodes(state)
         action_mask = [False] * num_actions
         for node_id in candidate_nodes:
             if 0 <= node_id < num_actions:
                 action_mask[node_id] = True
         # REJECT action at last index if present
-        if num_actions > state.p_net.num_nodes:
-            action_mask[state.p_net.num_nodes] = True
+        if num_actions > reject_idx:
+            action_mask[reject_idx] = True
 
         return {
             "observation": obs_cpu,        # Full observation dict (on CPU)
@@ -649,7 +745,7 @@ class OptimizedAlphaZeroActor(Solver):
             Policy vector of length num_actions with visit-count distribution
         """
         if num_actions is None:
-            num_actions = node.state.p_net.num_nodes
+            num_actions = self._state_num_nodes(node.state)
 
         policy = [0.0] * num_actions
 
@@ -671,6 +767,8 @@ class OptimizedAlphaZeroActor(Solver):
     def _compute_value(self, node: Node, v_node_id: int) -> float:
         """Compute value estimate from MCTS root node."""
         if node.visit_times == 0:
+            if not self.use_neural_network:
+                return 0.0
             obs = self._state_to_obs(node.state, v_node_id)
             _, value_float = self.policy_network.evaluate(obs, use_nn_value=True)
             return value_float
@@ -699,13 +797,17 @@ class OptimizedAlphaZeroActor(Solver):
         self._p_data = load_pyg_data_from_network(p_net)
         self._v_data = load_pyg_data_from_network(v_net)
 
-        # Always compute real encoder outputs (move to device only temporarily)
-        v_data_gpu = self._v_data.to(self.device)
-        encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
-        self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
-
-        # Set episode data in observation builder
-        self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+        if self.use_neural_network or self.cpp_adapter is None:
+            v_data_gpu = self._v_data.to(self.device)
+            encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
+            self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
+            # Set episode data in observation builder
+            self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+        else:
+            self._encoder_outputs = None
+            self.obs_builder.clear_episode_data()
+        if self.cpp_adapter is not None:
+            self.cpp_adapter.begin_request(p_net, v_net)
 
         # Determine temperature based on mode
         if training is None:
@@ -738,7 +840,15 @@ class OptimizedAlphaZeroActor(Solver):
             curr_v_id = current_node.state.v_order[next_pos]
             self.search(current_node, curr_v_id)
 
-            best_child = self._select_best_child(current_node, temperature=temperature)
+            try:
+                best_child = self._select_best_child(current_node, temperature=temperature)
+            except ValueError as exc:
+                self.logger.warning(
+                    f"Worker MCTS produced zero-visit children for v_node={curr_v_id} "
+                    f"(step={current_node.state.v_node_id + 1}): {exc}"
+                )
+                solution["place_result"] = False
+                return False
             if best_child is None:
                 self.logger.warning(
                     f"Worker MCTS failed to select child for v_node={curr_v_id} "
@@ -747,7 +857,7 @@ class OptimizedAlphaZeroActor(Solver):
                 return False
 
             # Handle REJECT
-            reject_idx = current_node.state.p_net.num_nodes
+            reject_idx = self._state_num_nodes(current_node.state)
             if allow_rejection and best_child.state.p_node_id == reject_idx:
                 self._episode_rejects += 1
                 self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
@@ -763,7 +873,7 @@ class OptimizedAlphaZeroActor(Solver):
                 return False
 
             p_node_id = best_child.state.p_node_id
-            placed_v = best_child.state.v_order[best_child.state.v_node_id]
+            placed_v = curr_v_id
             
             place_result, place_info = controller.node_mapper.place(
                 v_net, p_net, placed_v, p_node_id, solution=solution

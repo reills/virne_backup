@@ -29,6 +29,10 @@ experiment:
 
   if_test_pretrained_models: false
   trained_model_summary_info_path: ""
+  request_timeout_sec: 0.0
+  run_watchdog_timeout_sec: 0.0
+  record_arrival_solve_time: false
+  gpu_synchronize_timing: true
 
 # For Network System
 system:
@@ -75,3 +79,7 @@ logger:
   backends: ['console', 'file', 'tensorboard']
   log_show_interval: 20
   log_file_name: 'running.log'  # if file backend is used
+
+simulation:
+  p_net_dataset_dir: ''
+  v_nets_dataset_dir: ''

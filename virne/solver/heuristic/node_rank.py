@@ -31,8 +31,16 @@ class BaseNodeRankSolver(Solver):
         # node mapping
         self.matching_mathod = kwargs.get('matching_mathod', 'greedy')
         # link mapping
-        self.shortest_method = kwargs.get('shortest_method', 'k_shortest')
-        self.k_shortest = kwargs.get('k_shortest', 10)
+        self.shortest_method = kwargs.get(
+            'shortest_method',
+            getattr(config.solver, 'shortest_method', self.shortest_method),
+        )
+        self.k_shortest = int(
+            kwargs.get(
+                'k_shortest',
+                getattr(config.solver, 'k_shortest', self.k_shortest),
+            )
+        )
     
     def solve(self, instance: dict) -> Solution:
         v_net, p_net  = instance['v_net'], instance['p_net']

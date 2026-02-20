@@ -1,0 +1,4 @@
+interface:
+  display_name: "Alpha VNE C++ Build"
+  short_description: "Canonical alpha_vne C++ build workflow"
+  default_prompt: "Build or rebuild alpha_vne C++ extension using the canonical bash command, then verify import and report issues clearly."

@@ -19,3 +19,12 @@ Acting: The main process, through calls to the Orchestrator's solve() method, ac
 Learning: Concurrently, the background Learner process watches the replay_buffer/. It loads batches of completed games, trains the network, and periodically overwrites policy_latest.pt with the new, improved weights.
 Policy Update: The next time the Actor starts a game, it loads the newer policy from policy_latest.pt, thus completing the self-play improvement cycle.
 This decoupled design faithfully adapts AlphaZero-style self-play to the domain of network resource allocation, coupling an intelligent MCTS search with a powerful transformer-GNN policy network for continuous improvement.
+
+## Command Execution Rule (virne env)
+
+Always run Python tooling for this repository via the project conda environment using `conda run -n virne ...`.
+
+- Use `conda run -n virne python ...` for scripts and CLIs.
+- Use `conda run -n virne pytest ...` for tests.
+- Use `conda run -n virne pip ...` for package inspection/install within this repo workflow.
+- Do **not** rely on `conda activate virne` in non-interactive shells.

@@ -24,6 +24,10 @@ experiment:
   if_save_v_nets: false 
   if_load_p_net: false
   if_load_v_nets: false 
+  request_timeout_sec: 0.0
+  run_watchdog_timeout_sec: 0.0
+  record_arrival_solve_time: false
+  gpu_synchronize_timing: true
 
 # For Network System
 system:
@@ -71,3 +75,7 @@ logger:
   log_file_name: 'running.log'  # if file backend is used
 
 use_fixed_dataset: false
+
+simulation:
+  p_net_dataset_dir: ''
+  v_nets_dataset_dir: ''

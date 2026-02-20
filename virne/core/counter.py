@@ -184,6 +184,8 @@ class Counter(object):
         else:
             raise TypeError
         summary_info = {}
+        arrival_mask = records['event_type'] == 1
+        summary_info['num_arrival_requests'] = int(arrival_mask.sum())
         # key
         summary_info['acceptance_rate'] = records.iloc[-1]['success_count'] / records.iloc[-1]['v_net_count']
         summary_info['avg_r2c_ratio'] = records.loc[records['event_type']==1, 'v_net_r2c_ratio'].mean()
@@ -219,6 +221,18 @@ class Counter(object):
             summary_info['avg_reward'] = records.loc[records['event_type']==1, 'v_net_reward'].mean()
         else:
             summary_info['avg_reward'] = 0
+        if 'request_timeout' in records.columns:
+            timeout_flags = (
+                records.loc[arrival_mask, 'request_timeout']
+                .astype(str)
+                .str.lower()
+                .isin({'1', 'true', 't', 'yes', 'y', 'on'})
+            )
+            timeout_count = int(timeout_flags.sum())
+        else:
+            timeout_count = 0
+        summary_info['request_timeout_count'] = timeout_count
+        summary_info['timed_out_arrivals'] = timeout_count
         return summary_info
 
     @classmethod

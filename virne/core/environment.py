@@ -111,11 +111,14 @@ class BaseEnvironment:
         self.recorder.count_init_p_net_info(self.p_net)
         if self.recorder.if_temp_save_records:
             self.logger.info(f'Temp save record in {self.recorder.temp_save_path}\n')
-        self.v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(self.v_net_simulator.v_sim_setting, seed=seed)
+        # Only dynamically construct dataset path if not using fixed dataset
+        use_fixed_dataset = self.config.get('use_fixed_dataset', False)
+        if not use_fixed_dataset:
+            self.v_nets_dataset_dir = get_v_nets_dataset_dir_from_setting(self.v_net_simulator.v_sim_setting, seed=seed)
         if os.path.exists(self.v_nets_dataset_dir) and seed is not None and self.config.experiment.if_load_v_nets:
             self.v_net_simulator = self.v_net_simulator.load_dataset(self.v_nets_dataset_dir)
             self.logger.critical(f'Virtual networks: Load them from {self.v_nets_dataset_dir}')
-        else: 
+        else:
             self.v_net_simulator.renew(v_nets=True, events=True, seed=seed)
             # self.logger.critical(f'Virtual networks: Generate them with seed {seed}')
         self.cumulative_reward: float = 0
@@ -176,6 +179,8 @@ class BaseEnvironment:
         Returns:
             reason (str): the reason of failure.
         """
+        if bool(solution.get('request_timeout', False)):
+            return 'timeout'
         if solution['early_rejection']:
             return 'reject'
         if not solution['place_result']:
@@ -203,6 +208,11 @@ class BaseEnvironment:
             self.solution['place_result'] = False
         elif reason in ['route', 2]:
             self.solution['description'] = 'Route Failure'
+            self.solution['route_result'] = False
+        elif reason in ['timeout', 3]:
+            self.solution['description'] = 'Request Timeout'
+            self.solution['request_timeout'] = True
+            self.solution['place_result'] = False
             self.solution['route_result'] = False
         else:
             raise NotImplementedError(f"Unknown reason: {reason}")
@@ -309,7 +319,13 @@ class BaseEnvironment:
         if summary_file_name is None:
             summary_file_name = self.config.recorder.summary_file_name
         if record_file_name is None:
-            record_file_name = f'{self.solver_name}-{self.run_id}-{start_run_time}.csv'
+            record_file_name = f'{self.solver_name}-{self.run_id}-{start_run_time}'
+            worker_id = getattr(self.recorder, 'worker_id', None)
+            if worker_id is not None:
+                record_file_name += f'-worker{worker_id}'
+            if self.seed is not None:
+                record_file_name += f'-seed{self.seed}'
+            record_file_name += '.csv'
         summary_info = self.recorder.summary_records(self.recorder.memory)
         end_run_time = time.time()
         clock_running_time = end_run_time - self.start_run_time
@@ -322,7 +338,9 @@ class BaseEnvironment:
             'start_run_time': start_run_time, 
             'clock_running_time': clock_running_time
         }
-        for k, v in extra_summary_info.items():
+        merged_extra_summary_info = dict(self.extra_summary_info)
+        merged_extra_summary_info.update(extra_summary_info)
+        for k, v in merged_extra_summary_info.items():
             run_info_dict[k] = v
         info = {**summary_info, **run_info_dict}
 
@@ -342,7 +360,11 @@ class SolutionStepEnvironment(BaseEnvironment):
     def __init__(self, p_net, v_net_simulator, controller, recorder, counter, logger, config, **kwargs):
         super(SolutionStepEnvironment, self).__init__(p_net, v_net_simulator, controller, recorder, counter, logger, config, **kwargs)
 
-    def step(self, solution: Solution):
+    def step(
+        self,
+        solution: Solution,
+        record_extra: Optional[Dict[str, Any]] = None,
+    ):
         """
         Step the environment with the solution.
 
@@ -387,7 +409,7 @@ class SolutionStepEnvironment(BaseEnvironment):
         else:
             failure_reason = self.get_failure_reason(self.solution)
             self.rollback_for_failure(reason=failure_reason)
-        record = self.count_and_add_record()
+        record = self.count_and_add_record(extra_info=record_extra or {})
         done = self.transit_obs()
         return self.get_observation(), self.compute_reward(), done, self.get_info(record)
 

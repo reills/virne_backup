@@ -30,8 +30,16 @@ class BaseMetaHeuristicSolver(Solver):
         self.infeasible_fitness = INFEASIBLE_FITNESS
         self.fitness_recorder = FitnessRecorder()
         # basic methods
-        self.shortest_method = kwargs.get('shortest_method', 'k_shortest')
-        self.k_shortest = kwargs.get('k_shortest', 10)
+        self.shortest_method = kwargs.get(
+            'shortest_method',
+            getattr(config.solver, 'shortest_method', self.shortest_method),
+        )
+        self.k_shortest = int(
+            kwargs.get(
+                'k_shortest',
+                getattr(config.solver, 'k_shortest', self.k_shortest),
+            )
+        )
 
 
     def get_parallel_executor(self, num_individuals: int, m_type: str = 'thread'):

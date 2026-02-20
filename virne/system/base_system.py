@@ -8,6 +8,7 @@ from sympy import im
 import tqdm
 import pprint
 import random
+import time
 import numpy as np
 import copy
 from typing import Union, Dict, TYPE_CHECKING
@@ -48,6 +49,7 @@ class BaseSystem:
         self.counter = counter
         self.logger = logger
         self.config = config
+        self.pbar = None
 
     @classmethod
     def from_config(cls, config):
@@ -155,6 +157,117 @@ class BaseSystem:
                 'inservice': f'{info["inservice_count"]:05d}',
             })
 
+    def _request_timeout_sec(self) -> float:
+        raw = getattr(self.config.experiment, 'request_timeout_sec', 0.0)
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.0
+
+    def _run_watchdog_timeout_sec(self) -> float:
+        raw = getattr(self.config.experiment, 'run_watchdog_timeout_sec', 0.0)
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.0
+
+    def _record_arrival_solve_time(self) -> bool:
+        if bool(getattr(self.config.experiment, 'record_arrival_solve_time', False)):
+            return True
+        return self._request_timeout_sec() > 0.0
+
+    def _gpu_synchronize_timing(self) -> bool:
+        if not bool(getattr(self.config.experiment, 'gpu_synchronize_timing', True)):
+            return False
+        return bool(getattr(self.config.training, 'use_cuda', False))
+
+    def _sync_cuda_if_needed(self) -> None:
+        if not self._gpu_synchronize_timing():
+            return
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            return
+
+    def _solve_with_runtime_controls(self, instance):
+        record_runtime = self._record_arrival_solve_time()
+        if record_runtime:
+            self._sync_cuda_if_needed()
+            start_time = time.perf_counter()
+        else:
+            start_time = 0.0
+
+        solution = self.solver.solve(instance)
+
+        if record_runtime:
+            self._sync_cuda_if_needed()
+            solve_time_sec = max(0.0, time.perf_counter() - start_time)
+        else:
+            solve_time_sec = 0.0
+
+        request_timeout_sec = self._request_timeout_sec()
+        request_timed_out = request_timeout_sec > 0.0 and solve_time_sec > request_timeout_sec
+        if request_timed_out:
+            solution['result'] = False
+            solution['request_timeout'] = True
+            solution['description'] = 'Request Timeout'
+            solution['place_result'] = False
+            solution['route_result'] = False
+            solution['early_rejection'] = False
+        else:
+            solution['request_timeout'] = False
+        return solution, solve_time_sec, request_timed_out
+
+    def _initialize_runtime_summary(self) -> None:
+        self.env.extra_summary_info.update(
+            {
+                'run_timeout': False,
+                'run_watchdog_timeout_sec': self._run_watchdog_timeout_sec(),
+                'request_timeout_sec': self._request_timeout_sec(),
+                'num_arrival_requests': 0,
+                'request_timeout_count': 0,
+                'timed_out_arrivals': 0,
+                'request_timeout_rate': 0.0,
+            }
+        )
+
+    def _update_runtime_summary(
+        self,
+        arrivals_processed: int,
+        request_timeout_count: int,
+    ) -> None:
+        request_timeout_rate = (
+            float(request_timeout_count) / float(arrivals_processed)
+            if arrivals_processed > 0
+            else 0.0
+        )
+        self.env.extra_summary_info.update(
+            {
+                'num_arrival_requests': int(arrivals_processed),
+                'request_timeout_count': int(request_timeout_count),
+                'timed_out_arrivals': int(request_timeout_count),
+                'request_timeout_rate': request_timeout_rate,
+            }
+        )
+
+    def _watchdog_timed_out(self, run_start_time: float) -> bool:
+        watchdog_timeout_sec = self._run_watchdog_timeout_sec()
+        if watchdog_timeout_sec <= 0.0:
+            return False
+        return (time.perf_counter() - run_start_time) >= watchdog_timeout_sec
+
+    def _handle_watchdog_timeout(self, epoch_id: int) -> None:
+        timeout_sec = self._run_watchdog_timeout_sec()
+        self.env.extra_summary_info['run_timeout'] = True
+        self.logger.warning(
+            f'Run watchdog timeout at epoch {epoch_id}: '
+            f'{timeout_sec:.3f}s exceeded; terminating run early'
+        )
+        if len(self.recorder.memory) > 0:
+            self.env.summary_records(extra_summary_info={'run_timeout': True})
+
 
 class OnlineSystem(BaseSystem):
 
@@ -169,13 +282,31 @@ class OnlineSystem(BaseSystem):
             self.solver.epoch_id = epoch_id
 
             instance = self.env.reset(self.config.experiment.seed)
+            self._initialize_runtime_summary()
+            run_start_time = time.perf_counter()
+            arrivals_processed = 0
+            request_timeout_count = 0
 
             self.get_process_bar(epoch_id)
 
             while True:
-                solution = self.solver.solve(instance)
+                if self._watchdog_timed_out(run_start_time):
+                    self._handle_watchdog_timeout(epoch_id)
+                    break
 
-                next_instance, _, done, info = self.env.step(solution)
+                solution, solve_time_sec, request_timed_out = self._solve_with_runtime_controls(instance)
+                arrivals_processed += 1
+                request_timeout_count += int(request_timed_out)
+                self._update_runtime_summary(
+                    arrivals_processed=arrivals_processed,
+                    request_timeout_count=request_timeout_count,
+                )
+
+                record_extra = {'request_timeout': bool(request_timed_out)}
+                if self._record_arrival_solve_time():
+                    record_extra['request_solve_time'] = solve_time_sec
+
+                next_instance, _, done, info = self.env.step(solution, record_extra=record_extra)
 
                 self.update_process_bar(info)
 
@@ -204,10 +335,28 @@ class ChangeableSystem(BaseSystem):
             self.env.v_net_simulator = Generator.generate_changeable_v_nets_dataset_from_config(self.config, save=False)
             self.logger.info([v.num_nodes for v in self.env.v_net_simulator.v_nets])
             self.get_process_bar(epoch_id)
+            self._initialize_runtime_summary()
+            run_start_time = time.perf_counter()
+            arrivals_processed = 0
+            request_timeout_count = 0
             while True:
-                solution = self.solver.solve(instance)
+                if self._watchdog_timed_out(run_start_time):
+                    self._handle_watchdog_timeout(epoch_id)
+                    break
 
-                next_instance, _, done, info = self.env.step(solution)
+                solution, solve_time_sec, request_timed_out = self._solve_with_runtime_controls(instance)
+                arrivals_processed += 1
+                request_timeout_count += int(request_timed_out)
+                self._update_runtime_summary(
+                    arrivals_processed=arrivals_processed,
+                    request_timeout_count=request_timeout_count,
+                )
+
+                record_extra = {'request_timeout': bool(request_timed_out)}
+                if self._record_arrival_solve_time():
+                    record_extra['request_solve_time'] = solve_time_sec
+
+                next_instance, _, done, info = self.env.step(solution, record_extra=record_extra)
 
                 self.update_process_bar(info)
 
@@ -263,11 +412,29 @@ class OfflineSystem(BaseSystem):
             instance = self.env.reset(self.config.experiment.seed)
             self.p_net_init = copy.deepcopy(self.env.p_net)
             self.get_process_bar(epoch_id)
+            self._initialize_runtime_summary()
+            run_start_time = time.perf_counter()
+            arrivals_processed = 0
+            request_timeout_count = 0
 
             while True:
-                solution = self.solver.solve(instance)
+                if self._watchdog_timed_out(run_start_time):
+                    self._handle_watchdog_timeout(epoch_id)
+                    break
 
-                next_instance, _, done, info = self.env.step(solution)
+                solution, solve_time_sec, request_timed_out = self._solve_with_runtime_controls(instance)
+                arrivals_processed += 1
+                request_timeout_count += int(request_timed_out)
+                self._update_runtime_summary(
+                    arrivals_processed=arrivals_processed,
+                    request_timeout_count=request_timeout_count,
+                )
+
+                record_extra = {'request_timeout': bool(request_timed_out)}
+                if self._record_arrival_solve_time():
+                    record_extra['request_solve_time'] = solve_time_sec
+
+                next_instance, _, done, info = self.env.step(solution, record_extra=record_extra)
                 new_p_net = self.reset_p_net()
                 self.env.p_net = copy.deepcopy(new_p_net)
                 self.env.p_net_backup = copy.deepcopy(new_p_net)
@@ -353,4 +520,3 @@ class TimeWindowSystem(BaseSystem):
                     instance = next_instance
   
             if pbar is not None: pbar.close()
-

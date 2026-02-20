@@ -49,7 +49,7 @@ class MultiHeadGENLayer(nn.Module):
 class ActorCritic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, v_net_feature_dim,
                  embedding_dim=128, n_heads=8, n_layers=4, dropout=0.1,
-                 p_net_edge_dim=1, **kwargs):
+                 p_net_edge_dim=1, gnn_layers=3, **kwargs):
         super().__init__()
         
         common_kwargs = dict(
@@ -60,6 +60,7 @@ class ActorCritic(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             p_net_edge_dim=p_net_edge_dim,
+            gnn_layers=gnn_layers,
             **kwargs  # include allow_rejection, allow_revocable, etc.
         )
         
@@ -115,7 +116,7 @@ class Encoder(nn.Module):
 # --- Actor Module ---
 class Actor(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=4, dropout=0.1, **kwargs):
+                 n_heads=8, n_layers=4, dropout=0.1, gnn_layers=3, **kwargs):
         super().__init__()
         # Retrieve special action flags from kwargs
         # Extract p_net_edge_dim from kwargs to avoid duplicate parameter
@@ -129,6 +130,7 @@ class Actor(nn.Module):
             dropout=dropout,
             is_actor=True,
             p_net_edge_dim=p_net_edge_dim,
+            gnn_layers=gnn_layers,
             **kwargs
         )
 
@@ -138,7 +140,7 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=4, dropout=0.1, **kwargs):
+                 n_heads=8, n_layers=4, dropout=0.1, gnn_layers=3, **kwargs):
         super().__init__()
         self.p_net_feature_dim = p_net_feature_dim
         self.embedding_dim = embedding_dim
@@ -151,6 +153,7 @@ class Critic(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             is_actor=False,
+            gnn_layers=gnn_layers,
             **kwargs
         )
 
@@ -191,7 +194,7 @@ class AutoregressiveDecoder(nn.Module):
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
                  n_heads=8, n_layers=4, dropout=0.1, is_actor=True,
                  allow_revocable=False, allow_rejection=False, use_amp=False, max_seq_len=15,
-                 p_net_edge_dim=1):
+                 p_net_edge_dim=1, gnn_layers=3):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.use_amp = use_amp
@@ -215,7 +218,7 @@ class AutoregressiveDecoder(nn.Module):
                 out_dim=embedding_dim,
                 edge_dim=p_net_edge_dim if i == 0 else embedding_dim
             )
-            for i in range(3)
+            for i in range(gnn_layers)
         ])
         self.gat_projection = nn.Identity()
 

@@ -4,6 +4,9 @@ from __future__ import annotations
 import json
 import os
 import random
+import tempfile
+import time
+import uuid
 from typing import List
 
 import numpy as np
@@ -93,9 +96,48 @@ class TrajectoryWriter:
             }
         }
 
-        path = os.path.join(self.replay_dir, f"{random.random():.6f}.json")
-        with open(path, "w") as f:
-            json.dump(data, f, cls=NumpyEncoder)
+        # Use a truly unique filename across processes to avoid collisions.
+        # Write to a unique temp file, then atomically replace to final path.
+        os.makedirs(self.replay_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=self.replay_dir, prefix="episode_", suffix=".json.tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, cls=NumpyEncoder)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+
+        # Generate a unique final name to prevent any collision with existing files.
+        # Retry a few times if a rare collision occurs.
+        replaced = False
+        for _ in range(5):
+            final_name = f"episode_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+            final_path = os.path.join(self.replay_dir, final_name)
+            try:
+                os.replace(tmp_path, final_path)
+                replaced = True
+                break
+            except FileNotFoundError:
+                # Temp file missing or path issue; fall back to rewriting next call.
+                break
+            except FileExistsError:
+                # Extremely unlikely; retry with a new name.
+                continue
+        if not replaced and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
         self.cleanup()
 

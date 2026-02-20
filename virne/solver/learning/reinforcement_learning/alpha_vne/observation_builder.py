@@ -24,6 +24,12 @@ class ObservationBuilder:
         self._p_data = None
         self._v_data = None
         self._encoder_outputs = None
+        self._obs_p_data = None
+        self._cached_node_allocations = {}
+        self._cached_link_allocations = {}
+        self._edge_positions_by_id = None
+        self._edge_lookup_ref = None
+        self._resource_signature = None
 
     def set_episode_data(self, p_data, v_data, encoder_outputs):
         """Set cached data for the current episode.
@@ -36,6 +42,14 @@ class ObservationBuilder:
         self._p_data = p_data
         self._v_data = v_data
         self._encoder_outputs = encoder_outputs
+        self._reset_cpp_observation_cache()
+
+    def clear_episode_data(self):
+        """Clear cached episode data (used when NN guidance is disabled)."""
+        self._p_data = None
+        self._v_data = None
+        self._encoder_outputs = None
+        self._reset_cpp_observation_cache()
 
     def build(self, state, policy, v_node_id: int = None) -> dict:
         """Build observation dict from state.
@@ -50,6 +64,9 @@ class ObservationBuilder:
         """
         if v_node_id is None:
             v_node_id = state.v_node_id + 1
+
+        if self._p_data is None or self._v_data is None or self._encoder_outputs is None:
+            raise RuntimeError("Episode data not prepared; call set_episode_data() before build().")
 
         # Use real encoder outputs (computed once per episode, kept on CPU for IPC)
         return state_to_obs(
@@ -80,36 +97,29 @@ class ObservationBuilder:
         if self._p_data is None or self._v_data is None or self._encoder_outputs is None:
             raise RuntimeError("Episode data not set; call set_episode_data() first.")
 
-        # Clone static tensors to avoid mutating cached copies
-        p_data = self._p_data.clone() if hasattr(self._p_data, "clone") else self._p_data
+        p_data = self._get_or_create_episode_observation_data(
+            edge_lookup=edge_lookup,
+            node_resource_names=node_resource_names,
+            link_resource_names=link_resource_names,
+        )
         v_data = self._v_data
         encoder_outputs = self._encoder_outputs
 
-        # Update residual node resources
-        if getattr(p_data, "x", None) is not None:
-            for node_idx in range(p_data.x.size(0)):
-                for feat_idx, attr_name in enumerate(node_resource_names):
-                    if feat_idx >= p_data.x.size(1):
-                        break
-                    available = cpp_state.get_available_node_resource(int(node_idx), attr_name)
-                    p_data.x[node_idx, feat_idx] = float(available)
+        node_allocations = self._get_sparse_allocations(cpp_state, "get_allocated_node_resources")
+        if node_allocations is not None:
+            self._apply_sparse_node_allocation_updates(node_allocations, node_resource_names)
+        else:
+            self._refresh_all_node_resources(cpp_state, node_resource_names)
+            self._cached_node_allocations = {}
 
-        # Update residual link resources
-        if getattr(p_data, "edge_attr", None) is not None and p_data.edge_attr.numel() > 0:
-            edge_index = p_data.edge_index
-            for edge_pos in range(edge_index.size(1)):
-                u = int(edge_index[0, edge_pos].item())
-                v = int(edge_index[1, edge_pos].item())
-                edge_id = self._get_cpp_edge_id(u, v, edge_lookup)
-                if edge_id < 0:
-                    continue
-                for feat_idx, attr_name in enumerate(link_resource_names):
-                    if feat_idx >= p_data.edge_attr.size(1):
-                        break
-                    available = cpp_state.get_available_link_resource(edge_id, attr_name)
-                    p_data.edge_attr[edge_pos, feat_idx] = float(available)
+        link_allocations = self._get_sparse_allocations(cpp_state, "get_allocated_link_resources")
+        if link_allocations is not None:
+            self._apply_sparse_link_allocation_updates(link_allocations, link_resource_names)
+        else:
+            self._refresh_all_link_resources(cpp_state, link_resource_names, edge_lookup)
+            self._cached_link_allocations = {}
 
-        selected_nodes = list(cpp_state.selected_physical_nodes())
+        selected_nodes = list(cpp_state.selected_physical_nodes)
         history_len = len(selected_nodes) + 1
         num_features = p_data.x.size(1) if getattr(p_data, "x", None) is not None else 0
         hist_dtype = p_data.x.dtype if num_features > 0 else torch.float32
@@ -126,7 +136,7 @@ class ObservationBuilder:
                 history_features[0, idx + 1] = p_data.x[node]
 
         curr_step_idx = len(selected_nodes)
-        total_virtual = len(cpp_state.virtual_order())
+        total_virtual = len(cpp_state.virtual_order)
         vnfs_remaining = max(total_virtual - (curr_step_idx + 1), 0)
 
         # Determine action mask size
@@ -147,6 +157,193 @@ class ObservationBuilder:
             "v_net_x": v_data.x.unsqueeze(0),
         }
         return obs
+
+    def _reset_cpp_observation_cache(self) -> None:
+        """Reset episode-local mutable observation caches."""
+        self._obs_p_data = None
+        self._cached_node_allocations = {}
+        self._cached_link_allocations = {}
+        self._edge_positions_by_id = None
+        self._edge_lookup_ref = None
+        self._resource_signature = None
+
+    def _clone_p_data(self) -> Data:
+        """Clone the static physical graph data for mutable per-step updates."""
+        if hasattr(self._p_data, "clone"):
+            return self._p_data.clone()
+        return Data(
+            x=self._p_data.x.clone() if getattr(self._p_data, "x", None) is not None else None,
+            edge_index=self._p_data.edge_index.clone() if getattr(self._p_data, "edge_index", None) is not None else None,
+            edge_attr=self._p_data.edge_attr.clone() if getattr(self._p_data, "edge_attr", None) is not None else None,
+            num_nodes=getattr(self._p_data, "num_nodes", None),
+        )
+
+    def _get_or_create_episode_observation_data(
+        self,
+        edge_lookup: dict,
+        node_resource_names: list,
+        link_resource_names: list,
+    ) -> Data:
+        """Get mutable observation graph, rebuilding caches only when episode settings change."""
+        signature = (tuple(node_resource_names), tuple(link_resource_names))
+        if self._obs_p_data is None or self._resource_signature != signature:
+            self._obs_p_data = self._clone_p_data()
+            self._cached_node_allocations = {}
+            self._cached_link_allocations = {}
+            self._resource_signature = signature
+            self._edge_positions_by_id = None
+            self._edge_lookup_ref = None
+
+        if self._edge_positions_by_id is None or self._edge_lookup_ref is not edge_lookup:
+            self._edge_positions_by_id = self._build_edge_positions_by_id(self._obs_p_data, edge_lookup)
+            self._edge_lookup_ref = edge_lookup
+            self._cached_link_allocations = {}
+
+        return self._obs_p_data
+
+    def _build_edge_positions_by_id(self, p_data: Data, edge_lookup: dict) -> dict:
+        """Build mapping from C++ edge IDs to one or more edge_attr rows in PyG Data."""
+        edge_positions_by_id = {}
+        edge_index = getattr(p_data, "edge_index", None)
+        if edge_index is None:
+            return edge_positions_by_id
+
+        for edge_pos in range(edge_index.size(1)):
+            u = int(edge_index[0, edge_pos].item())
+            v = int(edge_index[1, edge_pos].item())
+            edge_id = self._get_cpp_edge_id(u, v, edge_lookup)
+            if edge_id < 0:
+                continue
+            edge_positions_by_id.setdefault(edge_id, []).append(edge_pos)
+        return edge_positions_by_id
+
+    @staticmethod
+    def _normalize_sparse_allocations(allocations) -> dict:
+        """Normalize pybind sparse-allocation dicts into plain Python dict[int][str] -> float."""
+        normalized = {}
+        if not isinstance(allocations, dict):
+            return normalized
+        for item_id, attrs in allocations.items():
+            if not isinstance(attrs, dict):
+                continue
+            attr_values = {}
+            for attr_name, value in attrs.items():
+                float_value = float(value)
+                if abs(float_value) <= 1e-12:
+                    continue
+                attr_values[str(attr_name)] = float_value
+            if attr_values:
+                normalized[int(item_id)] = attr_values
+        return normalized
+
+    def _get_sparse_allocations(self, cpp_state, method_name: str):
+        """Read sparse allocations if supported by the C++ binding, otherwise return None."""
+        getter = getattr(cpp_state, method_name, None)
+        if getter is None:
+            return None
+        try:
+            allocations = getter()
+        except Exception:
+            return None
+        return self._normalize_sparse_allocations(allocations)
+
+    def _apply_sparse_node_allocation_updates(self, curr_allocations: dict, node_resource_names: list) -> None:
+        """Update only node features whose allocated resources changed between states."""
+        p_data = self._obs_p_data
+        if getattr(p_data, "x", None) is None:
+            self._cached_node_allocations = {}
+            return
+
+        node_feat_count = min(len(node_resource_names), p_data.x.size(1))
+        if node_feat_count <= 0:
+            self._cached_node_allocations = {}
+            return
+
+        resource_to_feat = {
+            attr_name: feat_idx
+            for feat_idx, attr_name in enumerate(node_resource_names[:node_feat_count])
+        }
+        changed_node_ids = set(self._cached_node_allocations.keys()) | set(curr_allocations.keys())
+        for node_id in changed_node_ids:
+            if node_id < 0 or node_id >= p_data.x.size(0):
+                continue
+            prev_attrs = self._cached_node_allocations.get(node_id, {})
+            curr_attrs = curr_allocations.get(node_id, {})
+            for attr_name, feat_idx in resource_to_feat.items():
+                prev_alloc = float(prev_attrs.get(attr_name, 0.0))
+                curr_alloc = float(curr_attrs.get(attr_name, 0.0))
+                if abs(prev_alloc - curr_alloc) <= 1e-12:
+                    continue
+                p_data.x[node_id, feat_idx] = self._p_data.x[node_id, feat_idx] - curr_alloc
+
+        self._cached_node_allocations = {
+            node_id: dict(attrs) for node_id, attrs in curr_allocations.items()
+        }
+
+    def _apply_sparse_link_allocation_updates(self, curr_allocations: dict, link_resource_names: list) -> None:
+        """Update only edge features whose allocated resources changed between states."""
+        p_data = self._obs_p_data
+        if getattr(p_data, "edge_attr", None) is None or p_data.edge_attr.numel() == 0:
+            self._cached_link_allocations = {}
+            return
+
+        edge_feat_count = min(len(link_resource_names), p_data.edge_attr.size(1))
+        if edge_feat_count <= 0:
+            self._cached_link_allocations = {}
+            return
+
+        resource_to_feat = {
+            attr_name: feat_idx
+            for feat_idx, attr_name in enumerate(link_resource_names[:edge_feat_count])
+        }
+        changed_edge_ids = set(self._cached_link_allocations.keys()) | set(curr_allocations.keys())
+        for edge_id in changed_edge_ids:
+            edge_positions = self._edge_positions_by_id.get(edge_id, [])
+            if not edge_positions:
+                continue
+            prev_attrs = self._cached_link_allocations.get(edge_id, {})
+            curr_attrs = curr_allocations.get(edge_id, {})
+            for attr_name, feat_idx in resource_to_feat.items():
+                prev_alloc = float(prev_attrs.get(attr_name, 0.0))
+                curr_alloc = float(curr_attrs.get(attr_name, 0.0))
+                if abs(prev_alloc - curr_alloc) <= 1e-12:
+                    continue
+                for edge_pos in edge_positions:
+                    p_data.edge_attr[edge_pos, feat_idx] = self._p_data.edge_attr[edge_pos, feat_idx] - curr_alloc
+
+        self._cached_link_allocations = {
+            edge_id: dict(attrs) for edge_id, attrs in curr_allocations.items()
+        }
+
+    def _refresh_all_node_resources(self, cpp_state, node_resource_names: list) -> None:
+        """Fallback: refresh all node resources when sparse C++ allocation APIs are unavailable."""
+        p_data = self._obs_p_data
+        if getattr(p_data, "x", None) is None:
+            return
+        for node_idx in range(p_data.x.size(0)):
+            for feat_idx, attr_name in enumerate(node_resource_names):
+                if feat_idx >= p_data.x.size(1):
+                    break
+                available = cpp_state.get_available_node_resource(int(node_idx), attr_name)
+                p_data.x[node_idx, feat_idx] = float(available)
+
+    def _refresh_all_link_resources(self, cpp_state, link_resource_names: list, edge_lookup: dict) -> None:
+        """Fallback: refresh all edge resources when sparse C++ allocation APIs are unavailable."""
+        p_data = self._obs_p_data
+        if getattr(p_data, "edge_attr", None) is None or p_data.edge_attr.numel() == 0:
+            return
+        edge_index = p_data.edge_index
+        for edge_pos in range(edge_index.size(1)):
+            u = int(edge_index[0, edge_pos].item())
+            v = int(edge_index[1, edge_pos].item())
+            edge_id = self._get_cpp_edge_id(u, v, edge_lookup)
+            if edge_id < 0:
+                continue
+            for feat_idx, attr_name in enumerate(link_resource_names):
+                if feat_idx >= p_data.edge_attr.size(1):
+                    break
+                available = cpp_state.get_available_link_resource(edge_id, attr_name)
+                p_data.edge_attr[edge_pos, feat_idx] = float(available)
 
     def obs_to_cpu(self, obs: dict) -> dict:
         """Convert observation tensors to CPU for serialization.

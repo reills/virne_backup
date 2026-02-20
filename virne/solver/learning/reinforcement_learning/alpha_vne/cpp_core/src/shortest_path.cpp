@@ -3,6 +3,7 @@
 #include "vnr_state.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <queue>
 #include <unordered_map>
@@ -23,6 +24,18 @@ inline bool has_capacity(const VNRState& state,
         }
     }
     return true;
+}
+
+inline bool bit_is_set(const std::vector<std::uint64_t>& bits, int node) {
+    const std::size_t word = static_cast<std::size_t>(node) >> 6U;
+    const std::size_t bit = static_cast<std::size_t>(node) & 63U;
+    return (bits[word] & (std::uint64_t{1} << bit)) != 0U;
+}
+
+inline void set_bit(std::vector<std::uint64_t>& bits, int node) {
+    const std::size_t word = static_cast<std::size_t>(node) >> 6U;
+    const std::size_t bit = static_cast<std::size_t>(node) & 63U;
+    bits[word] |= (std::uint64_t{1} << bit);
 }
 }  // namespace
 
@@ -71,68 +84,94 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
 
     auto bfs_single_path = [&](bool enforce_capacity) -> std::vector<Path> {
         std::vector<Path> bfs_results;
-        std::queue<std::vector<int>> frontier;
-        frontier.push({source});
+        std::queue<int> frontier;
+        std::vector<int> parent(static_cast<std::size_t>(net.num_nodes), -1);
+        std::vector<char> visited(static_cast<std::size_t>(net.num_nodes), 0);
 
-        std::unordered_map<int, int> best_depth;
-        best_depth[source] = 0;
+        frontier.push(source);
+        visited[static_cast<std::size_t>(source)] = 1;
 
         while (!frontier.empty()) {
-            auto path = std::move(frontier.front());
+            int current = frontier.front();
             frontier.pop();
-
-            int current = path.back();
             if (current == target) {
-                Path out;
-                out.nodes = path;
-                out.cost = static_cast<double>(path.size() - 1);
-                bfs_results.push_back(std::move(out));
                 break;
             }
 
-            int next_depth = static_cast<int>(path.size());
             const auto& neighbors = net.adjacency[current];
             for (const auto& [neighbor, edge_id] : neighbors) {
-                if (std::find(path.begin(), path.end(), neighbor) != path.end()) {
+                if (visited[static_cast<std::size_t>(neighbor)]) {
                     continue;
                 }
                 if (enforce_capacity && !has_capacity(state, edge_id, link_demands)) {
                     continue;
                 }
-                auto extended = path;
-                extended.push_back(neighbor);
-                auto it = best_depth.find(neighbor);
-                if (it == best_depth.end() || next_depth <= it->second) {
-                    best_depth[neighbor] = next_depth;
-                    frontier.push(std::move(extended));
-                }
+
+                visited[static_cast<std::size_t>(neighbor)] = 1;
+                parent[static_cast<std::size_t>(neighbor)] = current;
+                frontier.push(neighbor);
             }
         }
+
+        if (!visited[static_cast<std::size_t>(target)]) {
+            return bfs_results;
+        }
+
+        std::vector<int> nodes;
+        for (int cursor = target; cursor != -1; cursor = parent[static_cast<std::size_t>(cursor)]) {
+            nodes.push_back(cursor);
+        }
+        std::reverse(nodes.begin(), nodes.end());
+
+        Path out;
+        out.cost = static_cast<double>(nodes.size() - 1);
+        out.nodes = std::move(nodes);
+        bfs_results.push_back(std::move(out));
         return bfs_results;
     };
 
-    if (normalised_method == "bfs_shortest") {
-        return bfs_single_path(/*enforce_capacity=*/true);
-    }
-    if (normalised_method == "available_shortest") {
+    if (normalised_method == "bfs_shortest" ||
+        normalised_method == "first_shortest" ||
+        normalised_method == "available_shortest") {
         return bfs_single_path(/*enforce_capacity=*/true);
     }
 
     struct Candidate {
-        std::vector<int> nodes;
+        int node{-1};
+        int parent_index{-1};
+        int depth{0};
         double cost{0.0};
+        std::vector<std::uint64_t> visited_bits;
     };
-    struct CandidateCompare {
-        bool operator()(const Candidate& a, const Candidate& b) const noexcept {
+    struct FrontierEntry {
+        double cost{0.0};
+        int depth{0};
+        int candidate_index{-1};
+    };
+    struct FrontierCompare {
+        bool operator()(const FrontierEntry& a, const FrontierEntry& b) const noexcept {
             if (a.cost == b.cost) {
-                return a.nodes.size() > b.nodes.size();
+                return a.depth > b.depth;
             }
             return a.cost > b.cost;
         }
     };
 
-    std::priority_queue<Candidate, std::vector<Candidate>, CandidateCompare> frontier;
-    frontier.push({{source}, 0.0});
+    const int visited_words = std::max(1, (net.num_nodes + 63) / 64);
+    std::vector<Candidate> arena;
+    arena.reserve(64);
+
+    Candidate root;
+    root.node = source;
+    root.parent_index = -1;
+    root.depth = 1;
+    root.cost = 0.0;
+    root.visited_bits.assign(static_cast<std::size_t>(visited_words), 0U);
+    set_bit(root.visited_bits, source);
+    arena.push_back(std::move(root));
+
+    std::priority_queue<FrontierEntry, std::vector<FrontierEntry>, FrontierCompare> frontier;
+    frontier.push({0.0, 1, 0});
 
     std::unordered_map<int, double> best_cost_to_node;
     best_cost_to_node[source] = 0.0;
@@ -140,22 +179,34 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
     double best_goal_cost = std::numeric_limits<double>::infinity();
 
     while (!frontier.empty()) {
-        Candidate current = std::move(frontier.top());
+        FrontierEntry current_entry = frontier.top();
         frontier.pop();
 
-        int current_node = current.nodes.back();
-        if (collect_all_shortest && current.cost > best_goal_cost + 1e-6) {
+        const int current_index = current_entry.candidate_index;
+        const int current_node = arena[current_index].node;
+        const int current_depth = arena[current_index].depth;
+        const double current_cost = arena[current_index].cost;
+
+        if (collect_all_shortest && current_cost > best_goal_cost + 1e-6) {
             break;
         }
 
         if (current_node == target) {
-            if (static_cast<int>(current.nodes.size()) > max_length) {
+            if (current_depth > max_length) {
                 continue;
             }
             if (best_goal_cost == std::numeric_limits<double>::infinity()) {
-                best_goal_cost = current.cost;
+                best_goal_cost = current_cost;
             }
-            results.push_back({current.nodes, current.cost});
+
+            std::vector<int> nodes;
+            nodes.reserve(static_cast<std::size_t>(current_depth));
+            for (int cursor = current_index; cursor != -1; cursor = arena[cursor].parent_index) {
+                nodes.push_back(arena[cursor].node);
+            }
+            std::reverse(nodes.begin(), nodes.end());
+
+            results.push_back({std::move(nodes), current_cost});
             if (!collect_all_shortest && static_cast<int>(results.size()) >= max_results) {
                 break;
             }
@@ -165,30 +216,37 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
             continue;
         }
 
-        if (static_cast<int>(current.nodes.size()) >= max_length) {
+        if (current_depth >= max_length) {
             continue;
         }
-        if (static_cast<int>(current.nodes.size()) > net.num_nodes + 1) {
+        if (current_depth > net.num_nodes + 1) {
             continue;
         }
 
         const auto& neighbors = net.adjacency[current_node];
         for (const auto& [neighbor, edge_id] : neighbors) {
-            if (std::find(current.nodes.begin(), current.nodes.end(), neighbor) != current.nodes.end()) {
+            const auto& current_visited = arena[current_index].visited_bits;
+            if (bit_is_set(current_visited, neighbor)) {
                 continue;
             }
             if (!has_capacity(state, edge_id, link_demands)) {
                 continue;
             }
+
             Candidate expanded;
-            expanded.nodes = current.nodes;
-            expanded.nodes.push_back(neighbor);
-            expanded.cost = current.cost + 1.0;
+            expanded.node = neighbor;
+            expanded.parent_index = current_index;
+            expanded.depth = current_depth + 1;
+            expanded.cost = current_cost + 1.0;
+            expanded.visited_bits = current_visited;
+            set_bit(expanded.visited_bits, neighbor);
 
             auto it = best_cost_to_node.find(neighbor);
             if (it == best_cost_to_node.end() || expanded.cost <= it->second + 1e-6) {
                 best_cost_to_node[neighbor] = expanded.cost;
-                frontier.push(std::move(expanded));
+                int expanded_index = static_cast<int>(arena.size());
+                arena.push_back(std::move(expanded));
+                frontier.push({arena[expanded_index].cost, arena[expanded_index].depth, expanded_index});
             }
         }
     }

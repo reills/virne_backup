@@ -1,0 +1,185 @@
+# @package _global_
+
+# Root-level simulation keys are intentionally declared here so strict Hydra
+# overrides can target simulation.* without using '+' on critical keys.
+simulation:
+  p_net_dataset_dir: ''
+  v_nets_dataset_dir: ''
+
+journal_suite:
+  name: journal_suite
+  default_profile: smoke
+
+  paths:
+    suite_root: results/journal_suite
+    save_root_dir: results/journal_suite/results
+    dataset_root: datasets/generated/journal
+    manifest_path: results/journal_suite/preflight_manifest.json
+  
+  evaluation:
+    request_timeout_sec: 0.0
+    run_watchdog_timeout_sec: 0.0
+    record_arrival_solve_time: true
+    gpu_synchronize_timing: true
+
+  safety:
+    strict_hydra_key_validation: true
+    prohibit_plus_on_critical: true
+    critical_override_roots:
+      - use_fixed_dataset
+      - simulation
+      - experiment
+      - system
+      - solver
+      - training
+      - hydra.run
+    required_fixed_dataset_keys:
+      - use_fixed_dataset
+      - experiment.if_load_p_net
+      - experiment.if_load_v_nets
+      - simulation.p_net_dataset_dir
+      - simulation.v_nets_dataset_dir
+    run_id_tokens:
+      train: __train__
+      eval: __eval__
+      offline: __offline__
+
+  paired_matching_policy:
+    enabled: true
+    method_keys: [alpha_zero_sfc, mcts, grc_rank, pso_meta]
+    match_fields: [topology, scenario, seed, k_value]
+
+  offline_slice:
+    enabled: true
+    method_keys: [alpha_zero_sfc, mcts, grc_rank]
+    topologies: [wx100]
+    scenarios: [nominal]
+    seeds: [0]
+    k_eval_values: [1, 3]
+    conversion:
+      enabled: true
+      dataset_suffix: offline
+
+  k_semantics_parity:
+    enabled: true
+    method_keys: [alpha_zero_sfc, mcts, grc_rank]
+    fail_k_value: 1
+    success_k_value: 2
+
+  topologies:
+    wx100:
+      file_path: datasets/topology/Waxman100.gml
+    geant:
+      file_path: datasets/topology/Geant.gml
+    brain:
+      file_path: datasets/topology/Brain.gml
+    wx500:
+      file_path: datasets/topology/Waxman500.gml
+      overrides:
+        train:
+          - training.min_buffer_size=16
+
+  scenarios:
+    nominal:
+      train_split: train
+      eval_split: test
+    generalization:
+      train_split: train
+      eval_split: test
+      v_sim_setting_overrides:
+        arrival_rate:
+          lam: 0.06
+        v_net_size:
+          low: 3
+          high: 12
+
+  methods:
+    alpha_zero_sfc:
+      solver_name: alpha_zero_sfc
+      trainable: true
+      train_k_values: [10]
+    mcts:
+      solver_name: mcts
+      trainable: false
+    grc_rank:
+      solver_name: grc_rank
+      trainable: false
+    pso_meta:
+      solver_name: pso_meta
+      trainable: false
+    ppo_mlp_plus:
+      solver_name: ppo_mlp+
+      trainable: true
+      train_k_values: [10]
+    ppo_dual_gcn_plus:
+      solver_name: ppo_dual_gcn+
+      trainable: true
+      train_k_values: [10]
+
+  profiles:
+    tiny:
+      seeds: [0]
+      topologies: [wx100]
+      scenarios: [nominal]
+      methods: [alpha_zero_sfc, mcts, grc_rank]
+      k_eval_values: [1, 3]
+      generalization_cells: []
+      overrides:
+        common:
+          - training.num_workers=1
+          - training.distributed_training=false
+          - training.computation_budget=2
+        train:
+          - training.num_train_epochs=1
+          - training.max_training_steps=80
+          - training.min_buffer_size=8
+          - training.num_train_steps_per_epoch=10
+          - training.max_empty_batches=10
+        eval:
+          - training.computation_budget=2
+    smoke:
+      seeds: [0]
+      topologies: [wx100]
+      scenarios: [nominal]
+      methods: [alpha_zero_sfc, mcts, grc_rank]
+      k_eval_values: [1, 3, 5]
+      generalization_cells: []
+    core:
+      seeds: [0, 1, 2]
+      topologies: [wx100, geant, brain]
+      scenarios: [nominal]
+      methods: [alpha_zero_sfc, mcts, grc_rank, pso_meta, ppo_mlp_plus, ppo_dual_gcn_plus]
+      k_eval_values: [1, 3, 5, 10, 15]
+      generalization_cells: []
+    full:
+      seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      topologies: [wx100, geant, brain, wx500]
+      scenarios: [nominal]
+      methods: [alpha_zero_sfc, mcts, grc_rank, pso_meta, ppo_mlp_plus, ppo_dual_gcn_plus]
+      k_eval_values: [1, 3, 5, 10, 15]
+      generalization_cells:
+        - train_scenario: nominal
+          eval_scenario: generalization
+          topology: wx500
+          seed: 0
+
+  overrides:
+    common:
+      - solver.shortest_method=k_shortest
+      - training.if_use_random_training_seed=false
+      - training.num_workers=4
+    fixed_dataset:
+      - use_fixed_dataset=true
+      - experiment.if_load_p_net=true
+      - experiment.if_load_v_nets=true
+    train:
+      - training.inference_only=false
+    eval:
+      - training.inference_only=true
+      - training.num_train_epochs=0
+      - training.enable_async_learner=false
+
+  thread_env:
+    OMP_NUM_THREADS: '1'
+    MKL_NUM_THREADS: '1'
+    OPENBLAS_NUM_THREADS: '1'

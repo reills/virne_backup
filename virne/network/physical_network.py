@@ -98,14 +98,17 @@ class PhysicalNetwork(BaseNetwork):
 
         if file_path and os.path.exists(file_path):
             try:
+                config_node_attrs_setting = copy.deepcopy(config.get('node_attrs_setting', []))
+                config_link_attrs_setting = copy.deepcopy(config.get('link_attrs_setting', []))
                 G = nx.read_gml(file_path, label='id')
                 net_instance.__dict__['graph'].update(G.__dict__.get('graph', {}))
                 net_instance.__dict__['_node'] = G.__dict__.get('_node', {})
                 net_instance.__dict__['_adj'] = G.__dict__.get('_adj', {})
-                if 'node_attrs_setting' in net_instance.graph:
-                    del net_instance.graph['node_attrs_setting']
-                if 'link_attrs_setting' in net_instance.graph:
-                    del net_instance.graph['link_attrs_setting']
+                # Always keep configured resource/extrema attribute settings so
+                # generated datasets preserve the schema when saved/loaded.
+                net_instance.graph['node_attrs_setting'] = config_node_attrs_setting
+                net_instance.graph['link_attrs_setting'] = config_link_attrs_setting
+                net_instance.create_attrs_from_setting()
                 if net_instance.nodes:
                     sample_node_attrs = net_instance.nodes[list(net_instance.nodes)[0]].keys()
                     for attr_name in sample_node_attrs:

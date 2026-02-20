@@ -8,9 +8,50 @@ import torch
 from .node import Node, State
 
 try:
-    import alpha_zero_cpp_core as cpp_core  # type: ignore
+    from . import alpha_zero_cpp_core as cpp_core  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     cpp_core = None
+
+
+class _LazyCppStateProxy:
+    """Lightweight Python view over a C++ VNRState that materializes on demand."""
+
+    def __init__(self, adapter: "CppMCTSAdapter", parent: State, cpp_state: "cpp_core.VNRState", cache_key):
+        self._adapter = adapter
+        self._parent_state = parent
+        self._cpp_state = cpp_state
+        self._cpp_network_cache_key = cache_key
+        self._materialized_state: State | None = None
+
+        # Shared references / scalar metadata needed by selection and bookkeeping.
+        self._original_p_net = parent._original_p_net
+        self.v_net = parent.v_net
+        self.controller = parent.controller
+        self.counter = parent.counter
+        self.recorder = parent.recorder
+        self.link_params = parent.link_params
+        self.v_order = list(getattr(parent, "v_order", []))
+        self.v_pos = dict(getattr(parent, "v_pos", {}))
+        self.selected_p_net_nodes = list(cpp_state.selected_physical_nodes)
+        self.v_node_id = int(cpp_state.current_virtual_index)
+        self.p_node_id = int(cpp_state.last_physical_node)
+        self.rejected = bool(cpp_state.rejected)
+        self.allow_rejection = getattr(parent, "allow_rejection", False)
+        self.reject_penalty = getattr(parent, "reject_penalty", 50.0)
+        self.max_expansion = max(len(cpp_state.get_candidate_nodes()), 1)
+        self._prune_log_count = getattr(parent, "_prune_log_count", 0)
+
+    def materialize(self) -> State:
+        if self._materialized_state is None:
+            child = self._adapter._python_state_from_cpp(self._parent_state, self._cpp_state)
+            child._cpp_state = self._cpp_state
+            child._cpp_network_cache_key = self._cpp_network_cache_key
+            self._materialized_state = child
+        return self._materialized_state
+
+    def __getattr__(self, name):
+        # Defer expensive full-state reconstruction until an unsupported attribute is requested.
+        return getattr(self.materialize(), name)
 
 
 class CppMCTSAdapter:
@@ -22,12 +63,20 @@ class CppMCTSAdapter:
             raise RuntimeError("alpha_zero_cpp_core extension is not available.")
 
         self.actor = actor
+        self.use_neural_network = bool(use_neural_network)
         self._engine = cpp_core.MCTSEngine(
-            self._build_config(computation_budget, c_puct, dirichlet_alpha, dirichlet_epsilon, use_neural_network, rollout_depth_limit)
+            self._build_config(
+                computation_budget,
+                c_puct,
+                dirichlet_alpha,
+                dirichlet_epsilon,
+                self.use_neural_network,
+                rollout_depth_limit,
+            )
         )
         self._engine.set_callbacks(
             self._expand_callback,
-            self._evaluate_callback,
+            self._evaluate_callback if self.use_neural_network else self._evaluate_callback_plain,
             self._terminal_value_callback,
             self._terminal_check_callback,
         )
@@ -37,12 +86,31 @@ class CppMCTSAdapter:
         self._cpp_v_network: cpp_core.Network | None = None
         self._root_cpp_config: cpp_core.VNRConfig | None = None
         self._edge_lookup: Dict[Tuple[int, int], int] = {}
+        self._active_network_cache_key: Tuple[int, int, int, bool, float, str, int] | None = None
+        self._request_generation: int = 0
+        self._request_network_ids: Tuple[int, int] | None = None
         self._node_resource_names = [
             getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "node_resource_attrs", [])
         ]
         self._link_resource_names = [
             getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "link_resource_attrs", [])
         ]
+
+    def build_obs_from_cpp_state(self, cpp_state: "cpp_core.VNRState") -> dict:
+        """Public helper for actor hot paths that can consume C++ state directly."""
+        return self._build_obs_from_cpp_state(cpp_state)
+
+    @staticmethod
+    def materialize_state(state):
+        """Return a fully-materialized Python State when `state` is a lazy proxy."""
+        if isinstance(state, _LazyCppStateProxy):
+            return state.materialize()
+        return state
+
+    def begin_request(self, p_net, v_net) -> None:
+        """Mark a request boundary for per-request network snapshot caching."""
+        self._request_generation += 1
+        self._request_network_ids = (id(p_net), id(v_net))
 
     @staticmethod
     def _build_config(
@@ -79,6 +147,7 @@ class CppMCTSAdapter:
 
         cpp_state = self._initialize_cpp_state(root_state)
         root_state._cpp_state = cpp_state
+        root_state._cpp_network_cache_key = self._active_network_cache_key
 
         state_view = cpp_core.StateView(root_state_id)
         state_view.step_index = len(root_state.selected_p_net_nodes)
@@ -90,6 +159,28 @@ class CppMCTSAdapter:
 
         visit_counts = result.visit_counts.cpu()
         policy = result.policy.cpu()
+        total_visits = int(visit_counts.sum().item())
+
+        logger = getattr(self.actor, "logger", None)
+        if logger is not None:
+            visit_list = visit_counts.tolist()
+            visited_actions = [int(idx) for idx, count in enumerate(visit_list) if count > 0]
+            head = visit_counts[: min(16, visit_counts.numel())].tolist()
+            logger.debug(
+                f"C++ search stats: total_visits={total_visits} "
+                f"visited_actions={visited_actions} head_visit_counts={head}"
+            )
+
+        if total_visits == 0:
+            if logger is not None:
+                logger.warning("C++ search produced zero total visits; marking request as infeasible.")
+            root_node.children = []
+            root_node._diag_root_priors = []
+            root_node._diag_root_action_ids = []
+            root_node._diag_effective_sims = 0
+            root_node._diag_root_value = float(result.value)
+            root_state.p_node_id = -1
+            return result
 
         candidate_actions = list(cpp_state.get_candidate_nodes())
         if hasattr(root_state, "max_expansion"):
@@ -98,23 +189,84 @@ class CppMCTSAdapter:
         root_node._diag_root_priors = []
         root_node._diag_root_action_ids = []
 
-        candidate_priors = []
-        for action in candidate_actions:
-            if 0 <= action < policy.numel():
-                candidate_priors.append(float(policy[action].item()))
-            else:
-                candidate_priors.append(0.0)
-        total_prior = sum(candidate_priors)
-        if total_prior <= 1e-8 and candidate_priors:
-            candidate_priors = [1.0 / len(candidate_priors)] * len(candidate_priors)
-        elif total_prior > 0:
-            candidate_priors = [p / total_prior for p in candidate_priors]
+        # IMPORTANT: Do not reconstruct a Python child for every candidate action.
+        # On large topologies (e.g. 500 nodes), `create_child()` can be expensive because it
+        # may perform feasibility checks / shadow reservations. For selecting an action and
+        # recording π, we only need actions that were actually visited by the C++ search.
+        actions_to_reconstruct: List[int] = []
+        try:
+            for action in candidate_actions:
+                if 0 <= action < visit_counts.numel() and int(visit_counts[action].item()) > 0:
+                    actions_to_reconstruct.append(int(action))
+        except Exception:
+            actions_to_reconstruct = []
 
-        for idx, action in enumerate(candidate_actions):
+        # Fallback: if the search somehow visited nothing in the candidate set, keep a small
+        # subset of highest-prior actions so downstream logic can proceed deterministically.
+        if not actions_to_reconstruct and candidate_actions:
+            scored = []
+            for action in candidate_actions:
+                if 0 <= action < policy.numel():
+                    scored.append((float(policy[action].item()), int(action)))
+                else:
+                    scored.append((0.0, int(action)))
+            scored.sort(reverse=True, key=lambda t: t[0])
+            actions_to_reconstruct = [a for _, a in scored[: min(8, len(scored))]]
+
+        # Optional cap for debugging / stress runs.
+        try:
+            max_children = int(getattr(getattr(self.actor, "config", None).training, "cpp_reconstruct_max_children", 0))
+        except Exception:
+            max_children = 0
+        if max_children and len(actions_to_reconstruct) > max_children:
+            # Keep top by visit count, then by policy prior.
+            def _key(a: int):
+                v = int(visit_counts[a].item()) if 0 <= a < visit_counts.numel() else 0
+                p = float(policy[a].item()) if 0 <= a < policy.numel() else 0.0
+                return (v, p)
+            actions_to_reconstruct = sorted(actions_to_reconstruct, key=_key, reverse=True)[:max_children]
+
+        # Normalize priors over the reconstructed set only (sufficient for diagnostics).
+        priors_map: Dict[int, float] = {}
+        total_prior = 0.0
+        for action in actions_to_reconstruct:
+            prior = float(policy[action].item()) if 0 <= action < policy.numel() else 0.0
+            prior = prior if prior > 0.0 and prior < float("inf") else 0.0
+            priors_map[action] = prior
+            total_prior += prior
+        if total_prior <= 1e-8 and actions_to_reconstruct:
+            uniform = 1.0 / len(actions_to_reconstruct)
+            for action in actions_to_reconstruct:
+                priors_map[action] = uniform
+        elif total_prior > 0:
+            for action in list(priors_map.keys()):
+                priors_map[action] = priors_map[action] / total_prior
+
+        valid_children = 0
+        for action in actions_to_reconstruct:
             child_cpp_state = cpp_state.create_child(int(action))
-            child_state = self._python_state_from_cpp(root_state, child_cpp_state)
-            child_state._cpp_state = child_cpp_state
-            prior = candidate_priors[idx] if idx < len(candidate_priors) else 0.0
+            child_state = _LazyCppStateProxy(
+                adapter=self,
+                parent=root_state,
+                cpp_state=child_cpp_state,
+                cache_key=self._active_network_cache_key,
+            )
+            reject_idx = child_state._original_p_net.num_nodes
+            is_reject_action = child_state.rejected or child_state.p_node_id == reject_idx
+            is_invalid = child_state.p_node_id < 0 and not is_reject_action
+            reject_not_allowed = child_state.p_node_id == reject_idx and not getattr(child_state, "allow_rejection", False)
+            out_of_range = child_state.p_node_id > reject_idx
+            if is_invalid or reject_not_allowed or out_of_range:
+                if logger is not None:
+                    logger.debug(
+                        "Skipping invalid child action="
+                        f"{action} p_node_id={child_state.p_node_id} reject_idx={reject_idx} "
+                        f"allow_rejection={getattr(child_state, 'allow_rejection', False)} "
+                        f"rejected={child_state.rejected}"
+                    )
+                continue
+
+            prior = priors_map.get(int(action), 0.0)
             child = Node(root_node, child_state, prior=prior)
             if 0 <= action < visit_counts.numel():
                 child.visit_times = int(visit_counts[action].item())
@@ -123,6 +275,16 @@ class CppMCTSAdapter:
             child.value = 0.0
             root_node._diag_root_priors.append(prior)
             root_node._diag_root_action_ids.append(action)
+            valid_children += 1
+
+        if valid_children == 0:
+            if logger is not None:
+                logger.warning(
+                    "C++ search returned "
+                    f"{total_visits} total visits but no valid children were reconstructed (request infeasible)."
+                )
+            root_node.children = []
+            root_state.p_node_id = -1
 
         root_node._diag_effective_sims = int(visit_counts.sum().item())
         root_node._diag_root_value = float(result.value)
@@ -168,6 +330,40 @@ class CppMCTSAdapter:
 
         return logits_tensor, value_tensor
 
+    def _evaluate_callback_plain(self, state_view: cpp_core.StateView) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Neural-network-free evaluation used for uniform prior + rollout mode."""
+        num_actions = max(self._num_actions(), 1)
+        logits_tensor = torch.zeros(num_actions, dtype=torch.float32)
+        value_tensor = torch.tensor(0.0, dtype=torch.float32)
+
+        action_mask = torch.zeros(num_actions, dtype=torch.bool)
+        domain_state = getattr(state_view, "domain_state", None)
+        candidates = []
+        if domain_state is not None:
+            try:
+                candidates = domain_state.get_candidate_nodes()
+            except Exception:
+                candidates = []
+        else:
+            try:
+                state = self._fetch_state(state_view)
+                candidates = [st.p_node_id for st in state.get_candidate_states()]
+            except Exception:
+                candidates = list(range(num_actions))
+
+        if not candidates:
+            candidates = list(range(num_actions))
+
+        for action in candidates:
+            if 0 <= action < num_actions:
+                action_mask[action] = True
+
+        state_view.policy_logits = logits_tensor
+        state_view.value = value_tensor
+        state_view.action_mask = action_mask
+
+        return logits_tensor, value_tensor
+
     def _expand_callback(self, state_view: cpp_core.StateView):
         # With domain_state present the C++ core performs expansion internally.
         return []
@@ -188,13 +384,37 @@ class CppMCTSAdapter:
 
     # ---------------------------------------------------------------- Internal helpers ----------------------------------------------------
 
+    def _build_network_cache_key(self, root_state: State) -> Tuple[int, int, int, bool, float, str, int]:
+        return (
+            int(self._request_generation),
+            id(root_state._original_p_net),
+            id(root_state.v_net),
+            bool(getattr(root_state, "allow_rejection", False)),
+            float(getattr(root_state, "reject_penalty", 50.0)),
+            str(getattr(self.actor, "shortest_method", "bfs_shortest")),
+            int(getattr(self.actor, "k_shortest", 1)),
+        )
+
+    def _invalidate_cpp_network_cache(self) -> None:
+        self._cpp_p_network = None
+        self._cpp_v_network = None
+        self._root_cpp_config = None
+        self._edge_lookup = {}
+        self._active_network_cache_key = None
+
     def _ensure_cpp_networks(self, root_state: State) -> None:
-        """Serialize the static physical network once and rebuild the per-request virtual topology."""
-        if self._cpp_p_network is None:
-            self._cpp_p_network, self._edge_lookup = self._build_cpp_network(root_state._original_p_net)
-        elif not self._edge_lookup:
-            _, self._edge_lookup = self._build_cpp_network(root_state._original_p_net)
-        # Always refresh the virtual request representation
+        """Cache graph snapshots per request and rebuild only when networks change."""
+        cache_key = self._build_network_cache_key(root_state)
+        if (
+            cache_key == self._active_network_cache_key
+            and self._cpp_p_network is not None
+            and self._cpp_v_network is not None
+            and self._root_cpp_config is not None
+        ):
+            return
+
+        self._invalidate_cpp_network_cache()
+        self._cpp_p_network, self._edge_lookup = self._build_cpp_network(root_state._original_p_net)
         self._cpp_v_network, _ = self._build_cpp_network(root_state.v_net)
         config = cpp_core.VNRConfig()
         config.node_resource_names = list(self._node_resource_names)
@@ -204,11 +424,15 @@ class CppMCTSAdapter:
         config.shortest_method = getattr(self.actor, "shortest_method", "bfs_shortest")
         config.k_shortest = int(getattr(self.actor, "k_shortest", 1))
         self._root_cpp_config = config
+        self._active_network_cache_key = cache_key
 
     def _initialize_cpp_state(self, root_state: State) -> cpp_core.VNRState:
         cached = getattr(root_state, "_cpp_state", None)
-        if cached is not None:
+        cached_key = getattr(root_state, "_cpp_network_cache_key", None)
+        if cached is not None and cached_key == self._active_network_cache_key:
             return cached
+        if cached is not None and cached_key != self._active_network_cache_key:
+            root_state._cpp_state = None
 
         if self._cpp_p_network is None or self._cpp_v_network is None or self._root_cpp_config is None:
             raise RuntimeError("C++ networks are not initialised before building state.")
@@ -223,6 +447,7 @@ class CppMCTSAdapter:
         elif root_state.p_node_id == -1:
             cpp_state = cpp_state.create_child(-1)
 
+        root_state._cpp_network_cache_key = self._active_network_cache_key
         return cpp_state
 
     def _build_cpp_network(self, net) -> Tuple[cpp_core.Network, Dict[Tuple[int, int], int]]:
@@ -274,11 +499,11 @@ class CppMCTSAdapter:
         child.v_pos = dict(getattr(parent, "v_pos", {}))
 
         # Selection state
-        selected_nodes = list(cpp_state.selected_physical_nodes())
+        selected_nodes = list(cpp_state.selected_physical_nodes)
         child.selected_p_net_nodes = selected_nodes
-        child.v_node_id = cpp_state.current_virtual_index()
-        child.p_node_id = cpp_state.last_physical_node()
-        child.rejected = cpp_state.rejected()
+        child.v_node_id = int(cpp_state.current_virtual_index)
+        child.p_node_id = int(cpp_state.last_physical_node)
+        child.rejected = cpp_state.rejected
         child.allow_rejection = getattr(parent, "allow_rejection", False)
         child.reject_penalty = getattr(parent, "reject_penalty", 50.0)
         child.max_expansion = max(len(cpp_state.get_candidate_nodes()), 1)
@@ -316,7 +541,7 @@ class CppMCTSAdapter:
             "node": node_allocations,
             "link": link_allocations,
         }
-        child._p_net_view = None
+        # Don't set _p_net_view - let the property create it on demand
         child._prune_log_count = getattr(parent, "_prune_log_count", 0)
 
         return child
