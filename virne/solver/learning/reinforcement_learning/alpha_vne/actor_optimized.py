@@ -816,13 +816,30 @@ class OptimizedAlphaZeroActor(Solver):
 
         cpp_result = self.cpp_full_solver.solve(p_net, v_net, training=training)
         metrics = cpp_result.get("metrics", {}) if isinstance(cpp_result, dict) else {}
+        if metrics:
+            try:
+                metrics = dict(metrics)
+            except Exception:
+                pass
         if metrics and self.logger is not None:
             try:
+                total_ms = float(metrics.get("total_time_ms") or 0.0)
+                encode_ms = float(metrics.get("encode_ms") or 0.0)
+                build_ms = float(metrics.get("build_inputs_ms") or 0.0)
+                policy_ms = float(metrics.get("policy_eval_ms") or 0.0)
+                mcts_ms = float(metrics.get("mcts_ms") or 0.0)
+                post_ms = float(metrics.get("postprocess_ms") or 0.0)
                 self.logger.info(
-                    "C++ solve metrics: steps=%s sims=%s total_time_ms=%.2f",
+                    "C++ solve metrics: steps=%s sims=%s total_time_ms=%.2f "
+                    "encode_ms=%.2f build_inputs_ms=%.2f policy_eval_ms=%.2f mcts_ms=%.2f postprocess_ms=%.2f",
                     metrics.get("steps"),
                     metrics.get("total_simulations"),
-                    float(metrics.get("total_time_ms", 0.0)),
+                    total_ms,
+                    encode_ms,
+                    build_ms,
+                    policy_ms,
+                    mcts_ms,
+                    post_ms,
                 )
             except Exception:
                 pass
@@ -833,6 +850,8 @@ class OptimizedAlphaZeroActor(Solver):
         place_result = bool(cpp_result.get("place_result", True))
 
         solution = Solution.from_v_net(v_net)
+        if metrics:
+            solution["cpp_metrics"] = metrics
         trajectory: List[dict] = [] if not self.disable_trajectory_writing else None
 
         # Rebuild trajectory with Python observations for replay compatibility
