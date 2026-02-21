@@ -257,6 +257,11 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             metrics["total_simulations"] = result.metrics.total_simulations;
             metrics["steps"] = result.metrics.steps;
             metrics["total_time_ms"] = result.metrics.total_time_ms;
+            metrics["encode_ms"] = result.metrics.encode_ms;
+            metrics["build_inputs_ms"] = result.metrics.build_inputs_ms;
+            metrics["policy_eval_ms"] = result.metrics.policy_eval_ms;
+            metrics["mcts_ms"] = result.metrics.mcts_ms;
+            metrics["postprocess_ms"] = result.metrics.postprocess_ms;
             out["metrics"] = metrics;
             return out;
         },

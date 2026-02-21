@@ -5,9 +5,21 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace azsfc {
 namespace {
+
+using ResourceIndex = std::unordered_map<std::string, std::size_t>;
+
+ResourceIndex build_resource_index(const std::vector<std::string>& names) {
+    ResourceIndex index;
+    index.reserve(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        index.emplace(names[i], i);
+    }
+    return index;
+}
 
 torch::Tensor build_edge_index(const Network& net) {
     auto edge_index = torch::empty({2, net.num_edges}, torch::kInt64);
@@ -33,25 +45,61 @@ torch::Tensor build_v_net_x(const Network& net, const std::vector<std::string>& 
     return x;
 }
 
-torch::Tensor build_p_net_x(const VNRState& state, const Network& net, const std::vector<std::string>& node_resource_names) {
+torch::Tensor build_p_net_x(
+    const Network& net,
+    const std::vector<std::string>& node_resource_names,
+    const VNRState::SparseResourceAllocations& allocated,
+    const ResourceIndex& index
+) {
     auto x = torch::zeros({net.num_nodes, static_cast<long>(node_resource_names.size())}, torch::kFloat32);
     auto x_acc = x.accessor<float, 2>();
     for (int n = 0; n < net.num_nodes; ++n) {
         for (std::size_t j = 0; j < node_resource_names.size(); ++j) {
             const auto& name = node_resource_names[j];
-            x_acc[n][j] = static_cast<float>(state.get_available_node_resource(n, name));
+            auto it = net.node_attrs[n].find(name);
+            x_acc[n][j] = (it != net.node_attrs[n].end()) ? static_cast<float>(it->second) : 0.0f;
+        }
+    }
+    for (const auto& [node_id, attrs] : allocated) {
+        if (node_id < 0 || node_id >= net.num_nodes) {
+            continue;
+        }
+        for (const auto& [attr, value] : attrs) {
+            auto idx_it = index.find(attr);
+            if (idx_it == index.end()) {
+                continue;
+            }
+            x_acc[node_id][idx_it->second] -= static_cast<float>(value);
         }
     }
     return x;
 }
 
-torch::Tensor build_p_edge_attr(const VNRState& state, const Network& net, const std::vector<std::string>& link_resource_names) {
+torch::Tensor build_p_edge_attr(
+    const Network& net,
+    const std::vector<std::string>& link_resource_names,
+    const VNRState::SparseResourceAllocations& allocated,
+    const ResourceIndex& index
+) {
     auto attr = torch::zeros({net.num_edges, static_cast<long>(link_resource_names.size())}, torch::kFloat32);
     auto acc = attr.accessor<float, 2>();
     for (int e = 0; e < net.num_edges; ++e) {
         for (std::size_t j = 0; j < link_resource_names.size(); ++j) {
             const auto& name = link_resource_names[j];
-            acc[e][j] = static_cast<float>(state.get_available_link_resource(e, name));
+            auto it = net.edge_attrs[e].find(name);
+            acc[e][j] = (it != net.edge_attrs[e].end()) ? static_cast<float>(it->second) : 0.0f;
+        }
+    }
+    for (const auto& [edge_id, attrs] : allocated) {
+        if (edge_id < 0 || edge_id >= net.num_edges) {
+            continue;
+        }
+        for (const auto& [attr_name, value] : attrs) {
+            auto idx_it = index.find(attr_name);
+            if (idx_it == index.end()) {
+                continue;
+            }
+            acc[edge_id][idx_it->second] -= static_cast<float>(value);
         }
     }
     return attr;
@@ -87,6 +135,8 @@ StateView::TensorMap build_inputs(
     const Network& p_net,
     const std::vector<std::string>& node_resource_names,
     const std::vector<std::string>& link_resource_names,
+    const ResourceIndex& node_resource_index,
+    const ResourceIndex& link_resource_index,
     const torch::Tensor& edge_index,
     const torch::Tensor& p_batch,
     const torch::Tensor& encoder_outputs,
@@ -94,10 +144,13 @@ StateView::TensorMap build_inputs(
     bool allow_rejection,
     int reject_idx
 ) {
+    auto node_alloc = state.get_allocated_node_resources();
+    auto link_alloc = state.get_allocated_link_resources();
+
     StateView::TensorMap inputs;
-    inputs.emplace("p_net_x", build_p_net_x(state, p_net, node_resource_names));
+    inputs.emplace("p_net_x", build_p_net_x(p_net, node_resource_names, node_alloc, node_resource_index));
     inputs.emplace("p_net_edge_index", edge_index);
-    inputs.emplace("p_net_edge_attr", build_p_edge_attr(state, p_net, link_resource_names));
+    inputs.emplace("p_net_edge_attr", build_p_edge_attr(p_net, link_resource_names, link_alloc, link_resource_index));
     inputs.emplace("p_net_batch", p_batch);
     inputs.emplace("selected_p_nodes", build_selected_tensor(state.selected_physical_nodes()));
     inputs.emplace("encoder_outputs", encoder_outputs);
@@ -237,26 +290,44 @@ SolveResult solve_vnr(
         policy.load(policy_path, torch_device);
     }
 
+    auto node_resource_index = build_resource_index(vnr_config.node_resource_names);
+    auto link_resource_index = build_resource_index(vnr_config.link_resource_names);
+
     auto edge_index = build_edge_index(physical);
     auto p_batch = torch::zeros({physical.num_nodes}, torch::kInt64);
     auto v_net_x = build_v_net_x(virtual_net, vnr_config.node_resource_names).unsqueeze(0);
+    if (torch_device.type() == torch::kCUDA) {
+        edge_index = edge_index.to(torch_device);
+        p_batch = p_batch.to(torch_device);
+        v_net_x = v_net_x.to(torch_device);
+    }
     torch::Tensor encoder_outputs;
     if (search_config.use_neural_network) {
+        auto encode_start = std::chrono::high_resolution_clock::now();
         encoder_outputs = policy.encode(v_net_x);
+        auto encode_end = std::chrono::high_resolution_clock::now();
+        result.metrics.encode_ms += std::chrono::duration<double, std::milli>(encode_end - encode_start).count();
     } else {
         encoder_outputs = torch::zeros({1, virtual_net.num_nodes, 1}, torch::kFloat32);
     }
 
     MCTSEngine engine(search_config);
+    double build_inputs_ms = 0.0;
+    double policy_eval_ms = 0.0;
+    double mcts_ms = 0.0;
+    double postprocess_ms = 0.0;
 
     if (search_config.use_neural_network) {
         engine.set_evaluate_callback([&](const std::shared_ptr<StateView>& view) {
             auto& domain = *view->domain_state;
+            auto build_start = std::chrono::high_resolution_clock::now();
             auto inputs = build_inputs(
                 domain,
                 physical,
                 vnr_config.node_resource_names,
                 vnr_config.link_resource_names,
+                node_resource_index,
+                link_resource_index,
                 edge_index,
                 p_batch,
                 encoder_outputs,
@@ -264,8 +335,13 @@ SolveResult solve_vnr(
                 vnr_config.allow_rejection,
                 reject_idx
             );
+            auto build_end = std::chrono::high_resolution_clock::now();
+            build_inputs_ms += std::chrono::duration<double, std::milli>(build_end - build_start).count();
 
+            auto eval_start = std::chrono::high_resolution_clock::now();
             EvaluationResult eval = policy.evaluate(inputs);
+            auto eval_end = std::chrono::high_resolution_clock::now();
+            policy_eval_ms += std::chrono::duration<double, std::milli>(eval_end - eval_start).count();
             torch::Tensor logits = eval.policy_logits;
             torch::Tensor value = eval.value;
             if (!use_nn_policy) {
@@ -302,12 +378,16 @@ SolveResult solve_vnr(
         state_view->step_index = static_cast<std::int64_t>(current_state.selected_physical_nodes().size());
         state_view->domain_state = std::make_shared<VNRState>(current_state);
 
+        auto mcts_start = std::chrono::high_resolution_clock::now();
         std::optional<unsigned int> step_seed;
         if (seed) {
             step_seed = static_cast<unsigned int>(*seed + static_cast<unsigned int>(step));
         }
         auto search_result = engine.run_search(state_view, step_seed);
+        auto mcts_end = std::chrono::high_resolution_clock::now();
+        mcts_ms += std::chrono::duration<double, std::milli>(mcts_end - mcts_start).count();
 
+        auto post_start = std::chrono::high_resolution_clock::now();
         auto visit_counts_vec = tensor_to_vector(search_result.visit_counts);
         auto policy_vec = tensor_to_vector(search_result.policy);
 
@@ -365,12 +445,20 @@ SolveResult solve_vnr(
         current_state = current_state.create_child(action);
         if (current_state.last_physical_node() == -1) {
             result.place_result = false;
+            auto post_end = std::chrono::high_resolution_clock::now();
+            postprocess_ms += std::chrono::duration<double, std::milli>(post_end - post_start).count();
             break;
         }
+        auto post_end = std::chrono::high_resolution_clock::now();
+        postprocess_ms += std::chrono::duration<double, std::milli>(post_end - post_start).count();
     }
 
     result.metrics.steps = static_cast<int>(result.actions.size());
     result.final_reward = current_state.compute_final_reward();
+    result.metrics.build_inputs_ms = build_inputs_ms;
+    result.metrics.policy_eval_ms = policy_eval_ms;
+    result.metrics.mcts_ms = mcts_ms;
+    result.metrics.postprocess_ms = postprocess_ms;
 
     auto end_ts = std::chrono::high_resolution_clock::now();
     result.metrics.total_time_ms = std::chrono::duration<double, std::milli>(end_ts - start_ts).count();

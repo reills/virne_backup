@@ -271,20 +271,31 @@ class AlphaZeroSFCSolver(RLSolver):
         
         # Use the actor to determine node mappings via MCTS
         node_mapping_result = self._node_mapping_with_mcts(v_net, p_net, solution)
-        
-        if node_mapping_result:
-            # Standard link mapping using the controller
-            link_mapping_result = self.controller.link_mapper.link_mapping(
-                v_net, p_net, solution=solution,
-                shortest_method=self.shortest_method, 
-                k=self.k_shortest, 
-                inplace=True
-            )
+
+        # The actor may return a Solution (C++ full path) or a boolean (legacy path).
+        if isinstance(node_mapping_result, Solution):
+            solution = node_mapping_result
+            node_mapping_ok = bool(solution.get("place_result", True) and not solution.get("rejected", False))
+        else:
+            node_mapping_ok = bool(node_mapping_result)
+
+        if node_mapping_ok:
+            # Standard link mapping using the controller (skip if already mapped).
+            if solution.get("route_result", True) and not solution.get("link_paths") and not solution.get("rejected", False):
+                link_mapping_result = self.controller.link_mapper.link_mapping(
+                    v_net, p_net, solution=solution,
+                    shortest_method=self.shortest_method, 
+                    k=self.k_shortest, 
+                    inplace=True
+                )
+                if not link_mapping_result:
+                    solution['route_result'] = False
+            else:
+                link_mapping_result = bool(solution.get("route_result", False))
+
             if link_mapping_result:
                 solution['result'] = True
                 return solution
-            else:
-                solution['route_result'] = False
         else:
             solution['place_result'] = False
             

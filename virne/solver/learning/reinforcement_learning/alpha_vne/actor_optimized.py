@@ -862,6 +862,17 @@ class OptimizedAlphaZeroActor(Solver):
             curr_v_id = state.v_order[next_pos]
 
             solution["node_slots"].update({curr_v_id: action_taken})
+            # Apply placement to the Python controller/p_net for correctness and cost accounting.
+            place_ok, place_info = self.controller.node_mapper.place(
+                v_net, p_net, curr_v_id, action_taken, solution=solution
+            )
+            if not place_ok:
+                self.logger.warning(
+                    f"C++ placement rejected by controller v_node={curr_v_id} -> "
+                    f"p_node={action_taken} offsets={place_info}"
+                )
+                place_result = False
+                break
 
             if not self.disable_trajectory_writing:
                 obs = self._state_to_obs(state, curr_v_id)

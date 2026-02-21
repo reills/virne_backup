@@ -16,6 +16,11 @@ struct SolveMetrics {
     int total_simulations{0};
     int steps{0};
     double total_time_ms{0.0};
+    double encode_ms{0.0};
+    double build_inputs_ms{0.0};
+    double policy_eval_ms{0.0};
+    double mcts_ms{0.0};
+    double postprocess_ms{0.0};
 };
 
 struct SolveResult {

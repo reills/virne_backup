@@ -87,6 +87,7 @@ C++:
 - [x] Keep Python-only path as fallback (`training.use_cpp_mcts=false`).
 - [x] Preserve replay JSON schema (`trajectory_writer.py` parity).
 - [x] Add minimal stats surface (timers, expansions) for logs.
+- [x] Fix C++ full solve handoff: use returned `Solution` in `alpha_zero_sfc_solver` and apply controller node placements for cost/link parity.
 
 ### Phase 7: Validation + Tuning
 - [x] Parity tests on tiny graphs (fixed seeds). (tests/solver/learning/reinforcement_learning/alpha_vne/test_cpp_boundary_regressions.py)

@@ -22,6 +22,7 @@ torch::Tensor PolicyNetwork::encode(const torch::Tensor& v_net_x) {
     if (!loaded_) {
         throw std::runtime_error("PolicyNetwork::encode called before load().");
     }
+    torch::NoGradGuard no_grad;
     auto output = module_.run_method("encode", v_net_x.to(device_));
     return output.toTensor().detach();
 }
@@ -31,10 +32,15 @@ EvaluationResult PolicyNetwork::evaluate(const StateView::TensorMap& inputs) {
         throw std::runtime_error("PolicyNetwork::evaluate called before load().");
     }
 
+    torch::NoGradGuard no_grad;
     c10::Dict<std::string, torch::Tensor> dict;
     dict.reserve(inputs.size());
     for (const auto& [key, value] : inputs) {
-        dict.insert(key, value.to(device_));
+        torch::Tensor tensor = value;
+        if (tensor.device() != device_) {
+            tensor = tensor.to(device_);
+        }
+        dict.insert(key, tensor);
     }
 
     auto output = module_.forward({dict});
