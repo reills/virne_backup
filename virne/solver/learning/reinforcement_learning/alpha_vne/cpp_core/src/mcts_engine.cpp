@@ -12,7 +12,7 @@ namespace azsfc {
 
 namespace {
 torch::Tensor masked_softmax(const torch::Tensor& logits, const torch::Tensor& mask) {
-    auto float_mask = mask.to(logits.dtype());
+    auto float_mask = mask.to(logits.device(), logits.dtype());
     auto masked_logits = logits + (float_mask - 1.0f) * 1e9f;
     return torch::softmax(masked_logits, -1);
 }
