@@ -451,6 +451,17 @@ class CppMCTSAdapter:
         config = cpp_core.VNRConfig()
         config.node_resource_names = list(self._node_resource_names)
         config.link_resource_names = list(self._link_resource_names)
+        try:
+            node_constraints = getattr(self.actor.controller, "node_constraint_attrs_checking_at_node", [])
+            config.node_constraint_names = [getattr(attr, "name", str(attr)) for attr in node_constraints]
+            config.hard_constraint_names = [
+                getattr(attr, "name", str(attr))
+                for attr in node_constraints
+                if getattr(attr, "constraint_restrictions", "hard") == "hard"
+            ]
+        except Exception:
+            config.node_constraint_names = []
+            config.hard_constraint_names = []
         config.allow_rejection = bool(getattr(root_state, "allow_rejection", False))
         config.reject_penalty = float(getattr(root_state, "reject_penalty", 50.0))
         config.shortest_method = getattr(self.actor, "shortest_method", "bfs_shortest")
@@ -693,7 +704,7 @@ class CppFullSolver:
 
         return node_attrs, edges, edge_attrs, directed
 
-    def _build_search_config(self) -> "cpp_core.SearchConfig":
+    def _build_search_config(self, training: bool | None = None) -> "cpp_core.SearchConfig":
         cfg = cpp_core.SearchConfig()
         cfg.simulations = int(self.computation_budget)
         cfg.c_puct = float(getattr(self.actor, "c_puct", 1.0))
@@ -701,12 +712,38 @@ class CppFullSolver:
         cfg.dirichlet_epsilon = float(getattr(self.actor, "dirichlet_epsilon", 0.25))
         cfg.use_neural_network = bool(getattr(self.actor, "use_neural_network", True))
         cfg.rollout_depth_limit = int(getattr(self.actor, "rollout_depth_limit", 100))
+        if training is not None:
+            cfg.add_root_noise = bool(training)
+        # Batch eval size (C++): default to training.gpu_batch_size if present.
+        batch_size = 1
+        cfg_obj = getattr(self.actor, "config", None)
+        training_cfg = getattr(cfg_obj, "training", None) if cfg_obj is not None else None
+        if isinstance(training_cfg, dict):
+            batch_size = int(training_cfg.get("gpu_batch_size", batch_size))
+            cfg.value_normalization = str(training_cfg.get("value_normalization", "tanh"))
+            cfg.value_scale = float(training_cfg.get("value_scale", 1000.0))
+        elif training_cfg is not None:
+            batch_size = int(getattr(training_cfg, "gpu_batch_size", batch_size))
+            cfg.value_normalization = str(getattr(training_cfg, "value_normalization", "tanh"))
+            cfg.value_scale = float(getattr(training_cfg, "value_scale", 1000.0))
+        cfg.eval_batch_size = max(1, batch_size)
         return cfg
 
     def _build_vnr_config(self) -> "cpp_core.VNRConfig":
         cfg = cpp_core.VNRConfig()
         cfg.node_resource_names = list(self._node_resource_names)
         cfg.link_resource_names = list(self._link_resource_names)
+        try:
+            node_constraints = getattr(self.actor.controller, "node_constraint_attrs_checking_at_node", [])
+            cfg.node_constraint_names = [getattr(attr, "name", str(attr)) for attr in node_constraints]
+            cfg.hard_constraint_names = [
+                getattr(attr, "name", str(attr))
+                for attr in node_constraints
+                if getattr(attr, "constraint_restrictions", "hard") == "hard"
+            ]
+        except Exception:
+            cfg.node_constraint_names = []
+            cfg.hard_constraint_names = []
         allow_rejection = False
         try:
             allow_rejection = bool(getattr(self.actor.policy.actor.decoder, "allow_rejection", False))
@@ -729,7 +766,8 @@ class CppFullSolver:
         cfg.k_shortest = int(getattr(self.actor, "k_shortest", 1))
         return cfg
 
-    def solve(self, p_net, v_net, training: bool = None) -> dict:
+    def solve(self, p_net, v_net, training: bool = None, pure_cpp: bool = False,
+              replay_dir: str | None = None, max_buffer_size: int | None = None) -> dict:
         if training is None:
             training = not getattr(self.actor, "disable_trajectory_writing", False)
         temperature = getattr(self.actor, "temperature_train", 1.0) if training else getattr(self.actor, "temperature_eval", 0.0)
@@ -742,7 +780,7 @@ class CppFullSolver:
         )
 
         vnr_cfg = self._build_vnr_config()
-        search_cfg = self._build_search_config()
+        search_cfg = self._build_search_config(training=training)
 
         policy_ts_path = None
         try:
@@ -762,6 +800,24 @@ class CppFullSolver:
         except Exception:
             seed = None
 
+        policy_meta_path = getattr(self.actor, "policy_path", "") or ""
+        write_replay = bool(pure_cpp and training and not getattr(self.actor, "disable_trajectory_writing", False))
+        if write_replay:
+            # Ensure TorchScript export includes the replay-required helpers.
+            self._export_torchscript(policy_ts_path)
+        if replay_dir is None:
+            replay_dir = getattr(self.actor, "replay_dir", "") or ""
+        if not replay_dir:
+            write_replay = False
+        if max_buffer_size is None:
+            max_buffer_size = 500000
+            cfg = getattr(self.actor, "config", None)
+            training_cfg = getattr(cfg, "training", None) if cfg is not None else None
+            if isinstance(training_cfg, dict):
+                max_buffer_size = int(training_cfg.get("replay_buffer_max_size", max_buffer_size))
+            elif training_cfg is not None:
+                max_buffer_size = int(getattr(training_cfg, "replay_buffer_max_size", max_buffer_size))
+
         return cpp_core.solve(
             p_node_attrs,
             p_edges,
@@ -774,11 +830,15 @@ class CppFullSolver:
             vnr_cfg,
             search_cfg,
             policy_ts_path,
+            policy_meta_path,
             device,
             seed,
             float(temperature),
             bool(getattr(self.actor, "use_nn_policy", True)),
             bool(getattr(self.actor, "use_nn_value", True)),
+            write_replay,
+            replay_dir,
+            int(max_buffer_size),
         )
 
     def _export_torchscript(self, policy_ts_path: str) -> None:

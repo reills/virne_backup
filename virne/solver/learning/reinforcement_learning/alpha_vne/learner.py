@@ -427,10 +427,12 @@ class AlphaZeroLearner:
             # Use normalized final_reward (z) as the value target for AlphaZero-style training
             # value_normalization: 'raw' | 'sign' | 'tanh'
             norm_mode = getattr(self.config.training, 'value_normalization', 'tanh')
+            value_scale = float(getattr(self.config.training, 'value_scale', 1000.0))
             if norm_mode == 'sign':
                 target_value = 1.0 if final_reward > 0 else -1.0
             elif norm_mode == 'tanh':
-                target_value = float(torch.tanh(torch.tensor(final_reward / 1000.0)).item())
+                denom = value_scale if value_scale != 0.0 else 1.0
+                target_value = float(torch.tanh(torch.tensor(final_reward / denom)).item())
             else:
                 target_value = final_reward
 
@@ -528,10 +530,12 @@ class AlphaZeroLearner:
                 # target z consistent with training normalization
                 final_reward = data.get('final_reward', 0.0)
                 norm_mode = getattr(self.config.training, 'value_normalization', 'tanh')
+                value_scale = float(getattr(self.config.training, 'value_scale', 1000.0))
                 if norm_mode == 'sign':
                     z = 1.0 if final_reward > 0 else -1.0
                 elif norm_mode == 'tanh':
-                    z = float(torch.tanh(torch.tensor(final_reward / 1000.0)).item())
+                    denom = value_scale if value_scale != 0.0 else 1.0
+                    z = float(torch.tanh(torch.tensor(final_reward / denom)).item())
                 else:
                     z = float(final_reward)
                 preds.append(pv)

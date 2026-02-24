@@ -10,6 +10,7 @@ including:
 from __future__ import annotations
 
 import math
+import time
 from typing import List, TYPE_CHECKING
 
 import numpy as np
@@ -35,7 +36,9 @@ class NodeExpander:
         use_nn_policy: bool = True,
         use_nn_value: bool = True,
         uniform_prior: bool = False,
-        logger=None
+        logger=None,
+        timers: dict | None = None,
+        sync_cuda_timing: bool = False
     ):
         """Initialize NodeExpander.
 
@@ -59,6 +62,29 @@ class NodeExpander:
         self.use_nn_value = use_nn_value
         self.uniform_prior = uniform_prior
         self.logger = logger
+        self.timers = timers
+        self.sync_cuda_timing = bool(sync_cuda_timing)
+
+    def set_timers(self, timers: dict | None) -> None:
+        """Attach a per-solve timers dict for benchmarking."""
+        self.timers = timers
+
+    def _bump_timer(self, key: str, delta_ms: float) -> None:
+        if self.timers is None:
+            return
+        try:
+            self.timers[key] = float(self.timers.get(key, 0.0)) + float(delta_ms)
+        except Exception:
+            pass
+
+    def _maybe_sync_cuda(self) -> None:
+        if not self.sync_cuda_timing:
+            return
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
 
     def expand_node(self, node: Node, v_node_id: int | None = None, add_dirichlet_noise: bool = False) -> None:
         """Expand node using neural network policy and cache value (single NN call).
@@ -121,18 +147,24 @@ class NodeExpander:
             - priors: list[float] aligned with candidate_states
             - action_ids: list[int] per candidate (physical node id or special)
         """
+        t_obs = time.perf_counter()
         obs = self.obs_builder.build(state, self.policy_network.model, v_node_id)
+        self._bump_timer("build_inputs_ms", (time.perf_counter() - t_obs) * 1000.0)
         logits_tensor = None
         probs_tensor = None
         leaf_value = 0.0
         diag_value = None
 
         # Use PolicyNetwork for evaluation
+        self._maybe_sync_cuda()
+        t_eval = time.perf_counter()
         logits_tensor, value_float = self.policy_network.evaluate(
             obs,
             use_nn_policy=self.use_nn_policy,
             use_nn_value=self.use_nn_value
         )
+        self._maybe_sync_cuda()
+        self._bump_timer("policy_eval_ms", (time.perf_counter() - t_eval) * 1000.0)
 
         # Process logits into probabilities
         if logits_tensor is not None:
@@ -147,7 +179,9 @@ class NodeExpander:
             leaf_value = 0.0
             diag_value = None
 
+        t_cand = time.perf_counter()
         candidate_states = state.get_candidate_states()
+        self._bump_timer("candidate_ms", (time.perf_counter() - t_cand) * 1000.0)
 
         # Inject fallback candidates when necessary (mirrors original logic)
         candidate_states = [st for st in candidate_states if st.p_node_id != -1]

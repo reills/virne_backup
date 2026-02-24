@@ -47,6 +47,7 @@ training:
   # C++ MCTS implementation toggle
   use_cpp_mcts: true        # Use C++ implementation for MCTS (much faster)
   use_neural_network: true  # Enable neural network usage
+  pure_cpp: false           # Skip Python reconstruction in full C++ solve path
 
 inference:
   decode_strategy: greedy

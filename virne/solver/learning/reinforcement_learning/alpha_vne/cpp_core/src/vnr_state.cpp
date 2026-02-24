@@ -262,28 +262,54 @@ std::vector<int> VNRState::get_candidate_nodes() const {
     }
 
     int v_target = v_order_[next_index];
-    const auto& v_attrs = v_net_->node_attrs[v_target];
+
+    struct LinkRequirement {
+        int p_neighbor;
+        ResourceMap demands;
+    };
+    std::vector<LinkRequirement> link_requirements;
+    if (!config_.link_resource_names.empty()) {
+        const auto& v_adj = v_net_->adjacency[v_target];
+        for (const auto& [neighbor, edge_id] : v_adj) {
+            int neighbor_pos = v_pos_[neighbor];
+            if (neighbor_pos > v_node_index_) {
+                continue;
+            }
+            int mapped_neighbor = lookup_placement(neighbor);
+            if (mapped_neighbor < 0) {
+                continue;
+            }
+            LinkRequirement req;
+            req.p_neighbor = mapped_neighbor;
+            const auto& edge_attrs = v_net_->edge_attrs[edge_id];
+            req.demands.reserve(config_.link_resource_names.size());
+            for (const auto& attr_name : config_.link_resource_names) {
+                double demand = safe_lookup(edge_attrs, attr_name);
+                if (demand > 0.0) {
+                    req.demands[attr_name] = demand;
+                }
+            }
+            if (!req.demands.empty()) {
+                link_requirements.push_back(std::move(req));
+            }
+        }
+    }
 
     for (int p = 0; p < p_net_->num_nodes; ++p) {
         if (is_physical_selected(p)) {
             continue;
         }
-
-        bool feasible = true;
-        for (const auto& attr_name : config_.node_resource_names) {
-            double demand = safe_lookup(v_attrs, attr_name);
-            if (demand <= 0.0) {
-                continue;
+        if (check_node_constraints_feasible(v_target, p)) {
+            bool reachable = true;
+            for (const auto& req : link_requirements) {
+                if (!has_reachable_path(p, req.p_neighbor, req.demands)) {
+                    reachable = false;
+                    break;
+                }
             }
-            double available = get_available_node_resource(p, attr_name);
-            if (available + kEpsilon < demand) {
-                feasible = false;
-                break;
+            if (reachable) {
+                candidates.push_back(p);
             }
-        }
-
-        if (feasible) {
-            candidates.push_back(p);
         }
     }
 
@@ -296,6 +322,58 @@ std::vector<int> VNRState::get_candidate_nodes() const {
     }
 
     return candidates;
+}
+
+bool VNRState::has_reachable_path(int p_src, int p_dst, const ResourceMap& demands) const {
+    if (!p_net_) {
+        return false;
+    }
+    if (p_src == p_dst) {
+        return true;
+    }
+    if (p_src < 0 || p_src >= p_net_->num_nodes || p_dst < 0 || p_dst >= p_net_->num_nodes) {
+        return false;
+    }
+    if (demands.empty()) {
+        return true;
+    }
+
+    std::vector<char> visited(static_cast<std::size_t>(p_net_->num_nodes), 0);
+    std::vector<int> queue;
+    queue.reserve(static_cast<std::size_t>(p_net_->num_nodes));
+    visited[static_cast<std::size_t>(p_src)] = 1;
+    queue.push_back(p_src);
+    std::size_t head = 0;
+
+    while (head < queue.size()) {
+        int u = queue[head++];
+        const auto& neighbors = p_net_->adjacency[u];
+        for (const auto& [neighbor, edge_id] : neighbors) {
+            if (visited[static_cast<std::size_t>(neighbor)]) {
+                continue;
+            }
+            bool ok = true;
+            for (const auto& [attr, demand] : demands) {
+                if (demand <= 0.0) {
+                    continue;
+                }
+                double available = get_available_link_resource(edge_id, attr);
+                if (available + kEpsilon < demand) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+            if (neighbor == p_dst) {
+                return true;
+            }
+            visited[static_cast<std::size_t>(neighbor)] = 1;
+            queue.push_back(neighbor);
+        }
+    }
+    return false;
 }
 
 bool VNRState::is_terminal() const {
@@ -327,6 +405,23 @@ const std::vector<int>& VNRState::selected_physical_nodes() const {
     return selected_p_nodes_cache_;
 }
 
+std::vector<int> VNRState::node_slots() const {
+    if (node_slots_cache_valid_) {
+        return node_slots_cache_;
+    }
+    int v_nodes = v_net_ ? v_net_->num_nodes : 0;
+    node_slots_cache_.assign(static_cast<std::size_t>(v_nodes), -1);
+    auto cursor = placement_deltas_;
+    while (cursor) {
+        if (cursor->v_node_id >= 0 && cursor->v_node_id < v_nodes) {
+            node_slots_cache_[static_cast<std::size_t>(cursor->v_node_id)] = cursor->p_node_id;
+        }
+        cursor = cursor->parent;
+    }
+    node_slots_cache_valid_ = true;
+    return node_slots_cache_;
+}
+
 float VNRState::compute_final_reward() const {
     if (rejected_) {
         return static_cast<float>(-config_.reject_penalty);
@@ -349,13 +444,27 @@ double VNRState::sum_link_allocations() const {
 }
 
 VNRState VNRState::create_child(int p_node_id) const {
+    return create_child_internal(p_node_id, nullptr);
+}
+
+VNRState VNRState::create_child_with_info(int p_node_id, PlacementInfo* info) const {
+    return create_child_internal(p_node_id, info);
+}
+
+VNRState VNRState::create_child_internal(int p_node_id, PlacementInfo* info) const {
     VNRState child(*this);
     child.selected_p_nodes_cache_valid_ = false;
+    child.node_slots_cache_valid_ = false;
+    child.node_slots_cache_.clear();
     child.allocation_totals_cache_valid_ = false;
     child.node_allocation_totals_cache_.clear();
     child.link_allocation_totals_cache_.clear();
     child.v_node_index_ = v_node_index_ + 1;
     child.p_node_id_ = p_node_id;
+    child.last_place_info_ = PlacementInfo{};
+    if (info) {
+        *info = child.last_place_info_;
+    }
 
     if (p_node_id == reject_action_id_) {
         if (config_.allow_rejection) {
@@ -384,15 +493,31 @@ VNRState VNRState::create_child(int p_node_id) const {
 
     if (child.v_node_index_ < static_cast<int>(child.v_order_.size())) {
         int v_target = child.v_order_[child.v_node_index_];
+        bool feasible = false;
+        if (info) {
+            PlacementInfo place_info = child.check_node_constraints(v_target, p_node_id);
+            child.last_place_info_ = place_info;
+            child.total_hard_constraint_violation_ = total_hard_constraint_violation_ + place_info.max_hard_violation;
+            *info = place_info;
+            feasible = place_info.feasible;
+        } else {
+            feasible = child.check_node_constraints_feasible(v_target, p_node_id);
+            child.total_hard_constraint_violation_ = total_hard_constraint_violation_;
+        }
+        if (!feasible) {
+            child.p_node_id_ = -1;
+            return child;
+        }
+        if (!child.reserve_link_resources(v_target, p_node_id, child, *step_delta)) {
+            child.p_node_id_ = -1;
+            return child;
+        }
+        child.update_node_allocations(p_node_id, v_target, *step_delta);
         auto placement_delta = std::make_shared<PlacementDelta>();
         placement_delta->parent = placement_deltas_;
         placement_delta->v_node_id = v_target;
         placement_delta->p_node_id = p_node_id;
         child.placement_deltas_ = std::move(placement_delta);
-        child.update_node_allocations(p_node_id, v_target, *step_delta);
-        if (!child.reserve_link_resources(v_target, p_node_id, child, *step_delta)) {
-            child.p_node_id_ = -1;
-        }
     }
     child.total_link_allocation_ = total_link_allocation_ + step_delta->link_allocation_total;
 
@@ -408,6 +533,94 @@ void VNRState::update_node_allocations(int p_node_id, int v_node_id, AllocationD
         }
         add_allocation_delta(delta.node_allocations, p_node_id, attr_name, demand);
     }
+}
+
+bool VNRState::check_node_constraints_feasible(int v_node_id, int p_node_id) const {
+    if (!p_net_ || !v_net_) {
+        return false;
+    }
+    if (p_node_id < 0 || p_node_id >= p_net_->num_nodes) {
+        return false;
+    }
+    if (v_node_id < 0 || v_node_id >= v_net_->num_nodes) {
+        return false;
+    }
+    const auto& constraints = config_.node_constraint_names.empty()
+                                  ? config_.node_resource_names
+                                  : config_.node_constraint_names;
+    if (constraints.empty()) {
+        return true;
+    }
+    bool has_hard_list = !config_.hard_constraint_names.empty();
+    const auto& v_attrs = v_net_->node_attrs[v_node_id];
+    for (const auto& attr_name : constraints) {
+        double demand = safe_lookup(v_attrs, attr_name);
+        if (demand <= 0.0) {
+            continue;
+        }
+        double available = get_available_node_resource(p_node_id, attr_name);
+        bool is_hard = true;
+        if (has_hard_list) {
+            is_hard = std::find(config_.hard_constraint_names.begin(),
+                                config_.hard_constraint_names.end(),
+                                attr_name) != config_.hard_constraint_names.end();
+        }
+        if (is_hard && available + kEpsilon < demand) {
+            return false;
+        }
+    }
+    return true;
+}
+
+VNRState::PlacementInfo VNRState::check_node_constraints(int v_node_id, int p_node_id) const {
+    PlacementInfo info;
+    info.v_node_id = v_node_id;
+    info.p_node_id = p_node_id;
+    if (!p_net_ || !v_net_) {
+        info.feasible = false;
+        return info;
+    }
+    if (p_node_id < 0 || p_node_id >= p_net_->num_nodes) {
+        info.feasible = false;
+        return info;
+    }
+    if (v_node_id < 0 || v_node_id >= v_net_->num_nodes) {
+        info.feasible = false;
+        return info;
+    }
+    const auto& constraints = config_.node_constraint_names.empty()
+                                  ? config_.node_resource_names
+                                  : config_.node_constraint_names;
+    if (constraints.empty()) {
+        return info;
+    }
+    bool has_hard_list = !config_.hard_constraint_names.empty();
+    const auto& v_attrs = v_net_->node_attrs[v_node_id];
+    for (const auto& attr_name : constraints) {
+        double demand = safe_lookup(v_attrs, attr_name);
+        double available = get_available_node_resource(p_node_id, attr_name);
+        double offset = demand - available;
+        info.offsets[attr_name] = offset;
+
+        bool is_hard = true;
+        if (has_hard_list) {
+            is_hard = std::find(config_.hard_constraint_names.begin(),
+                                config_.hard_constraint_names.end(),
+                                attr_name) != config_.hard_constraint_names.end();
+        }
+        if (is_hard) {
+            if (offset > info.max_hard_violation) {
+                info.max_hard_violation = offset;
+            }
+            if (offset > kEpsilon) {
+                info.feasible = false;
+            }
+        }
+    }
+    if (info.max_hard_violation < 0.0) {
+        info.max_hard_violation = 0.0;
+    }
+    return info;
 }
 
 bool VNRState::reserve_link_resources(int new_virtual_node,
@@ -445,14 +658,22 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         return false;
     }
     int v_edge_id = it->second;
-    const auto& demands = v_net_->edge_attrs[v_edge_id];
+    ResourceMap demands;
+    demands.reserve(config_.link_resource_names.size());
+    const auto& edge_attrs = v_net_->edge_attrs[v_edge_id];
+    for (const auto& attr_name : config_.link_resource_names) {
+        demands[attr_name] = safe_lookup(edge_attrs, attr_name);
+    }
 
     int k = std::max(1, config_.k_shortest);
     std::string method = config_.shortest_method.empty() ? "bfs_shortest" : config_.shortest_method;
     if (method == "bfs_shortest" || method == "first_shortest" || method == "available_shortest") {
         k = 1;
     }
-    auto paths = path_finder_.find_paths(*p_net_, target, p_src, p_dst, k, demands, method);
+    auto capacity_fn = [&target](int edge_id, const std::string& attr) {
+        return target.get_available_link_resource(edge_id, attr);
+    };
+    auto paths = path_finder_.find_paths(*p_net_, p_src, p_dst, k, demands, method, capacity_fn);
     if (paths.empty()) {
         return false;
     }
@@ -538,6 +759,174 @@ double VNRState::get_available_link_resource(int u, int v, const std::string& at
         return 0.0;
     }
     return get_available_link_resource(it->second, attr);
+}
+
+VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_slots) const {
+    LinkMappingResult result;
+    if (!p_net_ || !v_net_) {
+        return result;
+    }
+    if (static_cast<int>(node_slots.size()) < v_net_->num_nodes) {
+        return result;
+    }
+    if (v_net_->num_edges == 0) {
+        result.success = true;
+        return result;
+    }
+
+    const auto& resource_names = config_.link_resource_names;
+    std::unordered_map<std::string, std::size_t> resource_index;
+    resource_index.reserve(resource_names.size());
+    for (std::size_t i = 0; i < resource_names.size(); ++i) {
+        resource_index.emplace(resource_names[i], i);
+    }
+
+    std::vector<std::vector<double>> used;
+    used.assign(static_cast<std::size_t>(p_net_->num_edges),
+                std::vector<double>(resource_names.size(), 0.0));
+
+    auto capacity_fn = [&](int edge_id, const std::string& attr) -> double {
+        auto idx_it = resource_index.find(attr);
+        if (idx_it == resource_index.end()) {
+            return 0.0;
+        }
+        if (edge_id < 0 || edge_id >= p_net_->num_edges) {
+            return 0.0;
+        }
+        std::size_t idx = idx_it->second;
+        double capacity = safe_lookup(p_net_->edge_attrs[edge_id], attr);
+        return capacity - used[static_cast<std::size_t>(edge_id)][idx];
+    };
+
+    std::string method = config_.shortest_method.empty() ? "bfs_shortest" : config_.shortest_method;
+    int k = std::max(1, config_.k_shortest);
+    if (method == "bfs_shortest" || method == "first_shortest" || method == "available_shortest") {
+        k = 1;
+    }
+
+    result.success = true;
+    result.records.reserve(static_cast<std::size_t>(v_net_->num_edges));
+
+    for (const auto& v_edge : v_net_->edges) {
+        int v_src = v_edge.first;
+        int v_dst = v_edge.second;
+        if (v_src < 0 || v_dst < 0 || v_src >= static_cast<int>(node_slots.size())
+            || v_dst >= static_cast<int>(node_slots.size())) {
+            result.success = false;
+            break;
+        }
+
+        int p_src = node_slots[static_cast<std::size_t>(v_src)];
+        int p_dst = node_slots[static_cast<std::size_t>(v_dst)];
+        if (p_src < 0 || p_dst < 0) {
+            result.success = false;
+            break;
+        }
+        if (p_src == p_dst) {
+            result.success = false;
+            break;
+        }
+
+        auto edge_it = v_net_->edge_index.find({v_src, v_dst});
+        if (edge_it == v_net_->edge_index.end()) {
+            edge_it = v_net_->edge_index.find({v_dst, v_src});
+        }
+        if (edge_it == v_net_->edge_index.end()) {
+            result.success = false;
+            break;
+        }
+        int v_edge_id = edge_it->second;
+
+        ResourceMap demands;
+        demands.reserve(resource_names.size());
+        const auto& v_edge_attrs = v_net_->edge_attrs[v_edge_id];
+        for (const auto& name : resource_names) {
+            demands[name] = safe_lookup(v_edge_attrs, name);
+        }
+
+        auto paths = path_finder_.find_paths(*p_net_, p_src, p_dst, k, demands, method, capacity_fn);
+        if (paths.empty()) {
+            result.success = false;
+            break;
+        }
+
+        bool selected = false;
+        for (const auto& candidate : paths) {
+            if (candidate.nodes.size() < 2) {
+                continue;
+            }
+            auto links = path_to_links(candidate.nodes);
+            bool feasible = true;
+            for (const auto& [u, v] : links) {
+                auto p_edge_it = p_net_->edge_index.find({u, v});
+                if (p_edge_it == p_net_->edge_index.end()) {
+                    feasible = false;
+                    break;
+                }
+                int edge_id = p_edge_it->second;
+                for (const auto& name : resource_names) {
+                    double demand = demands[name];
+                    if (demand <= 0.0) {
+                        continue;
+                    }
+                    if (capacity_fn(edge_id, name) + kEpsilon < demand) {
+                        feasible = false;
+                        break;
+                    }
+                }
+                if (!feasible) {
+                    break;
+                }
+            }
+
+            if (!feasible) {
+                continue;
+            }
+
+            LinkPathRecord record;
+            record.v_src = v_src;
+            record.v_dst = v_dst;
+            record.p_links = links;
+            record.p_link_resources.reserve(links.size());
+
+            for (const auto& [u, v] : links) {
+                auto p_edge_it = p_net_->edge_index.find({u, v});
+                if (p_edge_it == p_net_->edge_index.end()) {
+                    feasible = false;
+                    break;
+                }
+                int edge_id = p_edge_it->second;
+                ResourceMap used_map;
+                used_map.reserve(resource_names.size());
+                for (const auto& name : resource_names) {
+                    double demand = demands[name];
+                    used_map[name] = demand;
+                    if (demand > 0.0) {
+                        auto idx_it = resource_index.find(name);
+                        if (idx_it != resource_index.end()) {
+                            used[static_cast<std::size_t>(edge_id)][idx_it->second] += demand;
+                        }
+                        result.total_link_cost += demand;
+                    }
+                }
+                record.p_link_resources.push_back(std::move(used_map));
+            }
+            if (!feasible) {
+                continue;
+            }
+
+            result.records.push_back(std::move(record));
+            selected = true;
+            break;
+        }
+
+        if (!selected) {
+            result.success = false;
+            break;
+        }
+    }
+
+    return result;
 }
 
 VNRState::SparseResourceAllocations VNRState::get_allocated_node_resources() const {

@@ -77,6 +77,8 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         .def(py::init<>())
         .def_readwrite("node_resource_names", &az::VNRConfig::node_resource_names)
         .def_readwrite("link_resource_names", &az::VNRConfig::link_resource_names)
+        .def_readwrite("node_constraint_names", &az::VNRConfig::node_constraint_names)
+        .def_readwrite("hard_constraint_names", &az::VNRConfig::hard_constraint_names)
         .def_readwrite("allow_rejection", &az::VNRConfig::allow_rejection)
         .def_readwrite("reject_penalty", &az::VNRConfig::reject_penalty)
         .def_readwrite("shortest_method", &az::VNRConfig::shortest_method)
@@ -119,7 +121,10 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         .def_readwrite("virtual_loss", &az::SearchConfig::virtual_loss)
         .def_readwrite("add_root_noise", &az::SearchConfig::add_root_noise)
         .def_readwrite("use_neural_network", &az::SearchConfig::use_neural_network)
-        .def_readwrite("rollout_depth_limit", &az::SearchConfig::rollout_depth_limit);
+        .def_readwrite("rollout_depth_limit", &az::SearchConfig::rollout_depth_limit)
+        .def_readwrite("eval_batch_size", &az::SearchConfig::eval_batch_size)
+        .def_readwrite("value_normalization", &az::SearchConfig::value_normalization)
+        .def_readwrite("value_scale", &az::SearchConfig::value_scale);
 
     py::class_<az::SearchResult>(m, "SearchResult")
         .def_readonly("visit_counts", &az::SearchResult::visit_counts)
@@ -207,11 +212,15 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            az::VNRConfig vnr_config,
            az::SearchConfig search_config,
            const std::string& policy_path,
+           const std::string& policy_meta_path,
            const std::string& device,
            py::object seed_obj,
            float temperature,
            bool use_nn_policy,
-           bool use_nn_value) {
+           bool use_nn_value,
+           bool write_replay,
+           const std::string& replay_dir,
+           int max_buffer_size) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
@@ -239,11 +248,15 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
                 vnr_config,
                 search_config,
                 policy_path,
+                policy_meta_path,
                 device,
                 seed,
                 temperature,
                 use_nn_policy,
-                use_nn_value
+                use_nn_value,
+                write_replay,
+                replay_dir,
+                max_buffer_size
             );
 
             py::dict out;
@@ -252,7 +265,33 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             out["values"] = result.values;
             out["rejected"] = result.rejected;
             out["place_result"] = result.place_result;
+            out["route_result"] = result.route_result;
+            out["node_slots"] = result.node_slots;
+            out["place_info"] = result.place_info;
+            out["place_v_node_id"] = result.place_v_node_id;
+            out["place_p_node_id"] = result.place_p_node_id;
             out["final_reward"] = result.final_reward;
+            out["replay_written"] = result.replay_written;
+            out["replay_path"] = result.replay_path;
+            out["replay_error"] = result.replay_error;
+            py::dict link_paths;
+            py::dict link_paths_info;
+            for (const auto& record : result.link_mapping) {
+                py::tuple v_key = py::make_tuple(record.v_src, record.v_dst);
+                py::list p_links;
+                for (std::size_t i = 0; i < record.p_links.size(); ++i) {
+                    const auto& p_link = record.p_links[i];
+                    py::tuple p_key = py::make_tuple(p_link.first, p_link.second);
+                    p_links.append(p_key);
+                    if (i < record.p_link_resources.size()) {
+                        py::tuple info_key = py::make_tuple(v_key, p_key);
+                        link_paths_info[info_key] = record.p_link_resources[i];
+                    }
+                }
+                link_paths[v_key] = p_links;
+            }
+            out["link_paths"] = link_paths;
+            out["link_paths_info"] = link_paths_info;
             py::dict metrics;
             metrics["total_simulations"] = result.metrics.total_simulations;
             metrics["steps"] = result.metrics.steps;
@@ -276,10 +315,14 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("vnr_config"),
         py::arg("search_config"),
         py::arg("policy_path"),
+        py::arg("policy_meta_path") = "",
         py::arg("device") = "cpu",
         py::arg("seed") = py::none(),
         py::arg("temperature") = 1.0f,
         py::arg("use_nn_policy") = true,
-        py::arg("use_nn_value") = true
+        py::arg("use_nn_value") = true,
+        py::arg("write_replay") = false,
+        py::arg("replay_dir") = "",
+        py::arg("max_buffer_size") = 0
     );
 }

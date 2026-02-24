@@ -16,6 +16,10 @@ namespace azsfc {
 struct VNRConfig {
     std::vector<std::string> node_resource_names;
     std::vector<std::string> link_resource_names;
+    // Optional constraint name lists (defaults to node_resource_names if empty).
+    std::vector<std::string> node_constraint_names;
+    // Names of hard constraints (defaults to all node constraints if empty).
+    std::vector<std::string> hard_constraint_names;
     bool allow_rejection{false};
     double reject_penalty{50.0};
     std::string shortest_method{"bfs_shortest"};
@@ -26,6 +30,27 @@ class VNRState {
 public:
     using ResourceMap = std::unordered_map<std::string, double>;
     using SparseResourceAllocations = std::unordered_map<int, ResourceMap>;
+
+    struct LinkPathRecord {
+        int v_src{-1};
+        int v_dst{-1};
+        std::vector<std::pair<int, int>> p_links;
+        std::vector<ResourceMap> p_link_resources;
+    };
+
+    struct LinkMappingResult {
+        bool success{false};
+        std::vector<LinkPathRecord> records;
+        double total_link_cost{0.0};
+    };
+
+    struct PlacementInfo {
+        bool feasible{true};
+        int v_node_id{-1};
+        int p_node_id{-1};
+        ResourceMap offsets;
+        double max_hard_violation{0.0};
+    };
 
     VNRState(std::shared_ptr<const Network> physical,
              std::shared_ptr<const Network> virtual_net,
@@ -38,6 +63,7 @@ public:
     bool is_terminal() const;
     float compute_final_reward() const;
     VNRState create_child(int p_node_id) const;
+    VNRState create_child_with_info(int p_node_id, PlacementInfo* info) const;
 
     // Plain MCTS: Random rollout simulation for vanilla MCTS value estimation
     float run_random_rollout(std::mt19937& rng, int depth_limit = 100) const;
@@ -51,7 +77,10 @@ public:
     int current_virtual_index() const noexcept { return v_node_index_; }
     int last_physical_node() const noexcept { return p_node_id_; }
     bool rejected() const noexcept { return rejected_; }
+    const PlacementInfo& last_place_info() const noexcept { return last_place_info_; }
+    double total_hard_constraint_violation() const noexcept { return total_hard_constraint_violation_; }
     const std::vector<int>& selected_physical_nodes() const;
+    std::vector<int> node_slots() const;
     const std::vector<int>& virtual_order() const noexcept { return v_order_; }
     int action_space_size() const noexcept {
         if (!p_net_) {
@@ -63,6 +92,8 @@ public:
         }
         return size;
     }
+
+    LinkMappingResult link_mapping(const std::vector<int>& node_slots) const;
 
 private:
     struct AllocationDelta {
@@ -113,6 +144,10 @@ private:
     mutable SparseResourceAllocations link_allocation_totals_cache_;
 
     ShortestPathFinder path_finder_;
+    PlacementInfo last_place_info_;
+    double total_hard_constraint_violation_{0.0};
+    mutable bool node_slots_cache_valid_{false};
+    mutable std::vector<int> node_slots_cache_;
 
     void initialise_virtual_order();
     static bool selected_mask_contains(const std::vector<std::uint64_t>& mask, int node_id) noexcept;
@@ -139,6 +174,10 @@ private:
                                        int p_dst,
                                        VNRState& target,
                                        AllocationDelta& delta) const;
+    bool has_reachable_path(int p_src, int p_dst, const ResourceMap& demands) const;
+    bool check_node_constraints_feasible(int v_node_id, int p_node_id) const;
+    PlacementInfo check_node_constraints(int v_node_id, int p_node_id) const;
+    VNRState create_child_internal(int p_node_id, PlacementInfo* info) const;
     double sum_link_allocations() const;
 };
 

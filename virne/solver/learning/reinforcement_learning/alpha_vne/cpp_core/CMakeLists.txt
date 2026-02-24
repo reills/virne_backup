@@ -170,11 +170,19 @@ set(CPP_CORE_SOURCES
     src/node.cpp
     src/mcts_engine.cpp
     src/policy_network.cpp
+    src/replay_writer.cpp
     src/solver.cpp
     src/bindings.cpp
 )
 
 add_library(alpha_zero_cpp_core MODULE ${CPP_CORE_SOURCES} ${CPP_CORE_HEADERS})
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Silence a GCC 12+ false-positive in pybind11/torch headers.
+    target_compile_options(alpha_zero_cpp_core PRIVATE -Wno-stringop-overread)
+    # LTO can surface the same warning at link time; silence there too.
+    target_link_options(alpha_zero_cpp_core PRIVATE -Wno-stringop-overread)
+endif()
 
 target_include_directories(alpha_zero_cpp_core
     PRIVATE

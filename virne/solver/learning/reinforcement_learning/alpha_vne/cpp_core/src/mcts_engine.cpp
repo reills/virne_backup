@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cmath>
 #include <stdexcept>
 
 namespace azsfc {
@@ -42,6 +44,23 @@ int64_t find_max_action_id(const Container& entries) {
 
 std::atomic<std::int64_t> g_state_id_counter{1};
 }  // namespace
+
+float MCTSEngine::normalize_terminal_value(float raw) const {
+    std::string mode = config_.value_normalization;
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "sign") {
+        return raw > 0.0f ? 1.0f : -1.0f;
+    }
+    if (mode == "tanh") {
+        float scale = config_.value_scale;
+        if (scale == 0.0f) {
+            scale = 1.0f;
+        }
+        return std::tanh(raw / scale);
+    }
+    return raw;
+}
 
 MCTSEngine::MCTSEngine(SearchConfig config)
     : config_(config),
@@ -87,13 +106,77 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
         (void)expand(root);
     }
 
-    for (int sim = 0; sim < config_.simulations; ++sim) {
-        TreeNode* leaf = select(root);
-        if (!leaf) {
-            break;
+    const bool use_batch_eval =
+        config_.use_neural_network && batch_evaluate_fn_ && config_.eval_batch_size > 1;
+    if (!use_batch_eval) {
+        for (int sim = 0; sim < config_.simulations; ++sim) {
+            TreeNode* leaf = select(root);
+            if (!leaf) {
+                break;
+            }
+            float value = expand(*leaf);
+            backpropagate(leaf, value);
         }
-        float value = expand(*leaf);
-        backpropagate(leaf, value);
+    } else {
+        std::vector<TreeNode*> pending_nodes;
+        std::vector<std::shared_ptr<StateView>> pending_states;
+        pending_nodes.reserve(static_cast<std::size_t>(config_.eval_batch_size));
+        pending_states.reserve(static_cast<std::size_t>(config_.eval_batch_size));
+
+        for (int sim = 0; sim < config_.simulations; ++sim) {
+            TreeNode* leaf = select(root);
+            if (!leaf) {
+                break;
+            }
+
+            auto state = leaf->state();
+            bool terminal = false;
+            if (state->domain_state) {
+                terminal = state->domain_state->is_terminal();
+            } else if (terminal_check_fn_) {
+                terminal = terminal_check_fn_(state);
+            }
+            if (terminal) {
+                leaf->set_terminal(true);
+                float raw = state->domain_state ? state->domain_state->compute_final_reward()
+                                                : (terminal_value_fn_ ? terminal_value_fn_(state) : 0.0f);
+                float value = normalize_terminal_value(raw);
+                backpropagate(leaf, value);
+                continue;
+            }
+
+            if (state->policy_logits.defined() && state->value.defined()) {
+                float value = expand(*leaf);
+                backpropagate(leaf, value);
+                continue;
+            }
+
+            apply_virtual_loss(leaf);
+            pending_nodes.push_back(leaf);
+            pending_states.push_back(state);
+
+            bool flush = static_cast<int>(pending_nodes.size()) >= config_.eval_batch_size;
+            if (!flush && sim + 1 < config_.simulations) {
+                continue;
+            }
+
+            auto evals = batch_evaluate_fn_(pending_states);
+            std::size_t eval_count = std::min(pending_states.size(), evals.size());
+            for (std::size_t i = 0; i < eval_count; ++i) {
+                pending_states[i]->policy_logits = evals[i].policy_logits;
+                pending_states[i]->value = evals[i].value;
+                float value = expand(*pending_nodes[i]);
+                revert_virtual_loss(pending_nodes[i]);
+                backpropagate(pending_nodes[i], value);
+            }
+            // Cleanup any leftover virtual loss if evals returned fewer entries.
+            for (std::size_t i = eval_count; i < pending_nodes.size(); ++i) {
+                revert_virtual_loss(pending_nodes[i]);
+            }
+
+            pending_nodes.clear();
+            pending_states.clear();
+        }
     }
 
     const auto& root_children = root.children_ref();
@@ -174,9 +257,9 @@ float MCTSEngine::expand(TreeNode& node) {
     if (terminal) {
         node.set_terminal(true);
         if (state->domain_state) {
-            return state->domain_state->compute_final_reward();
+            return normalize_terminal_value(state->domain_state->compute_final_reward());
         }
-        return terminal_value_fn_(state);
+        return normalize_terminal_value(terminal_value_fn_(state));
     }
 
     // PLAIN MCTS MODE: Skip neural network evaluation if use_neural_network is false
@@ -212,9 +295,9 @@ float MCTSEngine::expand(TreeNode& node) {
     if (options.empty()) {
         node.set_terminal(true);
         if (state->domain_state) {
-            return state->domain_state->compute_final_reward();
+            return normalize_terminal_value(state->domain_state->compute_final_reward());
         }
-        return terminal_value_fn_(state);
+        return normalize_terminal_value(terminal_value_fn_(state));
     }
 
     // PLAIN MCTS MODE: Use uniform priors instead of neural network policy
@@ -254,10 +337,17 @@ float MCTSEngine::expand(TreeNode& node) {
         }
     }
 
+    torch::Tensor priors_cpu = priors;
+    if (priors.device().is_cuda()) {
+        priors_cpu = priors.to(torch::kCPU);
+    }
+    priors_cpu = priors_cpu.contiguous();
+    auto priors_acc = priors_cpu.accessor<float, 1>();
+
     for (auto& [action, child_state] : options) {
         float prior = 0.0f;
-        if (action >= 0 && action < priors.size(0)) {
-            prior = priors[action].item<float>();
+        if (action >= 0 && action < priors_cpu.size(0)) {
+            prior = priors_acc[action];
         } else {
             // Fallback uniform prior for this action
             prior = 1.0f / static_cast<float>(options.size());
@@ -292,6 +382,22 @@ void MCTSEngine::backpropagate(TreeNode* node, float value) {
     }
 }
 
+void MCTSEngine::apply_virtual_loss(TreeNode* node) {
+    float loss = config_.virtual_loss;
+    while (node) {
+        node->add_virtual_loss(loss);
+        node = node->parent();
+    }
+}
+
+void MCTSEngine::revert_virtual_loss(TreeNode* node) {
+    float loss = config_.virtual_loss;
+    while (node) {
+        node->revert_virtual_loss(loss);
+        node = node->parent();
+    }
+}
+
 void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
     auto state = root.state();
     auto logits = state->policy_logits.squeeze();
@@ -313,27 +419,38 @@ void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
     }
 
     std::gamma_distribution<float> gamma(config_.dirichlet_alpha, 1.0f);
-    auto noise = torch::zeros_like(priors);
+    std::vector<float> noise_vals;
+    noise_vals.reserve(valid_actions.size());
     float noise_sum = 0.0f;
-    for (int64_t action : valid_actions) {
+    for (std::size_t i = 0; i < valid_actions.size(); ++i) {
         float n = gamma(rng_);
-        noise[action] = n;
+        noise_vals.push_back(n);
         noise_sum += n;
     }
     if (noise_sum <= 0.0f) {
         return;
     }
-
-    for (int64_t action : valid_actions) {
-        noise[action] = noise[action].item<float>() / noise_sum;
+    for (auto& v : noise_vals) {
+        v /= noise_sum;
     }
+
+    auto noise = torch::zeros_like(priors);
+    auto action_idx = torch::tensor(valid_actions, torch::TensorOptions().dtype(torch::kInt64).device(priors.device()));
+    auto noise_tensor = torch::tensor(noise_vals, torch::TensorOptions().dtype(priors.dtype()).device(priors.device()));
+    noise.index_put_({action_idx}, noise_tensor);
 
     auto mixed = (1.0f - config_.dirichlet_epsilon) * priors + config_.dirichlet_epsilon * noise;
     state->policy_logits = torch::log(mixed + 1e-8f);
 
+    torch::Tensor mixed_cpu = mixed;
+    if (mixed.device().is_cuda()) {
+        mixed_cpu = mixed.to(torch::kCPU);
+    }
+    mixed_cpu = mixed_cpu.contiguous();
+    auto mixed_acc = mixed_cpu.accessor<float, 1>();
     for (const auto& [action, child] : root.children_ref()) {
-        if (child && action >= 0 && action < mixed.size(0)) {
-            child->set_prior(mixed[action].item<float>());
+        if (child && action >= 0 && action < mixed_cpu.size(0)) {
+            child->set_prior(mixed_acc[action]);
         }
     }
 }

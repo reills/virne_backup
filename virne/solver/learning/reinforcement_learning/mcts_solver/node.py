@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import random
+from collections import deque
 from typing import Dict, List, Tuple
 
 from virne.utils import path_to_links
@@ -136,6 +137,73 @@ class State:
             except KeyError:
                 return {}
 
+    def _build_link_requirements(self, v_target: int):
+        link_requirements = []
+        if not self.link_resource_names:
+            return link_requirements
+        for n_v in self.v_net.adj[v_target]:
+            if self.v_pos.get(n_v, 0) > self.v_index:
+                continue
+            pos = self.v_pos.get(n_v, None)
+            if pos is None or pos >= len(self.selected_p_net_nodes):
+                continue
+            p_neighbor = self.selected_p_net_nodes[pos]
+            edge_attrs = self._virtual_edge_attrs(v_target, n_v)
+            demands = {}
+            for attr in self.link_resource_names:
+                demand = float(edge_attrs.get(attr, 0.0))
+                if demand > 0.0:
+                    demands[attr] = demand
+            if demands:
+                link_requirements.append((p_neighbor, demands))
+        return link_requirements
+
+    def _has_reachable_path(self, p_src: int, p_dst: int, demands: Dict) -> bool:
+        if p_src == p_dst:
+            return True
+        if not demands:
+            return True
+        if p_src not in self._original_p_net or p_dst not in self._original_p_net:
+            return False
+        visited = set([p_src])
+        queue = deque([p_src])
+        while queue:
+            u = queue.popleft()
+            for v in self._original_p_net.adj[u]:
+                if v in visited:
+                    continue
+                edge = self.p_net.links[(u, v)]
+                ok = True
+                for attr, demand in demands.items():
+                    if demand <= 0.0:
+                        continue
+                    available = edge.get(attr, 0.0)
+                    if available + 1e-8 < demand:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                if v == p_dst:
+                    return True
+                visited.add(v)
+                queue.append(v)
+        return False
+
+    def _filter_candidates_by_reachability(self, v_target: int, candidates: List[int]) -> List[int]:
+        link_requirements = self._build_link_requirements(v_target)
+        if not link_requirements:
+            return candidates
+        filtered: List[int] = []
+        for p_node_id in candidates:
+            reachable = True
+            for p_neighbor, demands in link_requirements:
+                if not self._has_reachable_path(p_node_id, p_neighbor, demands):
+                    reachable = False
+                    break
+            if reachable:
+                filtered.append(p_node_id)
+        return filtered
+
     def is_terminal(self) -> bool:
         if self.rejected or self.p_node_id == -1:
             return True
@@ -178,6 +246,7 @@ class State:
                 filter=self.selected_p_net_nodes,
                 check_link_constraint=False,
             ))
+            actions = self._filter_candidates_by_reachability(v_target, actions)
 
         if self.allow_rejection and not self.rejected:
             actions.append(self.reject_action_id)

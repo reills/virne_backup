@@ -44,6 +44,7 @@ class PolicyNetwork:
         self.device = device
         self.use_batched_gpu = use_batched_gpu and torch.cuda.is_available()
         self.logger = logger
+        self._batched_failures = 0
 
         # Initialize the neural network model
         self.model = ActorCritic(**model_config).to(device)
@@ -170,28 +171,46 @@ class PolicyNetwork:
                         value_float = float(value)
                     except Exception:
                         value_float = 0.0
-
+                return logits_tensor, value_float
             except Exception as exc:
+                self._batched_failures += 1
                 if self.logger:
                     self.logger.warning(f"Batched GPU evaluation failed: {exc}")
-                logits_tensor = None
-                value_float = 0.0
-        else:
-            # Single-threaded inference
-            with torch.inference_mode():
-                obs_device = self._move_obs_to_device(obs)
+                    self.logger.warning("Restarting GPU worker and retrying once.")
+                try:
+                    if self.gpu_manager:
+                        self.gpu_manager.restart()
+                    logits, value = self.gpu_manager.evaluate(obs)
+                    if isinstance(logits, torch.Tensor) and use_nn_policy:
+                        logits_tensor = logits.detach().cpu()
+                        if logits_tensor.dim() > 1:
+                            logits_tensor = logits_tensor.squeeze(0)
+                    if use_nn_value:
+                        try:
+                            value_float = float(value)
+                        except Exception:
+                            value_float = 0.0
+                    return logits_tensor, value_float
+                except Exception as exc2:
+                    if self.logger:
+                        self.logger.error(f"Batched GPU evaluation retry failed: {exc2}")
+                    raise
 
-                # Get logits
-                if use_nn_policy:
-                    logits = self.model.act(obs_device)
-                    logits_tensor = logits.detach().cpu()
-                    if logits_tensor.dim() > 1:
-                        logits_tensor = logits_tensor.squeeze(0)
+        # Local single-threaded inference (non-batched path)
+        with torch.inference_mode():
+            obs_device = self._move_obs_to_device(obs)
 
-                # Get value
-                if use_nn_value:
-                    value = self.model.evaluate(obs_device)
-                    value_float = float(value.item())
+            # Get logits
+            if use_nn_policy:
+                logits = self.model.act(obs_device)
+                logits_tensor = logits.detach().cpu()
+                if logits_tensor.dim() > 1:
+                    logits_tensor = logits_tensor.squeeze(0)
+
+            # Get value
+            if use_nn_value:
+                value = self.model.evaluate(obs_device)
+                value_float = float(value.item())
 
         return logits_tensor, value_float
 

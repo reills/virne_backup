@@ -453,7 +453,7 @@ def _build_job_overrides(
     if is_offline_system:
         job_specific.append('system.if_offline_system=true')
 
-    return [
+    overrides = [
         *common,
         *fixed_dataset,
         *stage_overrides,
@@ -463,6 +463,14 @@ def _build_job_overrides(
         *topology_stage_overrides,
         *job_specific,
     ]
+
+    # Ensure AlphaZero-SFC uses the pure C++ backend for apples-to-apples comparisons.
+    if solver_name == 'alpha_zero_sfc':
+        for entry in ('training.use_cpp_mcts=true', 'training.pure_cpp=true'):
+            if entry not in overrides:
+                overrides.append(entry)
+
+    return overrides
 
 
 def _resolve_offline_slice_plan(

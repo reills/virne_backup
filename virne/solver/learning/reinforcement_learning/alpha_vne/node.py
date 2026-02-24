@@ -5,6 +5,7 @@
 
 import copy
 import random
+from collections import deque
 
 from virne.core import Solution
 from virne.utils import path_to_links
@@ -118,6 +119,84 @@ class State:
     def get_link_resource_types(self) -> list:
         """Get all link resource type names from controller configuration"""
         return [attr.name for attr in self.controller.link_resource_attrs]
+
+    def _virtual_edge_attrs(self, u: int, v: int) -> dict:
+        try:
+            return self.v_net.edges[u, v]
+        except Exception:
+            try:
+                return self.v_net.edges[v, u]
+            except Exception:
+                return {}
+
+    def _build_link_requirements(self, v_target: int):
+        """Collect link demand requirements to already-placed virtual neighbors."""
+        link_requirements = []
+        if not getattr(self.controller, "link_resource_attrs", None):
+            return link_requirements
+        for n_v in self.v_net.adj[v_target]:
+            if self.v_pos.get(n_v, 0) > self.v_node_id:
+                continue
+            pos = self.v_pos.get(n_v, None)
+            if pos is None or pos >= len(self.selected_p_net_nodes):
+                continue
+            p_neighbor = self.selected_p_net_nodes[pos]
+            edge_attrs = self._virtual_edge_attrs(v_target, n_v)
+            demands = {}
+            for attr in self.get_link_resource_types():
+                demand = float(edge_attrs.get(attr, 0.0))
+                if demand > 0.0:
+                    demands[attr] = demand
+            if demands:
+                link_requirements.append((p_neighbor, demands))
+        return link_requirements
+
+    def _has_reachable_path(self, p_src: int, p_dst: int, demands: dict) -> bool:
+        """Cheap reachability check with residual capacity constraints."""
+        if p_src == p_dst:
+            return True
+        if not demands:
+            return True
+        if p_src not in self._original_p_net or p_dst not in self._original_p_net:
+            return False
+        visited = set([p_src])
+        queue = deque([p_src])
+        while queue:
+            u = queue.popleft()
+            for v in self._original_p_net.adj[u]:
+                if v in visited:
+                    continue
+                edge = self.p_net.links[(u, v)]
+                ok = True
+                for attr, demand in demands.items():
+                    if demand <= 0.0:
+                        continue
+                    available = edge.get(attr, 0.0)
+                    if available + 1e-8 < demand:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                if v == p_dst:
+                    return True
+                visited.add(v)
+                queue.append(v)
+        return False
+
+    def _filter_candidates_by_reachability(self, v_target: int, candidates: list) -> list:
+        link_requirements = self._build_link_requirements(v_target)
+        if not link_requirements:
+            return candidates
+        filtered = []
+        for p_node_id in candidates:
+            reachable = True
+            for p_neighbor, demands in link_requirements:
+                if not self._has_reachable_path(p_node_id, p_neighbor, demands):
+                    reachable = False
+                    break
+            if reachable:
+                filtered.append(p_node_id)
+        return filtered
         
     def get_available_resources(self, element_type: str, element_id: int, attr_name: str) -> float:
         """Get currently available resources accounting for allocations"""
@@ -303,6 +382,7 @@ class State:
             v_node_id=v_target, 
             filter=self.selected_p_net_nodes,
             check_link_constraint=False)
+        candidate_p_nodes = self._filter_candidates_by_reachability(v_target, list(candidate_p_nodes))
 
         reject_action_id = self._original_p_net.num_nodes
         candidate_with_reject = list(candidate_p_nodes)
@@ -325,6 +405,7 @@ class State:
             filter=self.selected_p_net_nodes,
             check_link_constraint=False,
         )
+        candidate_p_nodes = self._filter_candidates_by_reachability(v_target, list(candidate_p_nodes))
 
         # Include explicit REJECT action only if solver allows it
         reject_action_id = self._original_p_net.num_nodes

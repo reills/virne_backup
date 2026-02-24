@@ -213,8 +213,12 @@ class Critic(nn.Module):
             vnfs_remaining=vnfs_remaining,
         )
         seq_summary = decoder_outputs.mean(dim=1)
-        # Single graph mean pool
-        graph_summary = graph_embedding.mean(dim=0, keepdim=True)
+        batch_size = history_features.size(0)
+        if batch_size > 1:
+            num_nodes = graph_embedding.size(0) // batch_size
+            graph_summary = graph_embedding.view(batch_size, num_nodes, -1).mean(dim=1)
+        else:
+            graph_summary = graph_embedding.mean(dim=0, keepdim=True)
         combined = torch.cat([seq_summary, graph_summary], dim=-1)
         return self.value_head(combined)
 
@@ -518,33 +522,42 @@ class AutoregressiveDecoder(nn.Module):
         if return_last_embed or not self.is_actor:
             return final_context_embedding
 
-        # Cross-attend to nodes (single graph batch)
+        batch_size = history_features.size(0)
         node_batch = p_net_batch
-        padded_nodes = graph_embedding.unsqueeze(0)
-        node_padding_mask = torch.zeros((1, graph_embedding.size(0)), dtype=torch.bool, device=graph_embedding.device)
-
-        query = final_context_embedding.unsqueeze(0)
-        key = value = padded_nodes.transpose(0, 1)
-        attn_output, _ = self.node_cross_attention(query=query, key=key, value=value, key_padding_mask=node_padding_mask)
-        attn_context = attn_output.squeeze(0)
-        attn_context_per_node = attn_context.index_select(0, node_batch)
+        if batch_size > 1:
+            num_nodes = graph_embedding.size(0) // batch_size
+            graph_embedding = graph_embedding.view(batch_size, num_nodes, -1)
+            node_padding_mask = torch.zeros((batch_size, num_nodes), dtype=torch.bool, device=graph_embedding.device)
+            query = final_context_embedding.unsqueeze(0)  # [1, B, D]
+            key = value = graph_embedding.transpose(0, 1)  # [N, B, D]
+            attn_output, _ = self.node_cross_attention(query=query, key=key, value=value, key_padding_mask=node_padding_mask)
+            attn_context = attn_output.squeeze(0)  # [B, D]
+            attn_context_per_node = attn_context.index_select(0, node_batch)
+            graph_embedding_flat = graph_embedding.reshape(batch_size * num_nodes, -1)
+        else:
+            padded_nodes = graph_embedding.unsqueeze(0)
+            node_padding_mask = torch.zeros((1, graph_embedding.size(0)), dtype=torch.bool, device=graph_embedding.device)
+            query = final_context_embedding.unsqueeze(0)
+            key = value = padded_nodes.transpose(0, 1)
+            attn_output, _ = self.node_cross_attention(query=query, key=key, value=value, key_padding_mask=node_padding_mask)
+            attn_context = attn_output.squeeze(0)
+            attn_context_per_node = attn_context.index_select(0, node_batch)
+            graph_embedding_flat = graph_embedding
 
         # Compute node scores
         combined = torch.cat([
-            F.normalize(graph_embedding, dim=-1, eps=1e-6),
+            F.normalize(graph_embedding_flat, dim=-1, eps=1e-6),
             F.normalize(attn_context_per_node, dim=-1, eps=1e-6),
         ], dim=-1)
         node_scores = self.node_score_head(combined).squeeze(-1)
 
         # Assemble final logits for physical nodes
         raw_logits_nodes = torch.full(
-            (1, self.p_net_num_nodes), -20.0, device=node_scores.device, dtype=node_scores.dtype
+            (batch_size, self.p_net_num_nodes), -20.0, device=node_scores.device, dtype=node_scores.dtype
         )
-        nodes_to_consider = node_scores.size(0)
-        if nodes_to_consider > self.num_actions:
-            nodes_to_consider = self.num_actions
-        if nodes_to_consider > 0:
-            raw_logits_nodes[0, :nodes_to_consider] = node_scores[:nodes_to_consider]
+        nodes_to_consider = node_scores.view(batch_size, -1)
+        nodes_to_consider = nodes_to_consider[:, : self.p_net_num_nodes]
+        raw_logits_nodes[:, : nodes_to_consider.size(1)] = nodes_to_consider
 
         if self.is_actor and self.allow_rejection and self.reject_head is not None:
             reject_logit = self.reject_head(final_context_embedding)
@@ -577,6 +590,11 @@ class ActorCriticScriptWrapper(nn.Module):
         """Encode virtual network features."""
         return self.model.encoder(v_net_x)
 
+    @torch.jit.export
+    def get_start_embedding(self) -> torch.Tensor:
+        """Expose decoder start embedding for C++ replay parity."""
+        return self.model.actor.decoder.start_embedding
+
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute policy logits and value from tensor inputs.
 
@@ -595,15 +613,19 @@ class ActorCriticScriptWrapper(nn.Module):
         vnfs_remaining = inputs["vnfs_remaining"]
         action_mask = inputs["action_mask"]
 
-        history_len = selected_p_nodes.size(0) + 1
-        history_features = torch.zeros(
-            (1, history_len, p_net_x.size(1)),
-            device=p_net_x.device,
-            dtype=p_net_x.dtype,
-        )
-        history_features[0, 0, :] = self.model.actor.decoder.start_embedding.to(p_net_x.dtype)
-        gathered = torch.index_select(p_net_x, 0, selected_p_nodes)
-        history_features[0, 1:history_len, :] = gathered
+        if "history_features" in inputs:
+            history_features = inputs["history_features"]
+        else:
+            history_len = selected_p_nodes.size(0) + 1
+            history_features = torch.zeros(
+                (1, history_len, p_net_x.size(1)),
+                device=p_net_x.device,
+                dtype=p_net_x.dtype,
+            )
+            history_features[0, 0, :] = self.model.actor.decoder.start_embedding.to(p_net_x.dtype)
+            if selected_p_nodes.numel() > 0:
+                gathered = torch.index_select(p_net_x, 0, selected_p_nodes)
+                history_features[0, 1:history_len, :] = gathered
 
         logits = self.model.actor.decoder.forward_from_tensors(
             p_net_x=p_net_x,

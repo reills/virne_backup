@@ -1,6 +1,7 @@
 #include "policy_network.hpp"
 
 #include <torch/torch.h>
+#include <c10/core/InferenceMode.h>
 
 #include <stdexcept>
 
@@ -22,8 +23,17 @@ torch::Tensor PolicyNetwork::encode(const torch::Tensor& v_net_x) {
     if (!loaded_) {
         throw std::runtime_error("PolicyNetwork::encode called before load().");
     }
-    torch::NoGradGuard no_grad;
+    c10::InferenceMode guard;
     auto output = module_.run_method("encode", v_net_x.to(device_));
+    return output.toTensor().detach();
+}
+
+torch::Tensor PolicyNetwork::start_embedding() {
+    if (!loaded_) {
+        throw std::runtime_error("PolicyNetwork::start_embedding called before load().");
+    }
+    c10::InferenceMode guard;
+    auto output = module_.run_method("get_start_embedding");
     return output.toTensor().detach();
 }
 
@@ -32,7 +42,7 @@ EvaluationResult PolicyNetwork::evaluate(const StateView::TensorMap& inputs) {
         throw std::runtime_error("PolicyNetwork::evaluate called before load().");
     }
 
-    torch::NoGradGuard no_grad;
+    c10::InferenceMode guard;
     c10::Dict<std::string, torch::Tensor> dict;
     dict.reserve(inputs.size());
     for (const auto& [key, value] : inputs) {

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import List
 
 import numpy as np
@@ -151,12 +152,35 @@ class OptimizedAlphaZeroActor(Solver):
         )
 
         # Initialize MCTSEngine
+        value_norm = "tanh"
+        value_scale = 1000.0
+        try:
+            cfg_obj = getattr(config, "training", None)
+            if isinstance(cfg_obj, dict):
+                value_norm = cfg_obj.get("value_normalization", value_norm)
+                value_scale = float(cfg_obj.get("value_scale", value_scale))
+            elif cfg_obj is not None:
+                value_norm = getattr(cfg_obj, "value_normalization", value_norm)
+                value_scale = float(getattr(cfg_obj, "value_scale", value_scale))
+        except Exception:
+            pass
         self.mcts_engine = MCTSEngine(
             node_expander=self.node_expander,
             computation_budget=self.computation_budget,
             c_puct=self.c_puct,
-            logger=self.logger
+            logger=self.logger,
+            value_normalization=value_norm,
+            value_scale=value_scale,
         )
+
+        # Timing sync flag (for accurate GPU timings in benchmarks)
+        self._sync_cuda_timing = False
+        try:
+            if bool(getattr(config.experiment, 'gpu_synchronize_timing', True)):
+                self._sync_cuda_timing = bool(getattr(config.training, 'use_cuda', False))
+        except Exception:
+            self._sync_cuda_timing = False
+        self.node_expander.sync_cuda_timing = bool(self._sync_cuda_timing)
 
         # Caches used during one solve episode
         self._p_data = None
@@ -177,11 +201,14 @@ class OptimizedAlphaZeroActor(Solver):
         self.cpp_full_solver = None
         training_cfg = getattr(config, "training", None)
         use_cpp_flag = False
+        self.pure_cpp = False
         if training_cfg is not None:
             if isinstance(training_cfg, dict):
                 use_cpp_flag = bool(training_cfg.get("use_cpp_mcts", False))
+                self.pure_cpp = bool(training_cfg.get("pure_cpp", False))
             else:
                 use_cpp_flag = bool(getattr(training_cfg, "use_cpp_mcts", False))
+                self.pure_cpp = bool(getattr(training_cfg, "pure_cpp", False))
 
         if use_cpp_flag:
             try:
@@ -228,15 +255,41 @@ class OptimizedAlphaZeroActor(Solver):
 
         from virne.solver.learning.utils import load_pyg_data_from_network
 
+        solve_start = time.perf_counter()
+        timers = {
+            "encode_ms": 0.0,
+            "build_inputs_ms": 0.0,
+            "policy_eval_ms": 0.0,
+            "candidate_ms": 0.0,
+            "mcts_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "link_ms": 0.0,
+            "traj_ms": 0.0,
+            "total_simulations": 0,
+        }
+        self.node_expander.set_timers(timers)
+
         # Keep data on CPU for pickle-safe IPC with batched GPU worker
         self._p_data = load_pyg_data_from_network(p_net)
         self._v_data = load_pyg_data_from_network(v_net)
 
         if self.use_neural_network or self.cpp_adapter is None:
             # Compute encoder outputs once per episode (required for NN-guided policies)
+            if self._sync_cuda_timing and self.device.type == 'cuda':
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+            t_encode = time.perf_counter()
             v_data_gpu = self._v_data.to(self.device)
             encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
             self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
+            if self._sync_cuda_timing and self.device.type == 'cuda':
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+            timers["encode_ms"] += (time.perf_counter() - t_encode) * 1000.0
             # Set episode data in observation builder
             self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
         else:
@@ -277,84 +330,123 @@ class OptimizedAlphaZeroActor(Solver):
             # Pass actual virtual node id for current position
             next_pos = current_node.state.v_node_id + 1
             curr_v_id = current_node.state.v_order[next_pos]
+            t_mcts = time.perf_counter()
             self.search(current_node, curr_v_id)
-            # Log prior quality at root (feasible entropy and top5)
-            self._log_root_prior_stats(current_node, current_node.state, curr_v_id)
-
-            # Periodic CUDA mem log
+            timers["mcts_ms"] += (time.perf_counter() - t_mcts) * 1000.0
             try:
-                import time
-                now = time.time()
-                if self.device.type == 'cuda' and now - self._last_cuda_log_ts > 10.0:
-                    mem_alloc = torch.cuda.memory_allocated(self.device)
-                    mem_res = torch.cuda.memory_reserved(self.device)
-                    self.logger.info(f"Actor CUDA memory: alloc={mem_alloc/1e6:.1f}MB reserved={mem_res/1e6:.1f}MB")
-                    self._last_cuda_log_ts = now
+                timers["total_simulations"] += sum(child.visit_times for child in current_node.children)
             except Exception:
                 pass
-            # Select the best child based on visit counts with appropriate temperature
+            # Log prior quality at root (feasible entropy and top5) + postprocess timing
+            post_start = time.perf_counter()
             try:
-                best_child = self._select_best_child(current_node, temperature=temperature)
-            except ValueError as exc:
-                solution["place_result"] = False
-                self.logger.warning(
-                    f"MCTS search produced zero-visit children for v_node={curr_v_id} "
-                    f"(step={current_node.state.v_node_id + 1}): {exc}"
-                )
-                break
-            if best_child is None:
-                solution["place_result"] = False
-                self.logger.warning(
-                    f"MCTS failed to select child for v_node={curr_v_id} "
-                    f"(step={current_node.state.v_node_id + 1})"
-                )
-                break
+                self._log_root_prior_stats(current_node, current_node.state, curr_v_id)
 
-            # Handle REJECT action (always at index p_net.num_nodes)
-            reject_idx = self._state_num_nodes(current_node.state)
-            if allow_rejection and best_child.state.p_node_id == reject_idx:
-                solution["place_result"] = False
-                solution["rejected"] = True
-                current_node = best_child  # advance to terminal rejected state for reward consistency
-                break
-            # Guard against invalid action (-1 or out of range). This can happen when a child
-            # has been marked terminal-bad by incremental feasibility checks.
-            if best_child.state.p_node_id < 0 or best_child.state.p_node_id >= reject_idx:
-                solution["place_result"] = False
-                self.logger.warning(
-                    f"Selected child with invalid p_node_id={best_child.state.p_node_id} "
-                    f"(reject_idx={reject_idx}) for v_node={curr_v_id}"
-                )
-                self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
-                break
+                # Periodic CUDA mem log
+                try:
+                    now = time.time()
+                    if self.device.type == 'cuda' and now - self._last_cuda_log_ts > 10.0:
+                        mem_alloc = torch.cuda.memory_allocated(self.device)
+                        mem_res = torch.cuda.memory_reserved(self.device)
+                        self.logger.info(f"Actor CUDA memory: alloc={mem_alloc/1e6:.1f}MB reserved={mem_res/1e6:.1f}MB")
+                        self._last_cuda_log_ts = now
+                except Exception:
+                    pass
 
-            # Store the action taken using stable ordering
-            placed_v = curr_v_id
-            solution["node_slots"].update({placed_v: best_child.state.p_node_id})
-            
-            # Create timestep data using the current root (before moving to child)
-            if not self.disable_trajectory_writing:
-                timestep_data = self._create_timestep_data(current_node, curr_v_id, best_child.state.p_node_id)
-                trajectory.append(timestep_data)
-            
-            # Promote the best child as the new root for next iteration
-            # Detach from parent to avoid memory buildup
-            best_child.parent = None
-            current_node = best_child
+                # Select the best child based on visit counts with appropriate temperature
+                try:
+                    best_child = self._select_best_child(current_node, temperature=temperature)
+                except ValueError as exc:
+                    solution["place_result"] = False
+                    self.logger.warning(
+                        f"MCTS search produced zero-visit children for v_node={curr_v_id} "
+                        f"(step={current_node.state.v_node_id + 1}): {exc}"
+                    )
+                    break
+                if best_child is None:
+                    solution["place_result"] = False
+                    self.logger.warning(
+                        f"MCTS failed to select child for v_node={curr_v_id} "
+                        f"(step={current_node.state.v_node_id + 1})"
+                    )
+                    break
+
+                # Handle REJECT action (always at index p_net.num_nodes)
+                reject_idx = self._state_num_nodes(current_node.state)
+                if allow_rejection and best_child.state.p_node_id == reject_idx:
+                    solution["place_result"] = False
+                    solution["rejected"] = True
+                    current_node = best_child  # advance to terminal rejected state for reward consistency
+                    break
+                # Guard against invalid action (-1 or out of range). This can happen when a child
+                # has been marked terminal-bad by incremental feasibility checks.
+                if best_child.state.p_node_id < 0 or best_child.state.p_node_id >= reject_idx:
+                    solution["place_result"] = False
+                    self.logger.warning(
+                        f"Selected child with invalid p_node_id={best_child.state.p_node_id} "
+                        f"(reject_idx={reject_idx}) for v_node={curr_v_id}"
+                    )
+                    self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
+                    break
+
+                # Store the action taken using stable ordering
+                placed_v = curr_v_id
+                solution["node_slots"].update({placed_v: best_child.state.p_node_id})
+
+                # Create timestep data using the current root (before moving to child)
+                if not self.disable_trajectory_writing:
+                    t_traj = time.perf_counter()
+                    timestep_data = self._create_timestep_data(current_node, curr_v_id, best_child.state.p_node_id)
+                    timers["traj_ms"] += (time.perf_counter() - t_traj) * 1000.0
+                    trajectory.append(timestep_data)
+
+                # Promote the best child as the new root for next iteration
+                # Detach from parent to avoid memory buildup
+                best_child.parent = None
+                current_node = best_child
+            finally:
+                timers["postprocess_ms"] += (time.perf_counter() - post_start) * 1000.0
 
         if solution.get("place_result", True) and not solution.get("rejected", False):
+            t_link = time.perf_counter()
             link_ok = self.controller.link_mapper.link_mapping(
                 v_net, p_net, solution=solution,
                 shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
             if not link_ok:
                 solution["route_result"] = False
+            timers["link_ms"] += (time.perf_counter() - t_link) * 1000.0
         # Set final result flag for accurate reward accounting
         solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
 
         # Store episode only if enabled
         if not self.disable_trajectory_writing:
             final_reward = self._compute_final_reward(solution, v_net, p_net)
+            t_store = time.perf_counter()
             self._store_episode_new_format(static_environment, trajectory, final_reward)
+            timers["traj_ms"] += (time.perf_counter() - t_store) * 1000.0
+
+        if self.logger is not None:
+            try:
+                steps = len(solution.get("node_slots", {})) if isinstance(solution, dict) else len(solution["node_slots"])
+            except Exception:
+                steps = 0
+            total_ms = (time.perf_counter() - solve_start) * 1000.0
+            self.logger.info(
+                "Python solve metrics: steps=%s sims=%s total_time_ms=%.2f "
+                "encode_ms=%.2f build_inputs_ms=%.2f policy_eval_ms=%.2f candidate_ms=%.2f "
+                "mcts_ms=%.2f postprocess_ms=%.2f link_ms=%.2f traj_ms=%.2f",
+                steps,
+                int(timers.get("total_simulations", 0)),
+                total_ms,
+                float(timers.get("encode_ms", 0.0)),
+                float(timers.get("build_inputs_ms", 0.0)),
+                float(timers.get("policy_eval_ms", 0.0)),
+                float(timers.get("candidate_ms", 0.0)),
+                float(timers.get("mcts_ms", 0.0)),
+                float(timers.get("postprocess_ms", 0.0)),
+                float(timers.get("link_ms", 0.0)),
+                float(timers.get("traj_ms", 0.0)),
+            )
             
         return solution
 
@@ -812,17 +904,38 @@ class OptimizedAlphaZeroActor(Solver):
         if training is None:
             training = not self.disable_trajectory_writing
 
+        pure_cpp = bool(self.pure_cpp)
         static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
 
-        cpp_result = self.cpp_full_solver.solve(p_net, v_net, training=training)
+        max_buffer_size = 500000
+        training_cfg = getattr(self.config, "training", None)
+        if isinstance(training_cfg, dict):
+            max_buffer_size = int(training_cfg.get("replay_buffer_max_size", max_buffer_size))
+        elif training_cfg is not None:
+            max_buffer_size = int(getattr(training_cfg, "replay_buffer_max_size", max_buffer_size))
+
+        cpp_result = self.cpp_full_solver.solve(
+            p_net,
+            v_net,
+            training=training,
+            pure_cpp=pure_cpp,
+            replay_dir=self.replay_dir,
+            max_buffer_size=max_buffer_size,
+        )
         metrics = cpp_result.get("metrics", {}) if isinstance(cpp_result, dict) else {}
         if metrics:
             try:
                 metrics = dict(metrics)
             except Exception:
                 pass
-        if metrics and self.logger is not None:
+        if self.logger is not None:
             try:
+                steps = metrics.get("steps", None)
+                if steps is None:
+                    steps = len(cpp_result.get("actions", [])) if isinstance(cpp_result, dict) else 0
+                sims = metrics.get("total_simulations", None)
+                if sims is None:
+                    sims = 0
                 total_ms = float(metrics.get("total_time_ms") or 0.0)
                 encode_ms = float(metrics.get("encode_ms") or 0.0)
                 build_ms = float(metrics.get("build_inputs_ms") or 0.0)
@@ -832,8 +945,8 @@ class OptimizedAlphaZeroActor(Solver):
                 self.logger.info(
                     "C++ solve metrics: steps=%s sims=%s total_time_ms=%.2f "
                     "encode_ms=%.2f build_inputs_ms=%.2f policy_eval_ms=%.2f mcts_ms=%.2f postprocess_ms=%.2f",
-                    metrics.get("steps"),
-                    metrics.get("total_simulations"),
+                    steps,
+                    sims,
                     total_ms,
                     encode_ms,
                     build_ms,
@@ -848,13 +961,68 @@ class OptimizedAlphaZeroActor(Solver):
         values = list(cpp_result.get("values", []))
         rejected = bool(cpp_result.get("rejected", False))
         place_result = bool(cpp_result.get("place_result", True))
+        route_result = cpp_result.get("route_result", None)
+        cpp_place_info = cpp_result.get("place_info", {})
+        cpp_place_v = cpp_result.get("place_v_node_id", None)
+        cpp_place_p = cpp_result.get("place_p_node_id", None)
+        replay_written = bool(cpp_result.get("replay_written", False))
+        replay_error = cpp_result.get("replay_error", None)
+        cpp_node_slots = cpp_result.get("node_slots", None)
+        cpp_link_paths = cpp_result.get("link_paths", None)
+        cpp_link_paths_info = cpp_result.get("link_paths_info", None)
 
         solution = Solution.from_v_net(v_net)
         if metrics:
             solution["cpp_metrics"] = metrics
-        trajectory: List[dict] = [] if not self.disable_trajectory_writing else None
+        build_trajectory = (not self.disable_trajectory_writing) and (not pure_cpp or not replay_written)
+        trajectory: List[dict] = [] if build_trajectory else None
+        if pure_cpp and not replay_written and not self.disable_trajectory_writing:
+            try:
+                self.logger.warning(f"C++ replay write failed, falling back to Python reconstruction: {replay_error}")
+            except Exception:
+                pass
+
+        use_cpp_link_mapping = isinstance(cpp_link_paths, dict) and isinstance(cpp_link_paths_info, dict)
+        if not build_trajectory and pure_cpp and isinstance(cpp_node_slots, (list, tuple)):
+            # Use C++ outputs directly (no Python reconstruction).
+            solution["selected_actions"] = list(actions)
+            for v_id, p_id in enumerate(cpp_node_slots):
+                if p_id is None or p_id < 0:
+                    continue
+                solution["node_slots"].update({v_id: p_id})
+                used_node_resources = {
+                    attr.name: v_net.nodes[v_id].get(attr.name, 0.0)
+                    for attr in getattr(self.controller, "node_resource_attrs", [])
+                }
+                solution["node_slots_info"][(v_id, p_id)] = used_node_resources
+
+            if rejected:
+                solution["place_result"] = False
+                solution["rejected"] = True
+            else:
+                solution["place_result"] = place_result
+
+            if use_cpp_link_mapping:
+                solution["link_paths"] = cpp_link_paths
+                solution["link_paths_info"] = cpp_link_paths_info
+                solution["route_result"] = bool(route_result) if route_result is not None else True
+            else:
+                solution["route_result"] = False
+
+            solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
+            return solution
 
         # Rebuild trajectory with Python observations for replay compatibility
+        if build_trajectory:
+            from virne.solver.learning.utils import load_pyg_data_from_network
+            # Keep data on CPU for serialization safety
+            self._p_data = load_pyg_data_from_network(p_net)
+            self._v_data = load_pyg_data_from_network(v_net)
+            v_data_gpu = self._v_data.to(self.device)
+            encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
+            self._encoder_outputs = encoder_outputs_gpu.cpu()
+            self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+
         state = State(
             p_net,
             v_net,
@@ -881,19 +1049,13 @@ class OptimizedAlphaZeroActor(Solver):
             curr_v_id = state.v_order[next_pos]
 
             solution["node_slots"].update({curr_v_id: action_taken})
-            # Apply placement to the Python controller/p_net for correctness and cost accounting.
-            place_ok, place_info = self.controller.node_mapper.place(
-                v_net, p_net, curr_v_id, action_taken, solution=solution
-            )
-            if not place_ok:
-                self.logger.warning(
-                    f"C++ placement rejected by controller v_node={curr_v_id} -> "
-                    f"p_node={action_taken} offsets={place_info}"
-                )
-                place_result = False
-                break
+            used_node_resources = {
+                attr.name: v_net.nodes[curr_v_id].get(attr.name, 0.0)
+                for attr in getattr(self.controller, "node_resource_attrs", [])
+            }
+            solution["node_slots_info"][(curr_v_id, action_taken)] = used_node_resources
 
-            if not self.disable_trajectory_writing:
+            if build_trajectory:
                 obs = self._state_to_obs(state, curr_v_id)
                 obs_cpu = self._obs_to_cpu(obs)
 
@@ -921,6 +1083,14 @@ class OptimizedAlphaZeroActor(Solver):
 
             state = state.next_state(action_taken)
             if state.p_node_id == -1:
+                if cpp_place_info:
+                    try:
+                        self.logger.warning(
+                            f"C++ placement rejected v_node={cpp_place_v} -> p_node={cpp_place_p} "
+                            f"offsets={cpp_place_info}"
+                        )
+                    except Exception:
+                        pass
                 place_result = False
                 break
 
@@ -931,14 +1101,19 @@ class OptimizedAlphaZeroActor(Solver):
             solution["place_result"] = place_result
 
         if solution.get("place_result", True) and not solution.get("rejected", False):
-            link_ok = self.controller.link_mapper.link_mapping(
-                v_net, p_net, solution=solution,
-                shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
-            if not link_ok:
-                solution["route_result"] = False
+            if use_cpp_link_mapping:
+                solution["link_paths"] = cpp_link_paths
+                solution["link_paths_info"] = cpp_link_paths_info
+                solution["route_result"] = bool(route_result) if route_result is not None else True
+            else:
+                link_ok = self.controller.link_mapper.link_mapping(
+                    v_net, p_net, solution=solution,
+                    shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
+                if not link_ok:
+                    solution["route_result"] = False
         solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
 
-        if not self.disable_trajectory_writing:
+        if not self.disable_trajectory_writing and build_trajectory:
             final_reward = self._compute_final_reward(solution, v_net, p_net)
             self._store_episode_new_format(static_environment, trajectory, final_reward)
 

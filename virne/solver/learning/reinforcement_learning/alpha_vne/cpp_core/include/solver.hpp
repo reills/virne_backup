@@ -8,6 +8,7 @@
 #include <torch/torch.h>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace azsfc {
@@ -29,7 +30,16 @@ struct SolveResult {
     std::vector<float> values;
     bool rejected{false};
     bool place_result{true};
+    bool route_result{true};
+    std::vector<int> node_slots;
+    std::unordered_map<std::string, double> place_info;
+    int place_v_node_id{-1};
+    int place_p_node_id{-1};
     float final_reward{0.0f};
+    bool replay_written{false};
+    std::string replay_path;
+    std::string replay_error;
+    std::vector<VNRState::LinkPathRecord> link_mapping;
     SolveMetrics metrics;
 };
 
@@ -39,11 +49,15 @@ SolveResult solve_vnr(
     const VNRConfig& vnr_config,
     const SearchConfig& search_config,
     const std::string& policy_path,
+    const std::string& policy_meta_path,
     const std::string& device,
     std::optional<unsigned int> seed,
     float temperature,
     bool use_nn_policy,
-    bool use_nn_value
+    bool use_nn_value,
+    bool write_replay,
+    const std::string& replay_dir,
+    int max_buffer_size
 );
 
 }  // namespace azsfc

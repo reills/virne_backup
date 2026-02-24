@@ -28,7 +28,9 @@ class MCTSEngine:
         node_expander: NodeExpander,
         computation_budget: int = 5,
         c_puct: float = 1.0,
-        logger=None
+        logger=None,
+        value_normalization: str = "tanh",
+        value_scale: float = 1000.0,
     ):
         """Initialize MCTSEngine.
 
@@ -42,6 +44,20 @@ class MCTSEngine:
         self.computation_budget = computation_budget
         self.c_puct = c_puct
         self.logger = logger
+        self.value_normalization = value_normalization or "raw"
+        self.value_scale = float(value_scale) if value_scale is not None else 1000.0
+
+    def _normalize_terminal_value(self, value: float) -> float:
+        mode = (self.value_normalization or "raw").lower()
+        if mode == "sign":
+            return 1.0 if value > 0 else -1.0
+        if mode == "tanh":
+            scale = self.value_scale if self.value_scale not in (0.0, -0.0) else 1.0
+            try:
+                return float(np.tanh(value / scale))
+            except Exception:
+                return float(np.tanh(value))
+        return float(value)
 
     def search(self, root_node: Node, v_node_id: int) -> None:
         """Run MCTS search from root node.
@@ -93,7 +109,7 @@ class MCTSEngine:
         # 3. Backup - terminal uses true reward (z), non-terminal uses NN value (v_θ)
         if node.state.is_terminal():
             # Terminal nodes: use true final reward (z)
-            value = node.state.compute_final_reward()
+            value = self._normalize_terminal_value(node.state.compute_final_reward())
         else:
             # Non-terminal leaf: use NN value (v_θ) cached during expansion
             value = node.leaf_value if node.leaf_value is not None else 0.0
