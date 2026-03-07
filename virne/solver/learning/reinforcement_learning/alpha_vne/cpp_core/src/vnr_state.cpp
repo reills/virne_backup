@@ -712,6 +712,17 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         }
     }
 
+    // Fallback: if k-shortest produced no feasible path, try capacity-aware search
+    std::vector<int> fallback_path_storage;
+    if (selected_path == nullptr && method != "available_shortest") {
+        auto fallback_paths = path_finder_.find_paths(
+            *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
+        if (!fallback_paths.empty() && fallback_paths[0].nodes.size() >= 2) {
+            fallback_path_storage = std::move(fallback_paths[0].nodes);
+            selected_path = &fallback_path_storage;
+        }
+    }
+
     if (selected_path == nullptr) {
         return false;
     }
@@ -918,6 +929,80 @@ VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_
             result.records.push_back(std::move(record));
             selected = true;
             break;
+        }
+
+        // Fallback: if k-shortest produced no feasible path, try capacity-aware search
+        if (!selected && method != "available_shortest") {
+            auto fallback_paths = path_finder_.find_paths(
+                *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
+            for (const auto& candidate : fallback_paths) {
+                if (candidate.nodes.size() < 2) {
+                    continue;
+                }
+                auto links = path_to_links(candidate.nodes);
+                bool feasible = true;
+                for (const auto& [u, v] : links) {
+                    auto p_edge_it = p_net_->edge_index.find({u, v});
+                    if (p_edge_it == p_net_->edge_index.end()) {
+                        feasible = false;
+                        break;
+                    }
+                    int edge_id = p_edge_it->second;
+                    for (const auto& name : resource_names) {
+                        double demand = demands[name];
+                        if (demand <= 0.0) {
+                            continue;
+                        }
+                        if (capacity_fn(edge_id, name) + kEpsilon < demand) {
+                            feasible = false;
+                            break;
+                        }
+                    }
+                    if (!feasible) {
+                        break;
+                    }
+                }
+
+                if (!feasible) {
+                    continue;
+                }
+
+                LinkPathRecord record;
+                record.v_src = v_src;
+                record.v_dst = v_dst;
+                record.p_links = links;
+                record.p_link_resources.reserve(links.size());
+
+                for (const auto& [u, v] : links) {
+                    auto p_edge_it = p_net_->edge_index.find({u, v});
+                    if (p_edge_it == p_net_->edge_index.end()) {
+                        feasible = false;
+                        break;
+                    }
+                    int edge_id = p_edge_it->second;
+                    ResourceMap used_map;
+                    used_map.reserve(resource_names.size());
+                    for (const auto& name : resource_names) {
+                        double demand = demands[name];
+                        used_map[name] = demand;
+                        if (demand > 0.0) {
+                            auto idx_it = resource_index.find(name);
+                            if (idx_it != resource_index.end()) {
+                                used[static_cast<std::size_t>(edge_id)][idx_it->second] += demand;
+                            }
+                            result.total_link_cost += demand;
+                        }
+                    }
+                    record.p_link_resources.push_back(std::move(used_map));
+                }
+                if (!feasible) {
+                    continue;
+                }
+
+                result.records.push_back(std::move(record));
+                selected = true;
+                break;
+            }
         }
 
         if (!selected) {

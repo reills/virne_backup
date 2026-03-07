@@ -38,6 +38,7 @@ training:
   use_nn_policy: true
   use_nn_value: true
   uniform_prior: false
+  value_normalization: sign    # 'sign' | 'tanh' | 'raw'
   # Execution mode toggles
   inference_only: false        # Skip learner/training loop and run inference-only
   enable_async_learner: true   # Disable to prevent spawning background learner

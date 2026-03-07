@@ -188,6 +188,19 @@ class LinkMapper:
                     self.resource_updator.update_link_resources(p_net, p_link, used_link_resources, operator='-', safe=True)
                     solution['link_paths_info'][(v_link, p_link)] = used_link_resources
                 return True, check_info
+        # Fallback: if k-shortest produced no feasible path, try capacity-aware search
+        if shortest_method not in ('available_shortest', 'bfs_shortest'):
+            fallback_paths = self.topology_analyzer.find_shortest_paths(v_net, p_net, v_link, pl_pair, method='available_shortest', k=1)
+            for p_path in fallback_paths:
+                check_result, check_info = self.constraint_checker.check_path_level_constraints(v_net, p_net, v_link, p_path)
+                if check_result:
+                    p_links = path_to_links(p_path)
+                    solution['link_paths'][v_link] = p_links
+                    for p_link in p_links:
+                        used_link_resources = {l_attr.name: v_net.links[v_link][l_attr.name] for l_attr in self.link_resource_attrs}
+                        self.resource_updator.update_link_resources(p_net, p_link, used_link_resources, operator='-', safe=True)
+                        solution['link_paths_info'][(v_link, p_link)] = used_link_resources
+                    return True, check_info
         return False, check_info
 
     def _unsafely_route(

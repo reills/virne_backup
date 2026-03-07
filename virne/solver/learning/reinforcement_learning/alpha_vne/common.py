@@ -47,12 +47,16 @@ def state_to_obs(
         else:
             target_v_node_id = next_pos
     
-    candidate_nodes = controller.find_candidate_nodes(
-        v_net=state.v_net,
-        p_net=state.p_net,
-        v_node_id=target_v_node_id,
-        filter=state.selected_p_net_nodes,
-    )
+    if hasattr(state, "get_candidate_node_ids"):
+        candidate_nodes = state.get_candidate_node_ids(v_target=target_v_node_id)
+    else:
+        candidate_nodes = controller.find_candidate_nodes(
+            v_net=state.v_net,
+            p_net=state.p_net,
+            v_node_id=target_v_node_id,
+            filter=state.selected_p_net_nodes,
+            check_link_constraint=False,
+        )
     num_actions = getattr(policy.actor.decoder, 'num_actions', None)
     if num_actions is None:
         num_actions = p_data.num_nodes
@@ -65,10 +69,6 @@ def state_to_obs(
     curr_step_idx = len(state.selected_p_net_nodes)
     # Remaining vnfs by step count (independent of virtual id values)
     vnfs_remaining = max(state.v_net.num_nodes - (curr_step_idx + 1), 0)
-
-    # If REJECT action exists, mark it as valid
-    if num_actions > p_data.num_nodes:
-        action_mask[0, p_data.num_nodes] = True
 
     obs = {
         "p_net": p_data,

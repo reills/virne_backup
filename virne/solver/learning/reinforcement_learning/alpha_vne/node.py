@@ -197,6 +197,42 @@ class State:
             if reachable:
                 filtered.append(p_node_id)
         return filtered
+
+    def get_candidate_node_ids(
+        self,
+        v_target: int | None = None,
+        include_reject: bool = True,
+        include_invalid_fallback: bool = True,
+    ) -> list:
+        """Canonical candidate action IDs aligned with C++ get_candidate_nodes()."""
+        if v_target is None:
+            next_pos = self.v_node_id + 1
+            if next_pos < 0 or next_pos >= len(self.v_order):
+                # Terminal: mirror C++ behavior (reject only when enabled, else empty list).
+                if include_reject and getattr(self, "allow_rejection", False):
+                    return [self._original_p_net.num_nodes]
+                return []
+            v_target = self.v_order[next_pos]
+        elif v_target < 0 or v_target >= self.v_net.num_nodes:
+            if include_reject and getattr(self, "allow_rejection", False):
+                return [self._original_p_net.num_nodes]
+            return []
+
+        candidate_p_nodes = self.controller.find_candidate_nodes(
+            v_net=self.v_net,
+            p_net=self.p_net,
+            v_node_id=v_target,
+            filter=self.selected_p_net_nodes,
+            check_link_constraint=False,
+        )
+        candidates = self._filter_candidates_by_reachability(v_target, list(candidate_p_nodes))
+
+        if include_reject and getattr(self, "allow_rejection", False):
+            candidates.append(self._original_p_net.num_nodes)
+
+        if include_invalid_fallback and not candidates:
+            candidates = [-1]
+        return candidates
         
     def get_available_resources(self, element_type: str, element_id: int, attr_name: str) -> float:
         """Get currently available resources accounting for allocations"""
@@ -336,9 +372,17 @@ class State:
                 # Use the same shortest-path policy as the orchestrator so ablations on k stay coherent.
                 shortest_method = self.link_params.get('shortest_method', 'bfs_shortest')
                 k_limit = int(self.link_params.get('k', 1))
-                # For methods that inherently return a single path (e.g. bfs_shortest) keep k=1
-                if shortest_method in ('bfs_shortest', 'first_shortest'):
+                edge_attrs = self._virtual_edge_attrs(new_v, n_v)
+                demands = {}
+                for l_attr in self.controller.link_resource_attrs:
+                    demand = float(edge_attrs.get(l_attr.name, 0.0))
+                    if demand > 0.0:
+                        demands[l_attr.name] = demand
+
+                # Methods that inherently return a single path should run with k=1.
+                if shortest_method in ('bfs_shortest', 'first_shortest', 'available_shortest'):
                     k_limit = 1
+
                 paths = self.controller.topology_analyzer.find_shortest_paths(
                     self.v_net,
                     child.p_net,  # view with shadow allocations applied
@@ -348,7 +392,51 @@ class State:
                     k=max(1, k_limit),
                 )
 
-                if not paths:
+                selected_path = None
+                for candidate_path in paths:
+                    if len(candidate_path) < 2:
+                        continue
+                    candidate_links = path_to_links(candidate_path)
+                    feasible = True
+                    for p_link in candidate_links:
+                        link_view = child.p_net.links[p_link]
+                        for attr_name, demand in demands.items():
+                            if link_view.get(attr_name, 0.0) + 1e-8 < demand:
+                                feasible = False
+                                break
+                        if not feasible:
+                            break
+                    if feasible:
+                        selected_path = candidate_path
+                        break
+
+                if selected_path is None and shortest_method != 'available_shortest':
+                    fallback_paths = self.controller.topology_analyzer.find_shortest_paths(
+                        self.v_net,
+                        child.p_net,
+                        (new_v, n_v),
+                        (p_u, p_v),
+                        method='available_shortest',
+                        k=1,
+                    )
+                    for candidate_path in fallback_paths:
+                        if len(candidate_path) < 2:
+                            continue
+                        candidate_links = path_to_links(candidate_path)
+                        feasible = True
+                        for p_link in candidate_links:
+                            link_view = child.p_net.links[p_link]
+                            for attr_name, demand in demands.items():
+                                if link_view.get(attr_name, 0.0) + 1e-8 < demand:
+                                    feasible = False
+                                    break
+                            if not feasible:
+                                break
+                        if feasible:
+                            selected_path = candidate_path
+                            break
+
+                if selected_path is None:
                     # prune: make this child immediately terminal-bad
                     import logging
                     # Only log first few occurrences to avoid spam
@@ -365,31 +453,19 @@ class State:
 
                 # Shadow-reserve link resources along the found path so subsequent
                 # expansions see reduced residual capacity through the view.
-                p_links = path_to_links(paths[0])
+                p_links = path_to_links(selected_path)
                 for p_link in p_links:
                     for l_attr in self.controller.link_resource_attrs:
-                        demand = self.v_net.links[(new_v, n_v)][l_attr.name]
+                        demand = demands.get(l_attr.name, 0.0)
+                        if demand <= 0.0:
+                            continue
                         child._track_resource_allocation('link', p_link, l_attr.name, demand)
         
         return child
 
     def random_select_next_state(self):
         """Random select a physical node to accommodate the next virtual node"""
-        v_target = self.v_order[self.v_node_id + 1]
-        candidate_p_nodes = self.controller.find_candidate_nodes(
-            v_net=self.v_net, 
-            p_net=self.p_net, 
-            v_node_id=v_target, 
-            filter=self.selected_p_net_nodes,
-            check_link_constraint=False)
-        candidate_p_nodes = self._filter_candidates_by_reachability(v_target, list(candidate_p_nodes))
-
-        reject_action_id = self._original_p_net.num_nodes
-        candidate_with_reject = list(candidate_p_nodes)
-        if getattr(self, 'allow_rejection', False):
-            candidate_with_reject.append(reject_action_id)
-        if not candidate_with_reject:
-            candidate_with_reject = [-1]
+        candidate_with_reject = self.get_candidate_node_ids()
         self.max_expansion = len(candidate_with_reject)
         random_choice = random.choice(candidate_with_reject)
             
@@ -398,28 +474,14 @@ class State:
     def get_candidate_states(self):
         """Return all feasible next states for the upcoming virtual node."""
         v_target = self.v_order[self.v_node_id + 1]
-        candidate_p_nodes = self.controller.find_candidate_nodes(
-            v_net=self.v_net,
-            p_net=self.p_net,
-            v_node_id=v_target,
-            filter=self.selected_p_net_nodes,
-            check_link_constraint=False,
-        )
-        candidate_p_nodes = self._filter_candidates_by_reachability(v_target, list(candidate_p_nodes))
-
-        # Include explicit REJECT action only if solver allows it
-        reject_action_id = self._original_p_net.num_nodes
-        candidate_with_reject = list(candidate_p_nodes)
-        if getattr(self, 'allow_rejection', False):
-            candidate_with_reject.append(reject_action_id)
-        if not candidate_with_reject:
+        candidate_with_reject = self.get_candidate_node_ids(v_target=v_target)
+        if candidate_with_reject == [-1]:
             import logging
             logging.getLogger(__name__).debug(
                 "State.get_candidate_states no feasible nodes for v_node=%s after placing=%s",
                 v_target,
                 self.selected_p_net_nodes,
             )
-            candidate_with_reject = [-1]
         self.max_expansion = len(candidate_with_reject)
 
         next_states = []

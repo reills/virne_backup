@@ -696,11 +696,14 @@ class OptimizedAlphaZeroActor(Solver):
                 return [int(action) for action in cpp_state.get_candidate_nodes()]
             except Exception:
                 pass
+        if hasattr(state, "get_candidate_node_ids"):
+            return state.get_candidate_node_ids(v_target=v_node_id)
         return self.controller.find_candidate_nodes(
             v_net=state.v_net,
             p_net=state.p_net,
             v_node_id=v_node_id,
             filter=state.selected_p_net_nodes,
+            check_link_constraint=False,
         )
 
     # ------------------------------------------------------------------
@@ -1264,6 +1267,15 @@ class OptimizedAlphaZeroActor(Solver):
             best_child.parent = None
             current_node = best_child
 
+        # Perform link mapping (consistent with solve() and _solve_with_cpp_full())
+        solution["place_result"] = True
+        link_ok = self.controller.link_mapper.link_mapping(
+            v_net, p_net, solution=solution,
+            shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
+        if not link_ok:
+            solution["route_result"] = False
+        solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False))
+
         # Store episode for learning (optional)
         if write_trajectory:
             final_reward = self._compute_final_reward(solution, v_net, p_net)
@@ -1289,10 +1301,8 @@ class OptimizedAlphaZeroActor(Solver):
             self._episode_rejects = 0
             self._store_episode_new_format(static_environment, trajectory, final_reward)
             self._cleanup()
-        
-        # Mark final result for downstream consumers
-        solution["result"] = True
-        return True
+
+        return solution
 
     def shutdown(self):
         """Cleanup method to shut down GPU worker."""
