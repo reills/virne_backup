@@ -73,6 +73,7 @@ def state_to_obs(
     obs = {
         "p_net": p_data,
         "history_features": hist,
+        "history_lengths": torch.tensor([history_len], dtype=torch.long, device=device),
         "encoder_outputs": encoder_outputs,
         "curr_v_node_id": torch.tensor([curr_step_idx], dtype=torch.long, device=device),
         "vnfs_remaining": torch.tensor([vnfs_remaining], dtype=torch.long, device=device),

@@ -79,6 +79,7 @@ public:
     bool rejected() const noexcept { return rejected_; }
     const PlacementInfo& last_place_info() const noexcept { return last_place_info_; }
     double total_hard_constraint_violation() const noexcept { return total_hard_constraint_violation_; }
+    double total_virtual_revenue() const noexcept { return total_v_revenue_; }
     const std::vector<int>& selected_physical_nodes() const;
     std::vector<int> node_slots() const;
     const std::vector<int>& virtual_order() const noexcept { return v_order_; }

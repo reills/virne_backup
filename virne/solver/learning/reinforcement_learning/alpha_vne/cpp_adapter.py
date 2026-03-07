@@ -722,11 +722,11 @@ class CppFullSolver:
         training_cfg = getattr(cfg_obj, "training", None) if cfg_obj is not None else None
         if isinstance(training_cfg, dict):
             batch_size = int(training_cfg.get("gpu_batch_size", batch_size))
-            cfg.value_normalization = str(training_cfg.get("value_normalization", "tanh"))
+            cfg.value_normalization = str(training_cfg.get("value_normalization", "acceptance_first"))
             cfg.value_scale = float(training_cfg.get("value_scale", 1000.0))
         elif training_cfg is not None:
             batch_size = int(getattr(training_cfg, "gpu_batch_size", batch_size))
-            cfg.value_normalization = str(getattr(training_cfg, "value_normalization", "tanh"))
+            cfg.value_normalization = str(getattr(training_cfg, "value_normalization", "acceptance_first"))
             cfg.value_scale = float(getattr(training_cfg, "value_scale", 1000.0))
         cfg.eval_batch_size = max(1, batch_size)
         return cfg
@@ -798,7 +798,10 @@ class CppFullSolver:
               replay_dir: str | None = None, max_buffer_size: int | None = None) -> dict:
         if training is None:
             training = not getattr(self.actor, "disable_trajectory_writing", False)
-        temperature = getattr(self.actor, "temperature_train", 1.0) if training else getattr(self.actor, "temperature_eval", 0.0)
+        if hasattr(self.actor, "get_action_selection_temperature"):
+            temperature = float(self.actor.get_action_selection_temperature(training))
+        else:
+            temperature = getattr(self.actor, "temperature_train", 1.0) if training else getattr(self.actor, "temperature_eval", 0.0)
 
         p_node_attrs, p_edges, p_edge_attrs, p_directed = self._build_network_payload(
             p_net, self._node_resource_names, self._link_resource_names
@@ -947,6 +950,8 @@ class CppFullSolver:
             curr_v_node_id = torch.zeros((1,), dtype=torch.long)
             vnfs_remaining = torch.zeros((1,), dtype=torch.long)
             action_mask = torch.ones((1, model.actor.decoder.num_actions), dtype=torch.bool)
+            history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32)
+            history_lengths = torch.tensor([1], dtype=torch.long)
 
             example = {
                 "p_net_x": p_net_x,
@@ -954,6 +959,8 @@ class CppFullSolver:
                 "p_net_edge_attr": edge_attr,
                 "p_net_batch": p_batch,
                 "selected_p_nodes": selected_p_nodes,
+                "history_features": history_features,
+                "history_lengths": history_lengths,
                 "encoder_outputs": encoder_outputs,
                 "curr_v_node_id": curr_v_node_id,
                 "vnfs_remaining": vnfs_remaining,

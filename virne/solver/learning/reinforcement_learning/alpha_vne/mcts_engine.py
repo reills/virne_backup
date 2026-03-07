@@ -15,6 +15,7 @@ from typing import List, TYPE_CHECKING
 import numpy as np
 
 from .node import Node
+from .value_target import AcceptanceFirstValueTarget, infer_total_cost_from_reward
 
 if TYPE_CHECKING:
     from .node_expander import NodeExpander
@@ -29,8 +30,11 @@ class MCTSEngine:
         computation_budget: int = 5,
         c_puct: float = 1.0,
         logger=None,
-        value_normalization: str = "tanh",
+        value_normalization: str = "acceptance_first",
         value_scale: float = 1000.0,
+        reject_value: float = -1.0,
+        accept_value_min: float = 0.2,
+        accept_value_max: float = 1.0,
     ):
         """Initialize MCTSEngine.
 
@@ -46,9 +50,34 @@ class MCTSEngine:
         self.logger = logger
         self.value_normalization = value_normalization or "raw"
         self.value_scale = float(value_scale) if value_scale is not None else 1000.0
+        self.value_target_builder = AcceptanceFirstValueTarget(
+            reject_value=float(reject_value),
+            accept_value_min=float(accept_value_min),
+            accept_value_max=float(accept_value_max),
+        )
 
-    def _normalize_terminal_value(self, value: float) -> float:
+    def _normalize_terminal_value(self, value: float, state=None) -> float:
         mode = (self.value_normalization or "raw").lower()
+        if mode == "acceptance_first":
+            accepted = bool(value > 0.0)
+            total_revenue = None
+            total_cost = None
+            try:
+                if state is not None and hasattr(state, "total_v_revenue"):
+                    total_revenue = float(getattr(state, "total_v_revenue"))
+                    total_cost = infer_total_cost_from_reward(total_revenue, float(value))
+            except Exception:
+                total_revenue = None
+                total_cost = None
+            return float(
+                self.value_target_builder.compute_target(
+                    accepted=accepted,
+                    total_cost=total_cost,
+                    total_revenue=total_revenue,
+                    raw_reward=float(value),
+                    update_stats=True,
+                )
+            )
         if mode == "sign":
             return 1.0 if value > 0 else -1.0
         if mode == "tanh":
@@ -57,6 +86,8 @@ class MCTSEngine:
                 return float(np.tanh(value / scale))
             except Exception:
                 return float(np.tanh(value))
+        # 'popart' and 'raw' both pass through raw values;
+        # learner-side PopArt normalizes targets during training.
         return float(value)
 
     def search(self, root_node: Node, v_node_id: int) -> None:
@@ -109,7 +140,7 @@ class MCTSEngine:
         # 3. Backup - terminal uses true reward (z), non-terminal uses NN value (v_θ)
         if node.state.is_terminal():
             # Terminal nodes: use true final reward (z)
-            value = self._normalize_terminal_value(node.state.compute_final_reward())
+            value = self._normalize_terminal_value(node.state.compute_final_reward(), state=node.state)
         else:
             # Non-terminal leaf: use NN value (v_θ) cached during expansion
             value = node.leaf_value if node.leaf_value is not None else 0.0

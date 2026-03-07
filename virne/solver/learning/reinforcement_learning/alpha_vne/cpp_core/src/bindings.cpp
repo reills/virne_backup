@@ -271,6 +271,9 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             out["place_v_node_id"] = result.place_v_node_id;
             out["place_p_node_id"] = result.place_p_node_id;
             out["final_reward"] = result.final_reward;
+            out["total_cost"] = result.total_cost;
+            out["total_revenue"] = result.total_revenue;
+            out["value_target"] = result.value_target;
             out["replay_written"] = result.replay_written;
             out["replay_path"] = result.replay_path;
             out["replay_error"] = result.replay_error;

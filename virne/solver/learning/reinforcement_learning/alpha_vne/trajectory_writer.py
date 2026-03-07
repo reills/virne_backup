@@ -51,8 +51,14 @@ class TrajectoryWriter:
         # Replay buffer size limit
         self.max_buffer_size = getattr(config.training, 'replay_buffer_max_size', 500000)
 
-    def save_episode(self, static_environment: dict, trajectory: List[dict],
-                     final_reward: float, policy_state_dict: dict = None) -> None:
+    def save_episode(
+        self,
+        static_environment: dict,
+        trajectory: List[dict],
+        final_reward: float,
+        policy_state_dict: dict = None,
+        episode_metrics: dict | None = None,
+    ) -> None:
         """Save complete episode to replay buffer.
 
         Args:
@@ -60,6 +66,7 @@ class TrajectoryWriter:
             trajectory: List of timestep dictionaries
             final_reward: Final reward for the episode
             policy_state_dict: Optional policy state dict for fingerprinting
+            episode_metrics: Optional top-level episode metadata
         """
         if not self.enabled:
             return
@@ -95,6 +102,11 @@ class TrajectoryWriter:
                 "mtime": policy_mtime,
             }
         }
+        if isinstance(episode_metrics, dict):
+            for key, value in episode_metrics.items():
+                if key in ("static_environment", "trajectory", "model"):
+                    continue
+                data[key] = value
 
         # Use a truly unique filename across processes to avoid collisions.
         # Write to a unique temp file, then atomically replace to final path.

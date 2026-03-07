@@ -38,7 +38,17 @@ training:
   use_nn_policy: true
   use_nn_value: true
   uniform_prior: false
-  value_normalization: sign    # 'sign' | 'tanh' | 'raw'
+  value_normalization: acceptance_first  # acceptance_first | popart | sign | tanh | raw
+  value_target_mode: acceptance_first
+  value_target_reject: -1.0
+  value_target_accept_min: 0.2
+  value_target_accept_max: 1.0
+  popart_beta: 0.001            # PopArt EMA decay rate for running statistics
+  transition_buffer_max_size: 200000  # Max transitions in memory for efficient sampling
+  # Temperature annealing for MCTS action selection
+  temperature_start: 1.0        # Initial temperature (exploration)
+  temperature_end: 0.5          # Final temperature (exploitation)
+  temperature_anneal_steps: 5000  # Steps over which to anneal temperature
   # Execution mode toggles
   inference_only: false        # Skip learner/training loop and run inference-only
   enable_async_learner: true   # Disable to prevent spawning background learner

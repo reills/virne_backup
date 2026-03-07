@@ -363,6 +363,12 @@ StateView::TensorMap build_inputs_cached(
     const auto& selected = state.selected_physical_nodes();
     inputs.emplace("selected_p_nodes", build_selected_tensor(selected).to(device));
     inputs.emplace("history_features", build_history_features_single(p_net_x, selected, start_embedding, device));
+    inputs.emplace(
+        "history_lengths",
+        torch::tensor(
+            {static_cast<int64_t>(selected.size()) + 1},
+            torch::TensorOptions().dtype(torch::kInt64).device(device))
+    );
 
     int step_idx = static_cast<int>(selected.size());
     inputs.emplace("curr_v_node_id", torch::tensor({step_idx}, torch::TensorOptions().dtype(torch::kInt64).device(device)));
@@ -404,8 +410,10 @@ StateView::TensorMap build_inputs_batch(
     selected_nodes.reserve(batch_size);
     std::vector<int64_t> curr_v_ids;
     std::vector<int64_t> remaining;
+    std::vector<int64_t> history_lengths;
     curr_v_ids.reserve(batch_size);
     remaining.reserve(batch_size);
+    history_lengths.reserve(batch_size);
     std::vector<torch::Tensor> masks;
     masks.reserve(batch_size);
 
@@ -422,6 +430,7 @@ StateView::TensorMap build_inputs_batch(
         const auto& selected = domain.selected_physical_nodes();
         selected_nodes.emplace_back(selected.begin(), selected.end());
         max_hist_len = std::max<int64_t>(max_hist_len, static_cast<int64_t>(selected.size()) + 1);
+        history_lengths.push_back(static_cast<int64_t>(selected.size()) + 1);
 
         int step_idx = static_cast<int>(selected.size());
         curr_v_ids.push_back(step_idx);
@@ -458,6 +467,7 @@ StateView::TensorMap build_inputs_batch(
         history[i].narrow(0, 1, static_cast<int64_t>(selected.size())).copy_(gathered);
     }
     inputs.emplace("history_features", history);
+    inputs.emplace("history_lengths", torch::tensor(history_lengths, torch::TensorOptions().dtype(torch::kInt64).device(device)));
     inputs.emplace("selected_p_nodes", torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64).device(device)));
 
     inputs.emplace("curr_v_node_id", torch::tensor(curr_v_ids, torch::TensorOptions().dtype(torch::kInt64).device(device)));
@@ -1045,13 +1055,18 @@ SolveResult solve_vnr(
             double total_link_demand = sum_link_demand(virtual_net, vnr_config.link_resource_names);
             double total_revenue = total_node_demand + total_link_demand;
             double total_cost = total_node_demand + link_map.total_link_cost;
+            result.total_revenue = static_cast<float>(total_revenue);
+            result.total_cost = static_cast<float>(total_cost);
             result.final_reward = static_cast<float>(1000.0 + total_revenue - total_cost);
+            result.value_target = 1.0f;
         } else {
             result.final_reward = -1000.0f;
+            result.value_target = -1.0f;
         }
     }
     if (!result.place_result || result.rejected) {
         result.final_reward = -1000.0f;
+        result.value_target = -1.0f;
     }
     result.metrics.build_inputs_ms = build_inputs_ms;
     result.metrics.policy_eval_ms = policy_eval_ms;
@@ -1066,6 +1081,11 @@ SolveResult solve_vnr(
         episode.static_env = build_static_environment(physical, virtual_net);
         episode.trajectory = std::move(replay_steps);
         episode.final_reward = static_cast<double>(result.final_reward);
+        episode.accepted = bool(result.place_result && result.route_result && !result.rejected);
+        if (episode.accepted) {
+            episode.total_cost = static_cast<double>(result.total_cost);
+            episode.total_revenue = static_cast<double>(result.total_revenue);
+        }
         episode.policy_path = policy_meta_path;
         if (!policy_meta_path.empty()) {
             try {

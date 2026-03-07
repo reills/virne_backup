@@ -24,7 +24,7 @@ struct SearchConfig {
     bool use_neural_network = true;  // If false, use uniform priors and random rollouts
     int rollout_depth_limit = 100;   // Maximum depth for rollout simulations
     int eval_batch_size = 1;         // Batch size for neural network evaluation
-    std::string value_normalization{"tanh"};  // raw | sign | tanh
+    std::string value_normalization{"acceptance_first"};  // acceptance_first | raw | sign | tanh
     float value_scale = 1000.0f;              // scale for tanh normalization
 };
 
@@ -60,7 +60,7 @@ private:
     void backpropagate(TreeNode* node, float value);
     void apply_virtual_loss(TreeNode* node);
     void revert_virtual_loss(TreeNode* node);
-    float normalize_terminal_value(float raw) const;
+    float normalize_terminal_value(float raw, const std::shared_ptr<StateView>& state = nullptr) const;
 
     SearchConfig config_;
     ExpandFn expand_fn_;
@@ -70,6 +70,9 @@ private:
     TerminalCheckFn terminal_check_fn_;
     std::mt19937 rng_;
     bool root_noise_applied_{false};
+    mutable bool acceptance_stats_ready_{false};
+    mutable float accepted_cost_min_{0.0f};
+    mutable float accepted_cost_max_{0.0f};
 };
 
 }  // namespace azsfc

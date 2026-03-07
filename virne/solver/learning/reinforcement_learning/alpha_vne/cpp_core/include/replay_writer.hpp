@@ -53,6 +53,10 @@ struct ReplayEpisode {
     StaticEnvironment static_env;
     std::vector<ReplayStep> trajectory;
     double final_reward{0.0};
+    bool accepted{false};
+    std::optional<double> total_cost;
+    std::optional<double> total_revenue;
+    std::optional<double> value_target;
     std::string policy_path;
     std::optional<std::string> policy_sha;
     std::optional<double> policy_mtime;

@@ -150,6 +150,7 @@ class ObservationBuilder:
         obs = {
             "p_net": p_data,
             "history_features": history_features,
+            "history_lengths": torch.tensor([history_len], dtype=torch.long),
             "encoder_outputs": encoder_outputs,
             "curr_v_node_id": torch.tensor([curr_step_idx], dtype=torch.long),
             "vnfs_remaining": torch.tensor([vnfs_remaining], dtype=torch.long),

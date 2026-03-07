@@ -30,6 +30,7 @@ from .observation_builder import ObservationBuilder
 from .policy_network import PolicyNetwork
 from .node_expander import NodeExpander
 from .mcts_engine import MCTSEngine
+from .value_target import AcceptanceFirstValueTarget
 
 
 class OptimizedAlphaZeroActor(Solver):
@@ -84,9 +85,22 @@ class OptimizedAlphaZeroActor(Solver):
         self.dirichlet_epsilon = getattr(config.training, 'dirichlet_epsilon', 0.25)
         self.dirichlet_alpha = getattr(config.training, 'dirichlet_alpha', 0.03)
 
-        # Temperature for action selection
-        self.temperature_train = getattr(config.training, 'temperature_train', 1.0)
-        self.temperature_eval = getattr(config.training, 'temperature_eval', 0.0)
+        # Temperature schedule for MCTS action selection.
+        # Keep legacy temperature_train/temperature_eval fields for compatibility.
+        legacy_train_temp = float(getattr(config.training, 'temperature_train', 1.0))
+        self.temperature_eval = float(getattr(config.training, 'temperature_eval', 0.0))
+        self.temperature_start = float(getattr(config.training, 'temperature_start', legacy_train_temp))
+        self.temperature_end = float(getattr(config.training, 'temperature_end', 0.5))
+        self.temperature_anneal_steps = int(getattr(config.training, 'temperature_anneal_steps', 0))
+        self._temperature_step = 0
+        self.temperature_train = self.temperature_start
+
+        self.value_target_mode = str(getattr(config.training, "value_target_mode", "acceptance_first")).lower()
+        self.value_target_builder = AcceptanceFirstValueTarget(
+            reject_value=float(getattr(config.training, "value_target_reject", -1.0)),
+            accept_value_min=float(getattr(config.training, "value_target_accept_min", 0.2)),
+            accept_value_max=float(getattr(config.training, "value_target_accept_max", 1.0)),
+        )
 
         # Link mapping parameters (inherited from MctsSolver)
         self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')
@@ -152,7 +166,7 @@ class OptimizedAlphaZeroActor(Solver):
         )
 
         # Initialize MCTSEngine
-        value_norm = "tanh"
+        value_norm = "acceptance_first"
         value_scale = 1000.0
         try:
             cfg_obj = getattr(config, "training", None)
@@ -171,6 +185,9 @@ class OptimizedAlphaZeroActor(Solver):
             logger=self.logger,
             value_normalization=value_norm,
             value_scale=value_scale,
+            reject_value=float(getattr(config.training, "value_target_reject", -1.0)),
+            accept_value_min=float(getattr(config.training, "value_target_accept_min", 0.2)),
+            accept_value_max=float(getattr(config.training, "value_target_accept_max", 1.0)),
         )
 
         # Timing sync flag (for accurate GPU timings in benchmarks)
@@ -302,7 +319,7 @@ class OptimizedAlphaZeroActor(Solver):
         # Determine temperature based on mode
         if training is None:
             training = not self.disable_trajectory_writing  # If writing trajectories, we're training
-        temperature = self.temperature_train if training else self.temperature_eval
+        temperature = self.get_action_selection_temperature(training)
 
         # Create static environment data (only needed when training and writing trajectories)
         write_trajectory = training and not self.disable_trajectory_writing
@@ -421,9 +438,14 @@ class OptimizedAlphaZeroActor(Solver):
 
         # Store episode only if enabled
         if write_trajectory:
-            final_reward = self._compute_final_reward(solution, v_net, p_net)
+            episode_metrics = self._build_episode_metrics(solution, v_net, p_net)
             t_store = time.perf_counter()
-            self._store_episode_new_format(static_environment, trajectory, final_reward)
+            self._store_episode_new_format(
+                static_environment,
+                trajectory,
+                episode_metrics["final_reward_raw"],
+                episode_metrics=episode_metrics,
+            )
             timers["traj_ms"] += (time.perf_counter() - t_store) * 1000.0
 
         if self.logger is not None:
@@ -449,6 +471,7 @@ class OptimizedAlphaZeroActor(Solver):
                 float(timers.get("traj_ms", 0.0)),
             )
             
+        self._advance_temperature_schedule(training)
         return solution
 
     # ------------------------------------------------------------------
@@ -466,6 +489,21 @@ class OptimizedAlphaZeroActor(Solver):
                 self.logger.warning(f"C++ MCTS search failed, falling back to Python: {exc}")
         # Delegate to MCTSEngine
         self.mcts_engine.search(root_node, v_node_id)
+
+    def get_action_selection_temperature(self, training: bool) -> float:
+        """Return action-selection temperature for current episode."""
+        if not training:
+            return float(self.temperature_eval)
+        if self.temperature_anneal_steps <= 0:
+            return float(self.temperature_start)
+        frac = min(1.0, float(self._temperature_step) / float(self.temperature_anneal_steps))
+        return float(self.temperature_start + frac * (self.temperature_end - self.temperature_start))
+
+    def _advance_temperature_schedule(self, training: bool) -> None:
+        """Advance annealing progress after each completed training episode."""
+        if not training or self.temperature_anneal_steps <= 0:
+            return
+        self._temperature_step = min(self._temperature_step + 1, self.temperature_anneal_steps)
 
     def _select_best_child(self, node: Node, temperature: float = 1.0) -> Node:
         """Select best child with guardrails for invalid zero-visit states."""
@@ -710,14 +748,21 @@ class OptimizedAlphaZeroActor(Solver):
     # Utility methods (same as original)
     # ------------------------------------------------------------------
     
-    def _store_episode_new_format(self, static_environment: dict, trajectory: List[dict], final_reward: float) -> None:
+    def _store_episode_new_format(
+        self,
+        static_environment: dict,
+        trajectory: List[dict],
+        final_reward: float,
+        episode_metrics: dict | None = None,
+    ) -> None:
         """Store episode in new efficient JSON format."""
         policy_state_dict = self.policy.state_dict() if self.policy is not None else None
         self.trajectory_writer.save_episode(
             static_environment=static_environment,
             trajectory=trajectory,
             final_reward=final_reward,
-            policy_state_dict=policy_state_dict
+            policy_state_dict=policy_state_dict,
+            episode_metrics=episode_metrics,
         )
 
     def _cleanup(self, keep: int = None) -> None:
@@ -901,6 +946,36 @@ class OptimizedAlphaZeroActor(Solver):
         else:
             return -1000.0
 
+    def _build_episode_metrics(self, solution: Solution, v_net, p_net) -> dict:
+        accepted = bool(solution.get("result", False))
+        total_cost = None
+        total_revenue = None
+        if accepted:
+            try:
+                total_cost = float(self.counter.calculate_v_net_cost(v_net, solution))
+                total_revenue = float(self.counter.calculate_v_net_revenue(v_net))
+            except Exception:
+                total_cost = None
+                total_revenue = None
+        final_reward_raw = float(self._compute_final_reward(solution, v_net, p_net))
+        value_target = float(
+            self.value_target_builder.compute_target(
+                accepted=accepted,
+                total_cost=total_cost,
+                total_revenue=total_revenue,
+                raw_reward=final_reward_raw,
+                update_stats=True,
+            )
+        )
+        return {
+            "final_reward_raw": final_reward_raw,
+            "accepted": bool(accepted),
+            "total_cost": total_cost,
+            "total_revenue": total_revenue,
+            "value_target": value_target,
+            "value_target_mode": self.value_target_mode,
+        }
+
     def _solve_with_cpp_full(self, instance, training: bool = None):
         """Solve a request using the full C++ backend and rebuild trajectory in Python."""
         v_net, p_net = instance["v_net"], instance["p_net"]
@@ -1024,6 +1099,7 @@ class OptimizedAlphaZeroActor(Solver):
                 solution["route_result"] = False
 
             solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
+            self._advance_temperature_schedule(training)
             return solution
 
         # Rebuild trajectory with Python observations for replay compatibility
@@ -1128,9 +1204,15 @@ class OptimizedAlphaZeroActor(Solver):
         solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
 
         if build_trajectory:
-            final_reward = self._compute_final_reward(solution, v_net, p_net)
-            self._store_episode_new_format(static_environment, trajectory, final_reward)
+            episode_metrics = self._build_episode_metrics(solution, v_net, p_net)
+            self._store_episode_new_format(
+                static_environment,
+                trajectory,
+                episode_metrics["final_reward_raw"],
+                episode_metrics=episode_metrics,
+            )
 
+        self._advance_temperature_schedule(training)
         return solution
 
     def solve_vnr_with_mcts(self, v_net, p_net, solution, controller, training: bool = None):
@@ -1167,7 +1249,7 @@ class OptimizedAlphaZeroActor(Solver):
         # Determine temperature based on mode
         if training is None:
             training = not self.disable_trajectory_writing
-        temperature = self.temperature_train if training else self.temperature_eval
+        temperature = self.get_action_selection_temperature(training)
         write_trajectory = training and not self.disable_trajectory_writing
 
         current_node = Node(
@@ -1201,9 +1283,15 @@ class OptimizedAlphaZeroActor(Solver):
                 except Exception:
                     # Keep failure-path robust even when diagnostics/timestep extraction fails.
                     pass
-                final_reward = self._compute_final_reward(solution, v_net, p_net)
-                self._store_episode_new_format(static_environment, trajectory, final_reward)
+                episode_metrics = self._build_episode_metrics(solution, v_net, p_net)
+                self._store_episode_new_format(
+                    static_environment,
+                    trajectory,
+                    episode_metrics["final_reward_raw"],
+                    episode_metrics=episode_metrics,
+                )
                 self._cleanup()
+            self._advance_temperature_schedule(training)
             return False
 
         for v_node_idx in range(v_net.num_nodes):
@@ -1274,11 +1362,12 @@ class OptimizedAlphaZeroActor(Solver):
             shortest_method=self.shortest_method, k=self.k_shortest, inplace=True)
         if not link_ok:
             solution["route_result"] = False
-        solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False))
+        solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
 
         # Store episode for learning (optional)
         if write_trajectory:
-            final_reward = self._compute_final_reward(solution, v_net, p_net)
+            episode_metrics = self._build_episode_metrics(solution, v_net, p_net)
+            final_reward = episode_metrics["final_reward_raw"]
             # Value calibration update using root prediction if available
             root_pred = getattr(current_node, '_diag_root_value', None)
             if root_pred is not None:
@@ -1299,9 +1388,15 @@ class OptimizedAlphaZeroActor(Solver):
             if self._episode_rejects:
                 self.logger.info(f"Reject actions this episode: {self._episode_rejects}")
             self._episode_rejects = 0
-            self._store_episode_new_format(static_environment, trajectory, final_reward)
+            self._store_episode_new_format(
+                static_environment,
+                trajectory,
+                final_reward,
+                episode_metrics=episode_metrics,
+            )
             self._cleanup()
 
+        self._advance_temperature_schedule(training)
         return solution
 
     def shutdown(self):

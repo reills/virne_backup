@@ -453,6 +453,48 @@ ReplayWriteResult write_episode_file(const ReplayEpisode& episode, const std::st
     write_float(out, episode.final_reward);
     out << ",\n";
 
+    write_indent(out, 2);
+    write_string(out, "final_reward_raw");
+    out << ": ";
+    write_float(out, episode.final_reward);
+    out << ",\n";
+
+    write_indent(out, 2);
+    write_string(out, "accepted");
+    out << ": ";
+    write_bool(out, episode.accepted);
+    out << ",\n";
+
+    write_indent(out, 2);
+    write_string(out, "total_cost");
+    out << ": ";
+    if (episode.total_cost.has_value()) {
+        write_float(out, episode.total_cost.value());
+    } else {
+        out << "null";
+    }
+    out << ",\n";
+
+    write_indent(out, 2);
+    write_string(out, "total_revenue");
+    out << ": ";
+    if (episode.total_revenue.has_value()) {
+        write_float(out, episode.total_revenue.value());
+    } else {
+        out << "null";
+    }
+    out << ",\n";
+
+    write_indent(out, 2);
+    write_string(out, "value_target");
+    out << ": ";
+    if (episode.value_target.has_value()) {
+        write_float(out, episode.value_target.value());
+    } else {
+        out << "null";
+    }
+    out << ",\n";
+
     write_policy_model(out, episode, 2);
     out << "\n";
     out << "}\n";

@@ -93,6 +93,23 @@ class State:
             self.v_order = list(self.v_net.nodes)
         # Position index: v-node id -> order position
         self.v_pos = {vid: i for i, vid in enumerate(self.v_order)}
+
+        # Request-level resource totals used by acceptance-first value shaping.
+        self.total_node_demand = 0.0
+        self.total_link_demand = 0.0
+        try:
+            node_resource_names = self.get_node_resource_types()
+            link_resource_names = self.get_link_resource_types()
+            for _, attrs in self.v_net.nodes(data=True):
+                for attr in node_resource_names:
+                    self.total_node_demand += float(attrs.get(attr, 0.0))
+            for _, _, attrs in self.v_net.edges(data=True):
+                for attr in link_resource_names:
+                    self.total_link_demand += float(attrs.get(attr, 0.0))
+        except Exception:
+            self.total_node_demand = 0.0
+            self.total_link_demand = 0.0
+        self.total_v_revenue = self.total_node_demand + self.total_link_demand
         
     @property 
     def p_net(self):
@@ -322,6 +339,9 @@ class State:
         child.allow_rejection = getattr(self, 'allow_rejection', False)
         child.v_order = getattr(self, 'v_order', list(self.v_net.nodes))
         child.v_pos = getattr(self, 'v_pos', {vid: i for i, vid in enumerate(child.v_order)})
+        child.total_node_demand = getattr(self, 'total_node_demand', 0.0)
+        child.total_link_demand = getattr(self, 'total_link_demand', 0.0)
+        child.total_v_revenue = getattr(self, 'total_v_revenue', 0.0)
         
         # Copy resource allocations tracking (shallow copy of nested dicts)
         child._resource_allocations = {

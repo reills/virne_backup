@@ -200,17 +200,24 @@ class PolicyNetwork:
         with torch.inference_mode():
             obs_device = self._move_obs_to_device(obs)
 
-            # Get logits
-            if use_nn_policy:
-                logits = self.model.act(obs_device)
+            if use_nn_policy and use_nn_value:
+                logits, value = self.model.act_and_evaluate(obs_device)
                 logits_tensor = logits.detach().cpu()
                 if logits_tensor.dim() > 1:
                     logits_tensor = logits_tensor.squeeze(0)
-
-            # Get value
-            if use_nn_value:
-                value = self.model.evaluate(obs_device)
                 value_float = float(value.item())
+            else:
+                # Get logits
+                if use_nn_policy:
+                    logits = self.model.act(obs_device)
+                    logits_tensor = logits.detach().cpu()
+                    if logits_tensor.dim() > 1:
+                        logits_tensor = logits_tensor.squeeze(0)
+
+                # Get value
+                if use_nn_value:
+                    value = self.model.evaluate(obs_device)
+                    value_float = float(value.item())
 
         return logits_tensor, value_float
 

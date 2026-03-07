@@ -45,10 +45,39 @@ int64_t find_max_action_id(const Container& entries) {
 std::atomic<std::int64_t> g_state_id_counter{1};
 }  // namespace
 
-float MCTSEngine::normalize_terminal_value(float raw) const {
+float MCTSEngine::normalize_terminal_value(float raw, const std::shared_ptr<StateView>& state) const {
     std::string mode = config_.value_normalization;
     std::transform(mode.begin(), mode.end(), mode.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "acceptance_first") {
+        if (raw <= 0.0f) {
+            return -1.0f;
+        }
+        double total_revenue = 0.0;
+        bool has_revenue = false;
+        if (state && state->domain_state) {
+            total_revenue = state->domain_state->total_virtual_revenue();
+            has_revenue = true;
+        }
+        float total_cost = has_revenue ? static_cast<float>(1000.0 + total_revenue - raw) : -raw;
+        if (!acceptance_stats_ready_) {
+            accepted_cost_min_ = total_cost;
+            accepted_cost_max_ = total_cost;
+            acceptance_stats_ready_ = true;
+        } else {
+            accepted_cost_min_ = std::min(accepted_cost_min_, total_cost);
+            accepted_cost_max_ = std::max(accepted_cost_max_, total_cost);
+        }
+        float penalty = 0.5f;
+        float span = accepted_cost_max_ - accepted_cost_min_;
+        if (span > 1e-8f) {
+            penalty = (total_cost - accepted_cost_min_) / span;
+            penalty = std::clamp(penalty, 0.0f, 1.0f);
+        }
+        constexpr float kAcceptMin = 0.2f;
+        constexpr float kAcceptMax = 1.0f;
+        return kAcceptMax - (kAcceptMax - kAcceptMin) * penalty;
+    }
     if (mode == "sign") {
         return raw > 0.0f ? 1.0f : -1.0f;
     }
@@ -140,7 +169,7 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
                 leaf->set_terminal(true);
                 float raw = state->domain_state ? state->domain_state->compute_final_reward()
                                                 : (terminal_value_fn_ ? terminal_value_fn_(state) : 0.0f);
-                float value = normalize_terminal_value(raw);
+                float value = normalize_terminal_value(raw, state);
                 backpropagate(leaf, value);
                 continue;
             }
@@ -257,9 +286,9 @@ float MCTSEngine::expand(TreeNode& node) {
     if (terminal) {
         node.set_terminal(true);
         if (state->domain_state) {
-            return normalize_terminal_value(state->domain_state->compute_final_reward());
+            return normalize_terminal_value(state->domain_state->compute_final_reward(), state);
         }
-        return normalize_terminal_value(terminal_value_fn_(state));
+        return normalize_terminal_value(terminal_value_fn_(state), state);
     }
 
     // PLAIN MCTS MODE: Skip neural network evaluation if use_neural_network is false
@@ -295,9 +324,9 @@ float MCTSEngine::expand(TreeNode& node) {
     if (options.empty()) {
         node.set_terminal(true);
         if (state->domain_state) {
-            return normalize_terminal_value(state->domain_state->compute_final_reward());
+            return normalize_terminal_value(state->domain_state->compute_final_reward(), state);
         }
-        return normalize_terminal_value(terminal_value_fn_(state));
+        return normalize_terminal_value(terminal_value_fn_(state), state);
     }
 
     // PLAIN MCTS MODE: Use uniform priors instead of neural network policy

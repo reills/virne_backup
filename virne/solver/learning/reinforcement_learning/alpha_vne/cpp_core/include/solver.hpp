@@ -36,6 +36,9 @@ struct SolveResult {
     int place_v_node_id{-1};
     int place_p_node_id{-1};
     float final_reward{0.0f};
+    float total_cost{0.0f};
+    float total_revenue{0.0f};
+    float value_target{0.0f};
     bool replay_written{false};
     std::string replay_path;
     std::string replay_error;

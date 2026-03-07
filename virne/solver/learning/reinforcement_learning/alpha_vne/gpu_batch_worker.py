@@ -56,6 +56,14 @@ def _batch_observations(observations: List[Dict], device: torch.device) -> Dict:
 
     enc_list = to_tensor_list('encoder_outputs')
     hist_list = to_tensor_list('history_features')
+    history_lengths = []
+    for h in hist_list:
+        if h.dim() == 3:
+            history_lengths.append(int(h.size(1)))
+        elif h.dim() >= 1:
+            history_lengths.append(int(h.size(0)))
+        else:
+            history_lengths.append(1)
     curr_list = to_tensor_list('curr_v_node_id')
     remain_list = to_tensor_list('vnfs_remaining')
     mask_list = to_tensor_list('action_mask')
@@ -91,6 +99,7 @@ def _batch_observations(observations: List[Dict], device: torch.device) -> Dict:
 
     encoder_outputs = pad_3d_list(enc_list).to(device)
     history_features = pad_3d_list(hist_list).to(device)
+    history_lengths = torch.tensor(history_lengths, dtype=torch.long, device=device)
     # Ensure scalar/1D shapes are consistent before concat
     curr_list = [t.view(1) if t.dim() == 0 else t for t in curr_list]
     remain_list = [t.view(1) if t.dim() == 0 else t for t in remain_list]
@@ -121,6 +130,7 @@ def _batch_observations(observations: List[Dict], device: torch.device) -> Dict:
         'p_net': batched_p_net,
         'encoder_outputs': encoder_outputs,
         'history_features': history_features,
+        'history_lengths': history_lengths,
         'curr_v_node_id': curr_v_node_id,
         'vnfs_remaining': vnfs_remaining,
         'action_mask': action_mask,
@@ -223,16 +233,13 @@ def _gpu_worker_main(model_config: Dict[str, Any], policy_path: str, device_id: 
                         # Prefer BF16 if supported (wider exponent range, avoids FP16 overflow).
                         if torch.cuda.is_bf16_supported():
                             with torch_amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                                logits_batch = model.act(batched)      # [B, A]
-                                values_batch = model.evaluate(batched) # [B, 1]
+                                logits_batch, values_batch = model.act_and_evaluate(batched)  # [B, A], [B, 1]
                         else:
-                            # FP16 autocast can overflow in the value head; keep value in FP32.
+                            # FP16 autocast can overflow in the value head; shared forward stays in FP32.
                             with torch_amp.autocast('cuda', dtype=torch.float16, enabled=True):
-                                logits_batch = model.act(batched)      # [B, A]
-                            values_batch = model.evaluate(batched)     # [B, 1] in FP32
+                                logits_batch, values_batch = model.act_and_evaluate(batched)  # [B, A], [B, 1]
                     else:
-                        logits_batch = model.act(batched)
-                        values_batch = model.evaluate(batched)
+                        logits_batch, values_batch = model.act_and_evaluate(batched)
 
                 for i, conn in enumerate(reply_conns):
                     try:
