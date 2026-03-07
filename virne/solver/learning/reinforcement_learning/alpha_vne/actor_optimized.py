@@ -304,8 +304,9 @@ class OptimizedAlphaZeroActor(Solver):
             training = not self.disable_trajectory_writing  # If writing trajectories, we're training
         temperature = self.temperature_train if training else self.temperature_eval
 
-        # Create static environment data
-        static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
+        # Create static environment data (only needed when training and writing trajectories)
+        write_trajectory = training and not self.disable_trajectory_writing
+        static_environment = self._create_static_environment(p_net, v_net) if write_trajectory else None
 
         current_node = Node(
             None,
@@ -322,7 +323,7 @@ class OptimizedAlphaZeroActor(Solver):
             ),
         )
         solution = Solution.from_v_net(v_net)
-        trajectory: List[dict] = [] if not self.disable_trajectory_writing else None
+        trajectory: List[dict] = [] if write_trajectory else None
         allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
 
         for v_node_idx in range(v_net.num_nodes):
@@ -394,7 +395,7 @@ class OptimizedAlphaZeroActor(Solver):
                 solution["node_slots"].update({placed_v: best_child.state.p_node_id})
 
                 # Create timestep data using the current root (before moving to child)
-                if not self.disable_trajectory_writing:
+                if write_trajectory:
                     t_traj = time.perf_counter()
                     timestep_data = self._create_timestep_data(current_node, curr_v_id, best_child.state.p_node_id)
                     timers["traj_ms"] += (time.perf_counter() - t_traj) * 1000.0
@@ -419,7 +420,7 @@ class OptimizedAlphaZeroActor(Solver):
         solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
 
         # Store episode only if enabled
-        if not self.disable_trajectory_writing:
+        if write_trajectory:
             final_reward = self._compute_final_reward(solution, v_net, p_net)
             t_store = time.perf_counter()
             self._store_episode_new_format(static_environment, trajectory, final_reward)
@@ -905,7 +906,8 @@ class OptimizedAlphaZeroActor(Solver):
             training = not self.disable_trajectory_writing
 
         pure_cpp = bool(self.pure_cpp)
-        static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
+        write_trajectory = training and not self.disable_trajectory_writing
+        static_environment = self._create_static_environment(p_net, v_net) if write_trajectory else None
 
         max_buffer_size = 500000
         training_cfg = getattr(self.config, "training", None)
@@ -970,13 +972,22 @@ class OptimizedAlphaZeroActor(Solver):
         cpp_node_slots = cpp_result.get("node_slots", None)
         cpp_link_paths = cpp_result.get("link_paths", None)
         cpp_link_paths_info = cpp_result.get("link_paths_info", None)
+        if cpp_place_info and cpp_place_info.get("incomplete_placement") and self.logger is not None:
+            try:
+                self.logger.warning(
+                    "C++ incomplete placement: node_slots_size=%s expected=%s",
+                    cpp_place_info.get("node_slots_size"),
+                    v_net.num_nodes,
+                )
+            except Exception:
+                pass
 
         solution = Solution.from_v_net(v_net)
         if metrics:
             solution["cpp_metrics"] = metrics
-        build_trajectory = (not self.disable_trajectory_writing) and (not pure_cpp or not replay_written)
+        build_trajectory = write_trajectory and (not pure_cpp or not replay_written)
         trajectory: List[dict] = [] if build_trajectory else None
-        if pure_cpp and not replay_written and not self.disable_trajectory_writing:
+        if pure_cpp and not replay_written and write_trajectory:
             try:
                 self.logger.warning(f"C++ replay write failed, falling back to Python reconstruction: {replay_error}")
             except Exception:
@@ -1113,7 +1124,7 @@ class OptimizedAlphaZeroActor(Solver):
                     solution["route_result"] = False
         solution["result"] = bool(solution.get("place_result", False) and solution.get("route_result", False)) and not solution.get("rejected", False)
 
-        if not self.disable_trajectory_writing and build_trajectory:
+        if build_trajectory:
             final_reward = self._compute_final_reward(solution, v_net, p_net)
             self._store_episode_new_format(static_environment, trajectory, final_reward)
 
@@ -1154,6 +1165,7 @@ class OptimizedAlphaZeroActor(Solver):
         if training is None:
             training = not self.disable_trajectory_writing
         temperature = self.temperature_train if training else self.temperature_eval
+        write_trajectory = training and not self.disable_trajectory_writing
 
         current_node = Node(
             None,
@@ -1171,15 +1183,15 @@ class OptimizedAlphaZeroActor(Solver):
         )
 
         # Generate training data for this episode (optional)
-        static_environment = self._create_static_environment(p_net, v_net) if not self.disable_trajectory_writing else None
-        trajectory = [] if not self.disable_trajectory_writing else None
+        static_environment = self._create_static_environment(p_net, v_net) if write_trajectory else None
+        trajectory = [] if write_trajectory else None
         allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
 
         def _finalize_failure(node: Node, v_id: int, action_taken: int = -1) -> bool:
             solution["place_result"] = False
             solution["route_result"] = False
             solution["result"] = False
-            if not self.disable_trajectory_writing:
+            if write_trajectory:
                 try:
                     timestep_data = self._create_timestep_data(node, v_id, action_taken)
                     trajectory.append(timestep_data)
@@ -1243,17 +1255,17 @@ class OptimizedAlphaZeroActor(Solver):
                 self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
                 return _finalize_failure(current_node, curr_v_id, p_node_id)
                 
-            if not self.disable_trajectory_writing:
+            if write_trajectory:
                 timestep_data = self._create_timestep_data(current_node, curr_v_id, p_node_id)
                 trajectory.append(timestep_data)
             # Log root diagnostics once per decision
             self._log_root_diagnostics(current_node, current_node.state, curr_v_id, best_child)
-            
+
             best_child.parent = None
             current_node = best_child
 
         # Store episode for learning (optional)
-        if not self.disable_trajectory_writing:
+        if write_trajectory:
             final_reward = self._compute_final_reward(solution, v_net, p_net)
             # Value calibration update using root prediction if available
             root_pred = getattr(current_node, '_diag_root_value', None)

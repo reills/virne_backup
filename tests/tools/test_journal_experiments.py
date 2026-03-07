@@ -157,6 +157,16 @@ def test_preflight_k_semantics_parity_smoke_profile() -> None:
         assert method_result['k_success_result'] is True
 
 
+def test_effective_dataset_generation_seed_is_split_sensitive() -> None:
+    base_seed = 7
+    train_seed = journal_experiments._effective_dataset_generation_seed(base_seed, 'train')
+    test_seed = journal_experiments._effective_dataset_generation_seed(base_seed, 'test')
+
+    assert train_seed != test_seed
+    assert train_seed == journal_experiments._effective_dataset_generation_seed(base_seed, 'train')
+    assert train_seed == journal_experiments._effective_dataset_generation_seed(base_seed, ' train ')
+
+
 def test_merge_model_registry_deduplicates_and_prefers_shard_rows(tmp_path: Path) -> None:
     registry_path = tmp_path / 'model_registry.csv'
     shards_dir = tmp_path / 'model_registry_shards'

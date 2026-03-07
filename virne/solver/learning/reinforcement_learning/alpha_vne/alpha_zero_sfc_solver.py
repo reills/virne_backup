@@ -332,7 +332,8 @@ class AlphaZeroSFCSolver(RLSolver):
     def _node_mapping_with_mcts(self, v_net, p_net, solution):
         """Use MCTS to determine node mappings, then use controller to place them."""
         # Delegate to actor's consolidated solve method
-        return self.actor.solve_vnr_with_mcts(v_net, p_net, solution, self.controller)
+        return self.actor.solve_vnr_with_mcts(v_net, p_net, solution, self.controller,
+                                              training=not self.inference_only)
 
     def learn(self, env, num_epochs: int, start_epoch: int = 0, **kwargs) -> None:
         """
@@ -693,9 +694,12 @@ def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, b
         except Exception as exc:
             logger.warning(f"Failed to emit fallback checkpoint on learner shutdown: {exc}")
         logger.info(f"Learner terminated after {total_steps} training steps")
-        # Only signal actors after at least one learner step, to avoid
-        # prematurely stopping data collection when the replay buffer is still warming up.
-        if stop_event is not None and trained_any_steps:
+        # Optionally signal actors after learner completion. Default is disabled
+        # so workers are not force-stopped when the learner reaches step cap.
+        signal_stop = bool(
+            getattr(config.training, 'signal_stop_event_on_learner_complete', False)
+        )
+        if stop_event is not None and trained_any_steps and signal_stop:
             stop_event.set()
 
 def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: str, policy_path: str):
@@ -799,8 +803,23 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
             
             # Use MCTS to solve this VNR - simplified version for worker
             node_mapping_result = worker_actor.solve_vnr_with_mcts(v_net, p_net, solution, controller)
-            
-            if node_mapping_result:
+
+            # C++ full solver returns a populated Solution; Python path returns bool.
+            if isinstance(node_mapping_result, Solution) or isinstance(node_mapping_result, dict):
+                solution = node_mapping_result
+                if solution.get("place_result", False) and solution.get("route_result", None) is None:
+                    link_mapping_result = controller.link_mapper.link_mapping(
+                        v_net, p_net, solution=solution,
+                        shortest_method=getattr(config.solver, 'shortest_method', 'k_shortest'),
+                        k=getattr(config.solver, 'k_shortest', 10),
+                        inplace=True
+                    )
+                    solution["route_result"] = bool(link_mapping_result)
+                solution["result"] = bool(
+                    solution.get("place_result", False)
+                    and solution.get("route_result", False)
+                ) and not solution.get("rejected", False)
+            elif node_mapping_result:
                 # Standard link mapping using the controller (respect config.solver.*)
                 link_mapping_result = controller.link_mapper.link_mapping(
                     v_net, p_net, solution=solution,

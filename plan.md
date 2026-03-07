@@ -107,6 +107,12 @@ Matched conditions for every compared run:
 6. Same hardware class and CPU thread limits for online evaluation.
 7. Same metric denominators: acceptance and latency must be computed on arrival events only (never on departure events).
 
+Implementation guarantee:
+For each eval cell `(topology, scenario, seed, k_eval)`, all solvers are assigned the same `dataset_dir`, so they read the same `p_net.gml`, `v_nets/*.gml`, and `events.yaml`.
+The orchestrator forces fixed-dataset loading (`use_fixed_dataset=true`, `experiment.if_load_p_net=true`, `experiment.if_load_v_nets=true`) to prevent per-method regeneration at run time.
+Dataset generation is keyed by `(scenario, topology, seed, split)` and occurs once per key, not once per solver.
+Train/test leakage is prevented by split-aware generation seeds, while cross-solver fairness is preserved because methods share identical datasets within a split.
+
 Training fairness rules for trainable methods:
 1. Reported comparisons use a declared training budget profile (`smoke/core/full`).
 2. Methods in the same profile use fixed, declared training steps/epochs (or explicitly method-specific budgets).

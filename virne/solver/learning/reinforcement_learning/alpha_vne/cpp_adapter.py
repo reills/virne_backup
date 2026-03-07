@@ -1,7 +1,9 @@
 """Adapter that wires the C++ MCTS core into the Python AlphaZero actor."""
 from __future__ import annotations
 
+import glob
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -766,6 +768,32 @@ class CppFullSolver:
         cfg.k_shortest = int(getattr(self.actor, "k_shortest", 1))
         return cfg
 
+    def _wait_for_torchscript(self, policy_ts_path: str, timeout_s: float = 5.0) -> bool:
+        """Wait for an in-progress TorchScript export to finish and stabilize."""
+        tmp_prefix = policy_ts_path + ".tmp"
+        deadline = time.monotonic() + timeout_s
+        last_size = None
+        last_mtime = None
+        while time.monotonic() < deadline:
+            if glob.glob(tmp_prefix + "*"):
+                time.sleep(0.05)
+                continue
+            if not os.path.exists(policy_ts_path):
+                time.sleep(0.05)
+                continue
+            try:
+                size = os.path.getsize(policy_ts_path)
+                mtime = os.path.getmtime(policy_ts_path)
+            except OSError:
+                time.sleep(0.05)
+                continue
+            if last_size == size and last_mtime == mtime:
+                return True
+            last_size = size
+            last_mtime = mtime
+            time.sleep(0.05)
+        return False
+
     def solve(self, p_net, v_net, training: bool = None, pure_cpp: bool = False,
               replay_dir: str | None = None, max_buffer_size: int | None = None) -> dict:
         if training is None:
@@ -790,6 +818,9 @@ class CppFullSolver:
         if not policy_ts_path:
             raise RuntimeError("Could not resolve TorchScript policy path.")
 
+        if glob.glob(policy_ts_path + ".tmp*"):
+            if not self._wait_for_torchscript(policy_ts_path):
+                raise RuntimeError("TorchScript policy is still being written; skipping C++ load.")
         if not os.path.exists(policy_ts_path):
             self._export_torchscript(policy_ts_path)
 
@@ -818,28 +849,70 @@ class CppFullSolver:
             elif training_cfg is not None:
                 max_buffer_size = int(getattr(training_cfg, "replay_buffer_max_size", max_buffer_size))
 
-        return cpp_core.solve(
-            p_node_attrs,
-            p_edges,
-            p_edge_attrs,
-            p_directed,
-            v_node_attrs,
-            v_edges,
-            v_edge_attrs,
-            v_directed,
-            vnr_cfg,
-            search_cfg,
-            policy_ts_path,
-            policy_meta_path,
-            device,
-            seed,
-            float(temperature),
-            bool(getattr(self.actor, "use_nn_policy", True)),
-            bool(getattr(self.actor, "use_nn_value", True)),
-            write_replay,
-            replay_dir,
-            int(max_buffer_size),
-        )
+        try:
+            return cpp_core.solve(
+                p_node_attrs,
+                p_edges,
+                p_edge_attrs,
+                p_directed,
+                v_node_attrs,
+                v_edges,
+                v_edge_attrs,
+                v_directed,
+                vnr_cfg,
+                search_cfg,
+                policy_ts_path,
+                policy_meta_path,
+                device,
+                seed,
+                float(temperature),
+                bool(getattr(self.actor, "use_nn_policy", True)),
+                bool(getattr(self.actor, "use_nn_value", True)),
+                write_replay,
+                replay_dir,
+                int(max_buffer_size),
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "PytorchStreamReader" in msg or "invalid header" in msg or "archive is corrupted" in msg:
+                try:
+                    if os.path.exists(policy_ts_path):
+                        os.remove(policy_ts_path)
+                except Exception:
+                    pass
+                try:
+                    self._export_torchscript(policy_ts_path)
+                except Exception:
+                    raise
+                try:
+                    logger = getattr(self.actor, "logger", None)
+                    if logger is not None:
+                        logger.warning("Re-exported TorchScript policy after load failure; retrying C++ solve.")
+                except Exception:
+                    pass
+                return cpp_core.solve(
+                    p_node_attrs,
+                    p_edges,
+                    p_edge_attrs,
+                    p_directed,
+                    v_node_attrs,
+                    v_edges,
+                    v_edge_attrs,
+                    v_directed,
+                    vnr_cfg,
+                    search_cfg,
+                    policy_ts_path,
+                    policy_meta_path,
+                    device,
+                    seed,
+                    float(temperature),
+                    bool(getattr(self.actor, "use_nn_policy", True)),
+                    bool(getattr(self.actor, "use_nn_value", True)),
+                    write_replay,
+                    replay_dir,
+                    int(max_buffer_size),
+                )
+            raise
 
     def _export_torchscript(self, policy_ts_path: str) -> None:
         from .net import ActorCritic, ActorCriticScriptWrapper
@@ -854,7 +927,7 @@ class CppFullSolver:
         wrapper = ActorCriticScriptWrapper(model)
         wrapper.eval()
 
-        tmp = policy_ts_path + ".tmp"
+        tmp = f"{policy_ts_path}.tmp.{os.getpid()}"
         try:
             scripted = torch.jit.script(wrapper)
         except Exception:

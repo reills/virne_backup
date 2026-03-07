@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -254,6 +255,17 @@ def _config_hash(cfg: DictConfig) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
+def _effective_dataset_generation_seed(seed: int, split: str) -> int:
+    split_name = split.strip()
+    if not split_name:
+        raise ValueError('Dataset split must be non-empty when deriving generation seed')
+    # Deterministically decorrelate train/eval dataset generation for the same base seed.
+    seed_payload = f'{int(seed)}::{split_name}'.encode('utf-8')
+    seed_hash = hashlib.sha256(seed_payload).digest()
+    # Keep in NumPy legacy seeding range [0, 2**32 - 1].
+    return int.from_bytes(seed_hash[:8], 'big', signed=False) % (2**32)
+
+
 def _load_suite_config(config_path: Path) -> Tuple[DictConfig, DictConfig]:
     cfg = OmegaConf.load(str(config_path))
     if not isinstance(cfg, DictConfig):
@@ -413,6 +425,7 @@ def _build_job_overrides(
     k_value: int,
     run_id: str,
     dataset_dir: Path,
+    method_cfg: Optional[DictConfig] = None,
     topology_cfg: Optional[DictConfig] = None,
     is_offline_system: bool = False,
 ) -> List[str]:
@@ -428,6 +441,15 @@ def _build_job_overrides(
             profile_common = [str(v) for v in _as_list(profile_overrides_cfg.common)]
         if stage in profile_overrides_cfg:
             profile_stage_overrides = [str(v) for v in _as_list(profile_overrides_cfg[stage])]
+
+    method_common: List[str] = []
+    method_stage_overrides: List[str] = []
+    if method_cfg is not None and 'overrides' in method_cfg:
+        method_overrides_cfg = method_cfg.overrides
+        if 'common' in method_overrides_cfg:
+            method_common = [str(v) for v in _as_list(method_overrides_cfg.common)]
+        if stage in method_overrides_cfg:
+            method_stage_overrides = [str(v) for v in _as_list(method_overrides_cfg[stage])]
 
     topology_common: List[str] = []
     topology_stage_overrides: List[str] = []
@@ -457,6 +479,8 @@ def _build_job_overrides(
         *common,
         *fixed_dataset,
         *stage_overrides,
+        *method_common,
+        *method_stage_overrides,
         *profile_common,
         *profile_stage_overrides,
         *topology_common,
@@ -692,6 +716,7 @@ def _build_planned_jobs(
                                 k_value=k_train,
                                 run_id=run_id,
                                 dataset_dir=dataset_dir,
+                                method_cfg=method_cfg,
                                 topology_cfg=topology_cfg,
                                 is_offline_system=False,
                             )
@@ -746,6 +771,7 @@ def _build_planned_jobs(
                             k_value=k_eval,
                             run_id=run_id,
                             dataset_dir=dataset_dir,
+                            method_cfg=method_cfg,
                             topology_cfg=topology_cfg,
                             is_offline_system=False,
                         )
@@ -812,6 +838,7 @@ def _build_planned_jobs(
                     k_value=k_eval,
                     run_id=run_id,
                     dataset_dir=dataset_dir,
+                    method_cfg=method_cfg,
                     topology_cfg=topology_cfg,
                     is_offline_system=False,
                 )
@@ -881,6 +908,7 @@ def _build_planned_jobs(
                                 k_value=k_eval,
                                 run_id=run_id,
                                 dataset_dir=offline_dataset_dir,
+                                method_cfg=method_cfg,
                                 topology_cfg=topology_cfg,
                                 is_offline_system=True,
                             )
@@ -1082,6 +1110,7 @@ def _write_dataset_config_snapshot(
     dataset_spec: DatasetSpec,
     generation_cfg: DictConfig,
     dataset_dir: Path,
+    generation_seed: int,
 ) -> None:
     dataset_dir.mkdir(parents=True, exist_ok=True)
     snapshot = OmegaConf.create(
@@ -1091,6 +1120,7 @@ def _write_dataset_config_snapshot(
             'topology': dataset_spec.topology_key,
             'split': dataset_spec.split,
             'seed': dataset_spec.seed,
+            'generation_seed': int(generation_seed),
             'topology_file_path': dataset_spec.topology_file_path,
             'dataset_dir': str(dataset_dir),
             'experiment': {
@@ -1226,26 +1256,56 @@ def _materialize_dataset(
     if existed_before and force:
         shutil.rmtree(dataset_dir)
 
+    generation_seed = _effective_dataset_generation_seed(
+        seed=dataset_spec.seed,
+        split=dataset_spec.split,
+    )
+    regeneration_reason: Optional[str] = None
+    if dataset_dir.exists() and not force:
+        metadata_path = dataset_dir / 'generation_metadata.json'
+        existing_generation_seed: Optional[int] = None
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+                existing_seed_raw = metadata.get('generation_seed')
+                if existing_seed_raw is not None:
+                    existing_generation_seed = int(existing_seed_raw)
+            except Exception:
+                existing_generation_seed = None
+        if existing_generation_seed is None:
+            regeneration_reason = 'missing_or_invalid_generation_seed_metadata'
+        elif existing_generation_seed != int(generation_seed):
+            regeneration_reason = (
+                f'generation_seed_mismatch:{existing_generation_seed}->{int(generation_seed)}'
+            )
+        if regeneration_reason is not None:
+            shutil.rmtree(dataset_dir)
+
     generated_now = False
     if not dataset_dir.exists():
         dataset_dir.mkdir(parents=True, exist_ok=True)
 
         p_net = PhysicalNetwork.from_setting(
             generation_cfg.p_net_setting,
-            seed=dataset_spec.seed,
+            seed=generation_seed,
         )
         p_net.save_dataset(str(dataset_dir))
 
         v_simulator = VirtualNetworkRequestSimulator.from_setting(
             generation_cfg.v_sim_setting,
-            seed=dataset_spec.seed,
+            seed=generation_seed,
         )
-        v_simulator.renew(v_nets=True, events=True, seed=dataset_spec.seed)
+        v_simulator.renew(v_nets=True, events=True, seed=generation_seed)
         v_simulator.save_dataset(str(dataset_dir))
         generated_now = True
 
     checks = _validate_event_stream_integrity(dataset_dir)
-    _write_dataset_config_snapshot(dataset_spec, generation_cfg, dataset_dir)
+    _write_dataset_config_snapshot(
+        dataset_spec=dataset_spec,
+        generation_cfg=generation_cfg,
+        dataset_dir=dataset_dir,
+        generation_seed=generation_seed,
+    )
 
     config_hash_input = OmegaConf.create(
         {
@@ -1253,13 +1313,16 @@ def _materialize_dataset(
             'topology': dataset_spec.topology_key,
             'split': dataset_spec.split,
             'seed': dataset_spec.seed,
+            'generation_seed': int(generation_seed),
             'topology_file_path': dataset_spec.topology_file_path,
             'p_net_setting': OmegaConf.to_container(generation_cfg.p_net_setting, resolve=True),
             'v_sim_setting': OmegaConf.to_container(generation_cfg.v_sim_setting, resolve=True),
         }
     )
     status = 'reused'
-    if generated_now and existed_before and force:
+    if generated_now and (force and existed_before):
+        status = 'regenerated'
+    elif generated_now and regeneration_reason is not None:
         status = 'regenerated'
     elif generated_now:
         status = 'generated'
@@ -1271,10 +1334,12 @@ def _materialize_dataset(
         'topology': dataset_spec.topology_key,
         'split': dataset_spec.split,
         'seed': dataset_spec.seed,
+        'generation_seed': int(generation_seed),
         'dataset_dir': str(dataset_dir),
         'topology_file_path': dataset_spec.topology_file_path,
         'status': status,
         'force': bool(force),
+        'regeneration_reason': regeneration_reason or '',
         'config_snapshot': str(dataset_dir / 'config_snapshot.yaml'),
         'dataset_config_sha256': _config_hash(config_hash_input),
         'event_checks': checks,
@@ -2639,6 +2704,8 @@ def _resolve_eval_job(
     overrides = _upsert_override(overrides, 'training.inference_only', 'true')
     overrides = _upsert_override(overrides, 'training.num_train_epochs', '0')
     overrides = _upsert_override(overrides, 'training.enable_async_learner', 'false')
+    overrides = _upsert_override(overrides, 'training.distributed_training', 'false')
+    overrides = _upsert_override(overrides, 'training.num_workers', '1')
     if model_path is not None:
         overrides = _upsert_override(
             overrides,
@@ -2696,7 +2763,21 @@ def _is_eval_job_completed(job: PlannedJob, save_root: Path) -> bool:
     marker_path = _eval_completion_marker_path(run_dir)
     if marker_path.exists():
         return True
-    return (run_dir / 'summary.csv').exists()
+
+    metadata_path = run_dir / 'eval_run_metadata.json'
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+            if bool(metadata.get('run_timeout', False)):
+                return True
+            returncode_raw = metadata.get('returncode')
+            if returncode_raw is None:
+                return False
+            return int(returncode_raw) == 0
+        except Exception:
+            return False
+
+    return False
 
 
 def _write_eval_completion_marker(
@@ -2825,7 +2906,9 @@ def _run_eval_job_subprocess(
     stderr_path = run_dir / 'stderr.log'
     started_at = time.perf_counter()
     run_timeout = False
+    run_failed = False
     returncode: Optional[int] = None
+    failure_reason = ''
 
     with stdout_path.open('w', encoding='utf-8') as stdout_file, stderr_path.open(
         'w', encoding='utf-8'
@@ -2844,8 +2927,15 @@ def _run_eval_job_subprocess(
             returncode = int(result.returncode)
         except subprocess.TimeoutExpired:
             run_timeout = True
+            failure_reason = 'run_watchdog_timeout'
+        except Exception as exc:
+            run_failed = True
+            failure_reason = f'subprocess_error: {exc}'
 
     elapsed_sec = max(0.0, time.perf_counter() - started_at)
+    if not run_timeout and not run_failed and returncode not in (None, 0):
+        run_failed = True
+        failure_reason = f'nonzero_exit_code:{returncode}'
     _ensure_run_timeout_in_summary(
         job=job,
         run_dir=run_dir,
@@ -2854,15 +2944,11 @@ def _run_eval_job_subprocess(
         elapsed_sec=elapsed_sec,
     )
 
-    if not run_timeout and returncode != 0:
-        raise RuntimeError(
-            f'eval job failed ({job.run_id}) with exit code {returncode}; '
-            f'see {stdout_path} and {stderr_path}'
-        )
-
     metadata = {
         'completed_at_utc': _now_iso(),
         'run_timeout': bool(run_timeout),
+        'run_failed': bool(run_failed),
+        'failure_reason': failure_reason,
         'run_watchdog_timeout_sec': float(max(0.0, watchdog_timeout_sec)),
         'returncode': returncode,
         'elapsed_sec': float(elapsed_sec),
@@ -2872,6 +2958,45 @@ def _run_eval_job_subprocess(
     }
     _write_json_atomic(run_dir / 'eval_run_metadata.json', metadata)
     return metadata
+
+
+def _run_eval_job_worker(
+    job: PlannedJob,
+    run_dir: Path,
+    env: Mapping[str, str],
+    watchdog_timeout_sec: float,
+    model_path: Optional[Path],
+) -> Dict[str, Any]:
+    metadata = _run_eval_job_subprocess(
+        job=job,
+        run_dir=run_dir,
+        env=env,
+        watchdog_timeout_sec=watchdog_timeout_sec,
+    )
+    run_timeout = bool(metadata.get('run_timeout', False))
+    run_failed = bool(metadata.get('run_failed', False))
+    returncode_raw = metadata.get('returncode')
+    returncode: Optional[int]
+    try:
+        returncode = None if returncode_raw is None else int(returncode_raw)
+    except Exception:
+        returncode = None
+
+    if not run_failed:
+        _write_eval_completion_marker(
+            job=job,
+            run_dir=run_dir,
+            model_path=model_path,
+            run_timeout=run_timeout,
+            watchdog_timeout_sec=watchdog_timeout_sec,
+        )
+
+    return {
+        'run_timeout': run_timeout,
+        'run_failed': run_failed,
+        'returncode': returncode,
+        'failure_reason': str(metadata.get('failure_reason', '')),
+    }
 
 
 def _run_train_job_subprocess(
@@ -3047,6 +3172,9 @@ def run_eval(
     registry_path, shard_dir = _resolve_train_registry_paths(suite_cfg)
     eval_cfg = suite_cfg.get('evaluation', OmegaConf.create({}))
     watchdog_timeout_sec = max(0.0, float(eval_cfg.get('run_watchdog_timeout_sec', 0.0)))
+    parallelism = int(eval_cfg.get('parallelism', 1))
+    if parallelism < 1:
+        parallelism = 1
 
     needs_registry = any(bool(methods_cfg[job.method_key].get('trainable', False)) for job in eval_jobs)
     if needs_registry:
@@ -3101,7 +3229,9 @@ def run_eval(
     executed = 0
     skipped = 0
     watchdog_timeouts = 0
+    failed_jobs: List[Tuple[str, Optional[int], str]] = []
 
+    jobs_to_run: List[Tuple[int, PlannedJob, Optional[Path]]] = []
     for idx, job in enumerate(resolved_jobs, start=1):
         eval_job = job
         model_path = model_path_by_run_id.get(job.run_id)
@@ -3135,30 +3265,97 @@ def run_eval(
                     f'using unique attempt run_id={eval_job.run_id}'
                 )
 
-        run_dir = _job_run_dir(save_root, eval_job)
-        print(f'[eval] run ({idx}/{total_jobs}) run_id={eval_job.run_id}')
-        metadata = _run_eval_job_subprocess(
-            job=eval_job,
-            run_dir=run_dir,
-            env=env,
-            watchdog_timeout_sec=watchdog_timeout_sec,
-        )
-        run_timeout = bool(metadata.get('run_timeout', False))
-        if run_timeout:
-            watchdog_timeouts += 1
+        jobs_to_run.append((idx, eval_job, model_path))
 
-        _write_eval_completion_marker(
-            job=eval_job,
-            run_dir=run_dir,
-            model_path=model_path,
-            run_timeout=run_timeout,
-            watchdog_timeout_sec=watchdog_timeout_sec,
-        )
-        executed += 1
+    if not jobs_to_run:
+        print('[eval] nothing to run after resume checks')
         print(
-            f'[eval] done ({idx}/{total_jobs}) run_id={eval_job.run_id} '
-            f'run_timeout={run_timeout}'
+            f'[eval] profile={selected_profile} jobs={total_jobs} '
+            f'executed={executed} skipped={skipped} run_timeouts={watchdog_timeouts}'
         )
+        return 0
+
+    parallelism = min(parallelism, len(jobs_to_run))
+    if parallelism == 1:
+        for idx, eval_job, model_path in jobs_to_run:
+            run_dir = _job_run_dir(save_root, eval_job)
+            print(f'[eval] run ({idx}/{total_jobs}) run_id={eval_job.run_id}')
+            outcome = _run_eval_job_worker(
+                job=eval_job,
+                run_dir=run_dir,
+                env=env,
+                watchdog_timeout_sec=watchdog_timeout_sec,
+                model_path=model_path,
+            )
+            run_timeout = bool(outcome.get('run_timeout', False))
+            run_failed = bool(outcome.get('run_failed', False))
+            returncode_raw = outcome.get('returncode')
+            returncode = int(returncode_raw) if returncode_raw is not None else None
+            failure_reason = str(outcome.get('failure_reason', ''))
+            if run_timeout:
+                watchdog_timeouts += 1
+            if run_failed:
+                failed_jobs.append((eval_job.run_id, returncode, failure_reason))
+            executed += 1
+            print(
+                f'[eval] done ({idx}/{total_jobs}) run_id={eval_job.run_id} '
+                f'run_timeout={run_timeout} run_failed={run_failed} returncode={returncode}'
+            )
+    else:
+        print(f'[eval] running with parallelism={parallelism}')
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            future_to_job: Dict[Any, Tuple[int, PlannedJob, Optional[Path]]] = {}
+            for idx, eval_job, model_path in jobs_to_run:
+                run_dir = _job_run_dir(save_root, eval_job)
+                print(f'[eval] run ({idx}/{total_jobs}) run_id={eval_job.run_id}')
+                future = executor.submit(
+                    _run_eval_job_worker,
+                    eval_job,
+                    run_dir,
+                    env,
+                    watchdog_timeout_sec,
+                    model_path,
+                )
+                future_to_job[future] = (idx, eval_job, model_path)
+
+            for future in as_completed(future_to_job):
+                idx, eval_job, _model_path = future_to_job[future]
+                try:
+                    outcome = future.result()
+                    run_timeout = bool(outcome.get('run_timeout', False))
+                    run_failed = bool(outcome.get('run_failed', False))
+                    returncode_raw = outcome.get('returncode')
+                    returncode = int(returncode_raw) if returncode_raw is not None else None
+                    failure_reason = str(outcome.get('failure_reason', ''))
+                except Exception as exc:
+                    run_timeout = False
+                    run_failed = True
+                    returncode = None
+                    failure_reason = str(exc)
+                if run_timeout:
+                    watchdog_timeouts += 1
+                if run_failed:
+                    failed_jobs.append((eval_job.run_id, returncode, failure_reason))
+                executed += 1
+                print(
+                    f'[eval] done ({idx}/{total_jobs}) run_id={eval_job.run_id} '
+                    f'run_timeout={run_timeout} run_failed={run_failed} returncode={returncode}'
+                )
+
+    if failed_jobs:
+        print('[eval] completed with failures')
+        print(
+            f'[eval] profile={selected_profile} jobs={total_jobs} '
+            f'executed={executed} skipped={skipped} run_timeouts={watchdog_timeouts} '
+            f'failed={len(failed_jobs)}'
+        )
+        for run_id, returncode, reason in failed_jobs:
+            reason_text = reason if reason else 'unknown_failure'
+            print(
+                f'[eval] failed_run run_id={run_id} returncode={returncode} '
+                f'reason={reason_text}'
+            )
+        return 1
 
     print('[eval] success')
     print(

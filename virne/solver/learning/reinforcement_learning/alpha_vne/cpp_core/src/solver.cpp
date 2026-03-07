@@ -1018,6 +1018,22 @@ SolveResult solve_vnr(
 
     result.metrics.steps = static_cast<int>(result.actions.size());
     result.node_slots = current_state.node_slots();
+    if (result.place_result && !result.rejected) {
+        bool placement_complete = static_cast<int>(result.node_slots.size()) == virtual_net.num_nodes;
+        if (placement_complete) {
+            for (int slot : result.node_slots) {
+                if (slot < 0) {
+                    placement_complete = false;
+                    break;
+                }
+            }
+        }
+        if (!placement_complete) {
+            result.place_result = false;
+            result.place_info["incomplete_placement"] = 1.0;
+            result.place_info["node_slots_size"] = static_cast<double>(result.node_slots.size());
+        }
+    }
     if (!result.place_result || result.rejected) {
         result.route_result = false;
     } else {

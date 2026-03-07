@@ -44,6 +44,7 @@ training:
   # Learner control
   guaranteed_save_step: 50
   learner_throttle_ms: 0
+  signal_stop_event_on_learner_complete: false  # If true, learner sets stop_event when it exits
   # C++ MCTS implementation toggle
   use_cpp_mcts: true        # Use C++ implementation for MCTS (much faster)
   use_neural_network: true  # Enable neural network usage

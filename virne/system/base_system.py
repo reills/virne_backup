@@ -116,6 +116,9 @@ class BaseSystem:
         with open_dict(config):
             config.p_net_setting.topology.num_nodes = p_net.num_nodes
             config.simulation.p_net_num_nodes = p_net.num_nodes
+            config.simulation.p_net_setting_num_nodes = p_net.num_nodes
+            if getattr(config, "rl", None) is not None and getattr(config.rl, "feature_constructor", None) is not None:
+                config.rl.feature_constructor.p_num_nodes = p_net.num_nodes
         v_net_simulator = VirtualNetworkRequestSimulator.from_setting(config.v_sim_setting, seed=config.experiment.seed)
         return p_net, v_net_simulator
 

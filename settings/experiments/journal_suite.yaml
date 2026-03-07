@@ -21,6 +21,7 @@ journal_suite:
     run_watchdog_timeout_sec: 0.0
     record_arrival_solve_time: true
     gpu_synchronize_timing: true
+    parallelism: 2
 
   safety:
     strict_hydra_key_validation: true
@@ -83,10 +84,13 @@ journal_suite:
     nominal:
       train_split: train
       eval_split: test
+      v_sim_setting_overrides:
+        num_v_nets: 1000
     generalization:
       train_split: train
       eval_split: test
       v_sim_setting_overrides:
+        num_v_nets: 1000
         arrival_rate:
           lam: 0.06
         v_net_size:
@@ -98,6 +102,13 @@ journal_suite:
       solver_name: alpha_zero_sfc
       trainable: true
       train_k_values: [10]
+      overrides:
+        train:
+          - training.computation_budget=64
+          - training.max_training_steps=24000
+          - training.num_train_steps_per_epoch=40
+        eval:
+          - training.computation_budget=64
     mcts:
       solver_name: mcts
       trainable: false
@@ -178,6 +189,7 @@ journal_suite:
       - training.inference_only=true
       - training.num_train_epochs=0
       - training.enable_async_learner=false
+      - training.disable_trajectory_writing=true
 
   thread_env:
     OMP_NUM_THREADS: '1'
