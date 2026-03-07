@@ -83,7 +83,7 @@ class OptimizedAlphaZeroActor(Solver):
 
         # Dirichlet noise for root exploration (AlphaZero style)
         self.dirichlet_epsilon = getattr(config.training, 'dirichlet_epsilon', 0.25)
-        self.dirichlet_alpha = getattr(config.training, 'dirichlet_alpha', 0.03)
+        self.dirichlet_alpha = getattr(config.training, 'dirichlet_alpha', 0.1)
 
         # Temperature schedule for MCTS action selection.
         # Keep legacy temperature_train/temperature_eval fields for compatibility.
@@ -323,6 +323,8 @@ class OptimizedAlphaZeroActor(Solver):
 
         # Create static environment data (only needed when training and writing trajectories)
         write_trajectory = training and not self.disable_trajectory_writing
+        if write_trajectory:
+            self._log_active_temperature(temperature)
         static_environment = self._create_static_environment(p_net, v_net) if write_trajectory else None
 
         current_node = Node(
@@ -505,13 +507,28 @@ class OptimizedAlphaZeroActor(Solver):
             return
         self._temperature_step = min(self._temperature_step + 1, self.temperature_anneal_steps)
 
+    def _log_active_temperature(self, temperature: float) -> None:
+        """Emit the active actor temperature used for data generation."""
+        if self.logger is None:
+            return
+        try:
+            self.logger.info(
+                "Actor data-generation temperature: step=%s/%s value=%.6f",
+                int(self._temperature_step),
+                int(max(self.temperature_anneal_steps, 0)),
+                float(temperature),
+            )
+        except Exception:
+            pass
+
     def _select_best_child(self, node: Node, temperature: float = 1.0) -> Node:
         """Select best child with guardrails for invalid zero-visit states."""
         num_nodes = self._state_num_nodes(node.state)
+        allow_rejection = bool(getattr(node.state, 'allow_rejection', False))
         selectable_children = [
             child for child in node.children
             if (0 <= child.state.p_node_id < num_nodes)
-            or child.state.p_node_id == num_nodes
+            or (allow_rejection and child.state.p_node_id == num_nodes)
             or child.state.p_node_id == -1
         ]
         if not selectable_children:
@@ -850,9 +867,10 @@ class OptimizedAlphaZeroActor(Solver):
                 pi = [0.0] * num_actions
                 cand_nodes = self._candidate_actions(state, v_node_id)
                 reject_idx = self._state_num_nodes(state)
+                allow_rejection = bool(getattr(state, "allow_rejection", False))
                 if not cand_nodes:
                     # If REJECT action exists, put full prob on reject; else uniform over all actions
-                    if num_actions > reject_idx:
+                    if allow_rejection and num_actions > reject_idx:
                         pi[reject_idx] = 1.0
                     else:
                         # Avoid all-zero vector: uniform over all actions
@@ -871,12 +889,13 @@ class OptimizedAlphaZeroActor(Solver):
         # Action mask for loss masking (optional)
         candidate_nodes = self._candidate_actions(state, v_node_id)
         reject_idx = self._state_num_nodes(state)
+        allow_rejection = bool(getattr(state, "allow_rejection", False))
         action_mask = [False] * num_actions
         for node_id in candidate_nodes:
             if 0 <= node_id < num_actions:
                 action_mask[node_id] = True
         # REJECT action at last index if present
-        if num_actions > reject_idx:
+        if allow_rejection and num_actions > reject_idx:
             action_mask[reject_idx] = True
 
         return {
@@ -985,6 +1004,8 @@ class OptimizedAlphaZeroActor(Solver):
 
         pure_cpp = bool(self.pure_cpp)
         write_trajectory = training and not self.disable_trajectory_writing
+        if write_trajectory:
+            self._log_active_temperature(self.get_action_selection_temperature(training))
         static_environment = self._create_static_environment(p_net, v_net) if write_trajectory else None
 
         max_buffer_size = 500000
@@ -1160,7 +1181,7 @@ class OptimizedAlphaZeroActor(Solver):
                 for node_id in candidate_nodes:
                     if 0 <= node_id < num_actions:
                         action_mask[node_id] = True
-                if num_actions > reject_idx:
+                if bool(getattr(state, "allow_rejection", False)) and num_actions > reject_idx:
                     action_mask[reject_idx] = True
 
                 trajectory.append({
@@ -1251,6 +1272,8 @@ class OptimizedAlphaZeroActor(Solver):
             training = not self.disable_trajectory_writing
         temperature = self.get_action_selection_temperature(training)
         write_trajectory = training and not self.disable_trajectory_writing
+        if write_trajectory:
+            self._log_active_temperature(temperature)
 
         current_node = Node(
             None,

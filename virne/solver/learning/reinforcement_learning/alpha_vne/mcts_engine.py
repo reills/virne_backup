@@ -86,8 +86,7 @@ class MCTSEngine:
                 return float(np.tanh(value / scale))
             except Exception:
                 return float(np.tanh(value))
-        # 'popart' and 'raw' both pass through raw values;
-        # learner-side PopArt normalizes targets during training.
+        # Raw mode keeps terminal rewards in their original scale.
         return float(value)
 
     def search(self, root_node: Node, v_node_id: int) -> None:
@@ -164,11 +163,12 @@ class MCTSEngine:
             return int(state.p_net.num_nodes)
 
         num_nodes = _num_nodes(node.state)
+        allow_rejection = bool(getattr(node.state, "allow_rejection", False))
 
         def _is_selectable(child: Node) -> bool:
             pid = child.state.p_node_id
             # Allow normal placements and explicit reject (num_nodes). Treat -1 as fallback.
-            return (0 <= pid < num_nodes) or pid == num_nodes or pid == -1
+            return (0 <= pid < num_nodes) or (allow_rejection and pid == num_nodes) or pid == -1
 
         selectable_children = [child for child in node.children if _is_selectable(child)]
         if not selectable_children:
@@ -224,10 +224,11 @@ class MCTSEngine:
             return int(state.p_net.num_nodes)
 
         num_nodes = _num_nodes(node.state)
+        allow_rejection = bool(getattr(node.state, "allow_rejection", False))
 
         def _is_selectable(child: Node) -> bool:
             pid = child.state.p_node_id
-            return (0 <= pid < num_nodes) or pid == num_nodes or pid == -1
+            return (0 <= pid < num_nodes) or (allow_rejection and pid == num_nodes) or pid == -1
 
         selectable_children = [child for child in node.children if _is_selectable(child)]
         if not selectable_children:

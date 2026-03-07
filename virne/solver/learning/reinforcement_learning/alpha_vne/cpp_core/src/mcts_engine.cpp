@@ -43,6 +43,39 @@ int64_t find_max_action_id(const Container& entries) {
 }
 
 std::atomic<std::int64_t> g_state_id_counter{1};
+
+std::vector<float> normalize_nonnegative(const std::vector<float>& values) {
+    std::vector<float> probs(values.size(), 0.0f);
+    if (values.empty()) {
+        return probs;
+    }
+    double total = 0.0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        float v = values[i];
+        if (!std::isfinite(v) || v < 0.0f) {
+            v = 0.0f;
+        }
+        probs[i] = v;
+        total += static_cast<double>(v);
+    }
+    if (total <= 1e-12) {
+        const float uniform = 1.0f / static_cast<float>(values.size());
+        std::fill(probs.begin(), probs.end(), uniform);
+        return probs;
+    }
+    const float inv_total = static_cast<float>(1.0 / total);
+    for (auto& p : probs) {
+        p *= inv_total;
+    }
+    return probs;
+}
+
+float dynamic_root_dirichlet_alpha(std::size_t num_children) {
+    if (num_children == 0) {
+        return 0.1f;
+    }
+    return std::clamp(10.0f / static_cast<float>(num_children), 0.03f, 0.30f);
+}
 }  // namespace
 
 float MCTSEngine::normalize_terminal_value(float raw, const std::shared_ptr<StateView>& state) const {
@@ -373,15 +406,21 @@ float MCTSEngine::expand(TreeNode& node) {
     priors_cpu = priors_cpu.contiguous();
     auto priors_acc = priors_cpu.accessor<float, 1>();
 
-    for (auto& [action, child_state] : options) {
+    std::vector<float> option_priors;
+    option_priors.reserve(options.size());
+    for (const auto& [action, child_state] : options) {
+        (void)child_state;
         float prior = 0.0f;
         if (action >= 0 && action < priors_cpu.size(0)) {
             prior = priors_acc[action];
-        } else {
-            // Fallback uniform prior for this action
-            prior = 1.0f / static_cast<float>(options.size());
         }
-        node.add_child(action, std::move(child_state), prior);
+        option_priors.push_back(prior);
+    }
+    option_priors = normalize_nonnegative(option_priors);
+
+    for (std::size_t i = 0; i < options.size(); ++i) {
+        auto& [action, child_state] = options[i];
+        node.add_child(action, std::move(child_state), option_priors[i]);
     }
 
     if (node.parent() == nullptr && config_.add_root_noise && !root_noise_applied_ && config_.use_neural_network) {
@@ -429,25 +468,24 @@ void MCTSEngine::revert_virtual_loss(TreeNode* node) {
 
 void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
     auto state = root.state();
-    auto logits = state->policy_logits.squeeze();
-    auto mask = state->action_mask.defined()
-                    ? state->action_mask.squeeze().to(torch::kBool)
-                    : torch::ones_like(logits, torch::TensorOptions().dtype(torch::kBool));
-    auto priors = masked_softmax(logits, mask);
-
     std::vector<int64_t> valid_actions;
+    std::vector<float> base_priors;
     valid_actions.reserve(root.children_ref().size());
+    base_priors.reserve(root.children_ref().size());
     for (const auto& [action, child] : root.children_ref()) {
-        (void)child;
-        if (action >= 0 && action < priors.size(0)) {
+        if (child && action >= 0) {
             valid_actions.push_back(action);
+            base_priors.push_back(child->prior());
         }
     }
     if (valid_actions.empty()) {
         return;
     }
 
-    std::gamma_distribution<float> gamma(config_.dirichlet_alpha, 1.0f);
+    base_priors = normalize_nonnegative(base_priors);
+
+    const float alpha = dynamic_root_dirichlet_alpha(valid_actions.size());
+    std::gamma_distribution<float> gamma(alpha, 1.0f);
     std::vector<float> noise_vals;
     noise_vals.reserve(valid_actions.size());
     float noise_sum = 0.0f;
@@ -463,23 +501,45 @@ void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
         v /= noise_sum;
     }
 
-    auto noise = torch::zeros_like(priors);
-    auto action_idx = torch::tensor(valid_actions, torch::TensorOptions().dtype(torch::kInt64).device(priors.device()));
-    auto noise_tensor = torch::tensor(noise_vals, torch::TensorOptions().dtype(priors.dtype()).device(priors.device()));
-    noise.index_put_({action_idx}, noise_tensor);
-
-    auto mixed = (1.0f - config_.dirichlet_epsilon) * priors + config_.dirichlet_epsilon * noise;
-    state->policy_logits = torch::log(mixed + 1e-8f);
-
-    torch::Tensor mixed_cpu = mixed;
-    if (mixed.device().is_cuda()) {
-        mixed_cpu = mixed.to(torch::kCPU);
+    std::vector<float> mixed_vals(valid_actions.size(), 0.0f);
+    for (std::size_t i = 0; i < valid_actions.size(); ++i) {
+        mixed_vals[i] = (1.0f - config_.dirichlet_epsilon) * base_priors[i]
+                        + config_.dirichlet_epsilon * noise_vals[i];
     }
-    mixed_cpu = mixed_cpu.contiguous();
-    auto mixed_acc = mixed_cpu.accessor<float, 1>();
+    mixed_vals = normalize_nonnegative(mixed_vals);
+
+    int64_t num_actions = infer_action_space_size(state);
+    auto max_action = find_max_action_id(root.children_ref());
+    if (max_action >= 0) {
+        num_actions = std::max<int64_t>(num_actions, max_action + 1);
+    }
+    if (num_actions <= 0) {
+        num_actions = std::max<int64_t>(1, static_cast<int64_t>(valid_actions.size()));
+    }
+
+    auto logits = torch::full({num_actions}, -1e9f, torch::TensorOptions().dtype(torch::kFloat32));
+    for (std::size_t i = 0; i < valid_actions.size(); ++i) {
+        int64_t action = valid_actions[i];
+        float prob = std::max(1e-8f, mixed_vals[i]);
+        if (action >= 0 && action < num_actions) {
+            logits[action] = std::log(prob);
+        }
+    }
+    state->policy_logits = logits;
+
+    std::unordered_map<int64_t, float> mixed_by_action;
+    mixed_by_action.reserve(valid_actions.size());
+    for (std::size_t i = 0; i < valid_actions.size(); ++i) {
+        mixed_by_action[valid_actions[i]] = mixed_vals[i];
+    }
+
     for (const auto& [action, child] : root.children_ref()) {
-        if (child && action >= 0 && action < mixed_cpu.size(0)) {
-            child->set_prior(mixed_acc[action]);
+        if (!child || action < 0) {
+            continue;
+        }
+        auto it = mixed_by_action.find(action);
+        if (it != mixed_by_action.end()) {
+            child->set_prior(it->second);
         }
     }
 }

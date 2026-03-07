@@ -646,7 +646,7 @@ def create_cpp_adapter(actor, computation_budget: int):
         actor,
         computation_budget=computation_budget,
         c_puct=getattr(actor, "c_puct", 1.0),
-        dirichlet_alpha=getattr(actor, "dirichlet_alpha", 0.03),
+        dirichlet_alpha=getattr(actor, "dirichlet_alpha", 0.1),
         dirichlet_epsilon=getattr(actor, "dirichlet_epsilon", 0.25),
         use_neural_network=getattr(actor, "use_neural_network", True),
         rollout_depth_limit=getattr(actor, "rollout_depth_limit", 100),
@@ -710,7 +710,7 @@ class CppFullSolver:
         cfg = cpp_core.SearchConfig()
         cfg.simulations = int(self.computation_budget)
         cfg.c_puct = float(getattr(self.actor, "c_puct", 1.0))
-        cfg.dirichlet_alpha = float(getattr(self.actor, "dirichlet_alpha", 0.03))
+        cfg.dirichlet_alpha = float(getattr(self.actor, "dirichlet_alpha", 0.1))
         cfg.dirichlet_epsilon = float(getattr(self.actor, "dirichlet_epsilon", 0.25))
         cfg.use_neural_network = bool(getattr(self.actor, "use_neural_network", True))
         cfg.rollout_depth_limit = int(getattr(self.actor, "rollout_depth_limit", 100))

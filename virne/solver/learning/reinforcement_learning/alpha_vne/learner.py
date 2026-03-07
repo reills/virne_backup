@@ -22,50 +22,6 @@ from .value_target import (
 
 
 # ---------------------------------------------------------------------------
-# PopArt Normalizer: adaptive normalization tracking running mean/std of
-# value targets.  Allows the value head to regress normalized targets while
-# preserving the true scale of rewards.
-# ---------------------------------------------------------------------------
-class PopArtNormalizer:
-    """Running mean/variance normalizer for value targets (PopArt-lite)."""
-
-    def __init__(self, beta: float = 0.001):
-        self.beta = beta
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = 0
-
-    def update(self, values: torch.Tensor):
-        """Update running statistics with a batch of raw target values."""
-        batch_mean = values.mean().item()
-        batch_var = values.var().item() if values.numel() > 1 else 0.0
-        n = values.numel()
-
-        if self.count == 0:
-            self.mean = batch_mean
-            self.var = batch_var if batch_var > 0 else 1.0
-        else:
-            self.mean = (1 - self.beta) * self.mean + self.beta * batch_mean
-            self.var = (1 - self.beta) * self.var + self.beta * batch_var
-
-        self.count += n
-
-    def normalize(self, values: torch.Tensor) -> torch.Tensor:
-        """Normalize raw values using running statistics."""
-        std = max(self.var ** 0.5, 1e-6)
-        return (values - self.mean) / std
-
-    def state_dict(self):
-        return {'mean': self.mean, 'var': self.var, 'count': self.count, 'beta': self.beta}
-
-    def load_state_dict(self, d):
-        self.mean = d.get('mean', 0.0)
-        self.var = d.get('var', 1.0)
-        self.count = d.get('count', 0)
-        self.beta = d.get('beta', self.beta)
-
-
-# ---------------------------------------------------------------------------
 # Transition Buffer: flattens episodes into individual transitions so the
 # learner samples *positions* uniformly rather than one-per-file.
 # ---------------------------------------------------------------------------
@@ -338,7 +294,13 @@ class AlphaZeroLearner:
             'max_seq_len': getattr(config.nn, 'max_seq_len', 15),
         }
         self.policy = ActorCritic(**self.model_config).to(self.device)
-        self.value_target_mode = str(getattr(config.training, "value_target_mode", "acceptance_first")).lower()
+        configured_mode = str(getattr(config.training, "value_target_mode", "acceptance_first")).lower()
+        if configured_mode != "acceptance_first":
+            logger.warning(
+                "Unsupported value_target_mode=%s; forcing acceptance_first.",
+                configured_mode,
+            )
+        self.value_target_mode = "acceptance_first"
 
         # Load pretrained weights if specified
         model_loaded = False
@@ -399,22 +361,11 @@ class AlphaZeroLearner:
                     if 'optimizer' in ckpt:
                         self.optimizer.load_state_dict(ckpt['optimizer'])
                         logger.info("Optimizer state restored from latest full checkpoint")
-                    # Restore PopArt state if available
-                    if 'popart' in ckpt:
-                        self.value_normalizer = PopArtNormalizer()
-                        self.value_normalizer.load_state_dict(ckpt['popart'])
-                        logger.info("PopArt normalizer state restored")
                     if 'value_target_builder' in ckpt:
                         self.value_target_builder.load_state_dict(ckpt['value_target_builder'])
                         logger.info("Acceptance-first value target stats restored")
         except Exception as e:
             logger.warning(f"Failed to restore optimizer state: {e}")
-
-        # PopArt normalizer for value targets
-        if not hasattr(self, 'value_normalizer'):
-            self.value_normalizer = PopArtNormalizer(
-                beta=float(getattr(config.training, 'popart_beta', 0.001))
-            )
 
         # Transition-level replay index + bounded episode cache.
         buffer_max = getattr(config.training, 'transition_buffer_max_size', 200_000)
@@ -424,24 +375,11 @@ class AlphaZeroLearner:
             episode_cache_size=episode_cache_size,
         )
 
-        # Temperature annealing schedule (Task 4)
-        self.temp_start = float(getattr(config.training, 'temperature_start', 1.0))
-        self.temp_end = float(getattr(config.training, 'temperature_end', 0.5))
-        self.temp_anneal_steps = int(getattr(config.training, 'temperature_anneal_steps', 5000))
-
         # TensorBoard logging
         from virne.utils.config import get_run_id_dir
         tb_log_dir = os.path.join(get_run_id_dir(config), "logs")
         self.writer = SummaryWriter(tb_log_dir)
         self.global_step = 0
-
-    # ------------------------------------------------------------------
-    def _get_temperature(self) -> float:
-        """Compute annealed temperature based on global_step."""
-        if self.temp_anneal_steps <= 0:
-            return self.temp_start
-        frac = min(1.0, self.global_step / self.temp_anneal_steps)
-        return self.temp_start + frac * (self.temp_end - self.temp_start)
 
     # ------------------------------------------------------------------
     def train_steps(self, num_steps: int) -> None:
@@ -468,9 +406,9 @@ class AlphaZeroLearner:
 
             batch_obs, batch_policies, batch_values, batch_masks = batch
 
-            # Update temperature on the model for actor logits (Task 4)
-            current_temp = self._get_temperature()
-            self.policy.temperature = current_temp
+            # Keep learner-side policy logits unscaled; actor-side action-selection
+            # temperature controls exploration during data generation.
+            self.policy.temperature = 1.0
 
             self.optimizer.zero_grad()
 
@@ -487,7 +425,7 @@ class AlphaZeroLearner:
             else:
                 loss_policy = -(batch_policies * log_probs).sum(dim=-1).mean()
 
-            # Value loss: MSE on PopArt-normalized targets (Task 2)
+            # Value loss: MSE on acceptance-first bounded targets.
             loss_value = F.mse_loss(predicted_values, batch_values)
 
             # L2 regularization
@@ -516,24 +454,19 @@ class AlphaZeroLearner:
                 self.writer.add_scalar('Loss/Total', total_loss.item(), self.global_step)
                 self.writer.add_scalar('Training/GradNorm', grad_norm.item(), self.global_step)
                 self.writer.add_scalar('Training/LearningRate', self.optimizer.param_groups[0]['lr'], self.global_step)
-                self.writer.add_scalar('Training/Temperature', current_temp, self.global_step)
                 self.writer.add_scalar('Training/BufferSize', len(self.transition_buffer), self.global_step)
-                if self.value_target_mode == "acceptance_first":
-                    if self.value_target_builder.accepted_cost_min is not None:
-                        self.writer.add_scalar(
-                            'Training/AcceptedCostMin',
-                            float(self.value_target_builder.accepted_cost_min),
-                            self.global_step,
-                        )
-                    if self.value_target_builder.accepted_cost_max is not None:
-                        self.writer.add_scalar(
-                            'Training/AcceptedCostMax',
-                            float(self.value_target_builder.accepted_cost_max),
-                            self.global_step,
-                        )
-                else:
-                    self.writer.add_scalar('Training/PopArtMean', self.value_normalizer.mean, self.global_step)
-                    self.writer.add_scalar('Training/PopArtStd', max(self.value_normalizer.var ** 0.5, 1e-6), self.global_step)
+                if self.value_target_builder.accepted_cost_min is not None:
+                    self.writer.add_scalar(
+                        'Training/AcceptedCostMin',
+                        float(self.value_target_builder.accepted_cost_min),
+                        self.global_step,
+                    )
+                if self.value_target_builder.accepted_cost_max is not None:
+                    self.writer.add_scalar(
+                        'Training/AcceptedCostMax',
+                        float(self.value_target_builder.accepted_cost_max),
+                        self.global_step,
+                    )
 
                 pred_actions = predicted_logits.argmax(dim=-1)
                 target_actions = batch_policies.argmax(dim=-1)
@@ -548,7 +481,10 @@ class AlphaZeroLearner:
                         mem_str = ""
                 except Exception:
                     mem_str = ""
-                self.logger.info(f"Learner Step {self.global_step}: policy_acc={policy_accuracy.item():.3f} loss_p={loss_policy.item():.4f} loss_v={loss_value.item():.4f} temp={current_temp:.3f}{mem_str}")
+                self.logger.info(
+                    f"Learner Step {self.global_step}: policy_acc={policy_accuracy.item():.3f} "
+                    f"loss_p={loss_policy.item():.4f} loss_v={loss_value.item():.4f}{mem_str}"
+                )
 
             # Save model periodically
             if (step + 1) % save_interval == 0:
@@ -626,7 +562,6 @@ class AlphaZeroLearner:
             'optimizer': self.optimizer.state_dict(),
             'global_step': self.global_step,
             'sha256': sha,
-            'popart': self.value_normalizer.state_dict(),
             'value_target_mode': self.value_target_mode,
             'value_target_builder': self.value_target_builder.state_dict(),
         }
@@ -749,44 +684,40 @@ class AlphaZeroLearner:
             obs_list.append(obs_gpu)
             batch_policies.append(torch.tensor(pi, dtype=torch.float32))
 
-            if self.value_target_mode == "acceptance_first":
-                explicit_target = t.get('value_target', None)
-                if explicit_target is not None:
-                    try:
-                        target = float(explicit_target)
-                    except Exception:
-                        target = None
-                else:
+            explicit_target = t.get('value_target', None)
+            if explicit_target is not None:
+                try:
+                    target = float(explicit_target)
+                except Exception:
                     target = None
-
-                raw_reward = t.get('final_reward_raw', t.get('final_reward', 0.0))
-                accepted_field = t.get('accepted', None)
-                if accepted_field is None:
-                    accepted = float(raw_reward) > 0.0
-                else:
-                    accepted = bool(accepted_field)
-
-                total_cost = t.get('total_cost', None)
-                total_revenue = t.get('total_revenue', None)
-                if total_revenue is None:
-                    total_revenue = infer_total_revenue_from_static_env(t.get('static_environment'))
-                if total_cost is None and accepted:
-                    total_cost = infer_total_cost_from_reward(total_revenue, raw_reward)
-
-                if target is None:
-                    target = self.value_target_builder.compute_target(
-                        accepted=accepted,
-                        total_cost=total_cost,
-                        total_revenue=total_revenue,
-                        raw_reward=raw_reward,
-                        update_stats=True,
-                    )
-                elif accepted and total_cost is not None:
-                    self.value_target_builder.update_cost_stats(total_cost)
-                batch_values_target.append(float(target))
             else:
-                final_reward = t['final_reward']
-                batch_values_target.append(float(final_reward))
+                target = None
+
+            raw_reward = t.get('final_reward_raw', t.get('final_reward', 0.0))
+            accepted_field = t.get('accepted', None)
+            if accepted_field is None:
+                accepted = float(raw_reward) > 0.0
+            else:
+                accepted = bool(accepted_field)
+
+            total_cost = t.get('total_cost', None)
+            total_revenue = t.get('total_revenue', None)
+            if total_revenue is None:
+                total_revenue = infer_total_revenue_from_static_env(t.get('static_environment'))
+            if total_cost is None and accepted:
+                total_cost = infer_total_cost_from_reward(total_revenue, raw_reward)
+
+            if target is None:
+                target = self.value_target_builder.compute_target(
+                    accepted=accepted,
+                    total_cost=total_cost,
+                    total_revenue=total_revenue,
+                    raw_reward=raw_reward,
+                    update_stats=True,
+                )
+            elif accepted and total_cost is not None:
+                self.value_target_builder.update_cost_stats(total_cost)
+            batch_values_target.append(float(target))
 
             if mask is not None:
                 batch_masks.append(torch.tensor(mask, dtype=torch.float32))
@@ -796,13 +727,7 @@ class AlphaZeroLearner:
         if not obs_list:
             return None
 
-        raw_values = torch.tensor(batch_values_target, dtype=torch.float32)
-        if self.value_target_mode == "acceptance_first":
-            final_values = raw_values
-        else:
-            # Legacy PopArt normalization mode.
-            self.value_normalizer.update(raw_values)
-            final_values = self.value_normalizer.normalize(raw_values)
+        final_values = torch.tensor(batch_values_target, dtype=torch.float32)
 
         return self._collate_batch(obs_list, batch_policies, final_values, batch_masks)
 
@@ -894,7 +819,7 @@ class AlphaZeroLearner:
                     total_cost = infer_total_cost_from_reward(total_revenue, raw_reward)
                 if explicit_target is not None:
                     z = float(explicit_target)
-                elif self.value_target_mode == "acceptance_first":
+                else:
                     z = float(
                         self.value_target_builder.compute_target(
                             accepted=accepted,
@@ -904,9 +829,6 @@ class AlphaZeroLearner:
                             update_stats=False,
                         )
                     )
-                else:
-                    raw_val = torch.tensor([float(raw_reward)], dtype=torch.float32)
-                    z = self.value_normalizer.normalize(raw_val).item()
                 preds.append(pv)
                 targets.append(z)
             except Exception:

@@ -16,7 +16,7 @@ namespace azsfc {
 struct SearchConfig {
     int simulations = 32;
     float c_puct = 1.0f;
-    float dirichlet_alpha = 0.3f;
+    float dirichlet_alpha = 0.1f;
     float dirichlet_epsilon = 0.25f;
     float virtual_loss = 1.0f;
     bool add_root_noise = true;

@@ -12,7 +12,7 @@ from torch_geometric.nn import global_mean_pool
 
 
 class MultiHeadGENLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, aggr='softmax', edge_dim=1):
+    def __init__(self, in_dim, out_dim, aggr='softmax', edge_dim=1, gnn_dropout: float = 0.1):
         super().__init__()
         self.conv = GENConv(
             in_channels=in_dim,
@@ -24,7 +24,7 @@ class MultiHeadGENLayer(nn.Module):
             num_layers=2
         )
         self.norm = nn.LayerNorm(out_dim)
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(float(gnn_dropout))
         self.edge_mlp = nn.Sequential(
             nn.Linear(2 * out_dim, out_dim),
             nn.GELU(),
@@ -83,7 +83,7 @@ class SharedBackbone(nn.Module):
     """Shared GNN encoder and Transformer decoder used by both policy and value heads."""
 
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=4, dropout=0.1, max_seq_len=15,
+                 n_heads=8, n_layers=4, dropout=0.1, gnn_dropout=0.1, max_seq_len=15,
                  p_net_edge_dim=1, gnn_layers=3):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -98,7 +98,8 @@ class SharedBackbone(nn.Module):
             MultiHeadGENLayer(
                 in_dim=p_net_feature_dim if i == 0 else embedding_dim,
                 out_dim=embedding_dim,
-                edge_dim=p_net_edge_dim if i == 0 else embedding_dim
+                edge_dim=p_net_edge_dim if i == 0 else embedding_dim,
+                gnn_dropout=gnn_dropout,
             )
             for i in range(gnn_layers)
         ])
@@ -262,6 +263,7 @@ class ActorCritic(nn.Module):
 
         max_seq_len = kwargs.get("max_seq_len", 15)
         allow_rejection = bool(kwargs.get("allow_rejection", False))
+        gnn_dropout = float(kwargs.get("gnn_dropout", 0.1))
 
         self.encoder = Encoder(v_net_feature_dim, embedding_dim, n_heads, n_layers, dropout, max_seq_len=max_seq_len)
 
@@ -273,6 +275,7 @@ class ActorCritic(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
+            gnn_dropout=gnn_dropout,
             max_seq_len=max_seq_len,
             p_net_edge_dim=p_net_edge_dim,
             gnn_layers=gnn_layers,
@@ -579,7 +582,7 @@ class AutoregressiveDecoder(nn.Module):
     but delegates to a SharedBackbone and PolicyHead internally."""
 
     def __init__(self, p_net_num_nodes, p_net_feature_dim, embedding_dim=128,
-                 n_heads=8, n_layers=4, dropout=0.1, is_actor=True,
+                 n_heads=8, n_layers=4, dropout=0.1, gnn_dropout=0.1, is_actor=True,
                  allow_revocable=False, allow_rejection=False, use_amp=False, max_seq_len=15,
                  p_net_edge_dim=1, gnn_layers=3):
         super().__init__()
@@ -602,6 +605,7 @@ class AutoregressiveDecoder(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
+            gnn_dropout=gnn_dropout,
             max_seq_len=max_seq_len,
             p_net_edge_dim=p_net_edge_dim,
             gnn_layers=gnn_layers,

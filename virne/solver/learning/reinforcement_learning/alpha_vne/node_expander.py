@@ -31,7 +31,7 @@ class NodeExpander:
         policy_network: PolicyNetwork,
         observation_builder: ObservationBuilder,
         controller,
-        dirichlet_alpha: float = 0.03,
+        dirichlet_alpha: float = 0.1,
         dirichlet_epsilon: float = 0.25,
         use_nn_policy: bool = True,
         use_nn_value: bool = True,
@@ -64,6 +64,59 @@ class NodeExpander:
         self.logger = logger
         self.timers = timers
         self.sync_cuda_timing = bool(sync_cuda_timing)
+
+    @staticmethod
+    def _renormalize_priors(priors: List[float]) -> List[float]:
+        cleaned = [
+            float(p) if (p == p and p > 0.0 and p < float("inf")) else 0.0
+            for p in priors
+        ]
+        total = float(sum(cleaned))
+        if total <= 1e-12:
+            n = max(len(cleaned), 1)
+            return [1.0 / n] * len(cleaned)
+        return [p / total for p in cleaned]
+
+    def _effective_root_dirichlet_alpha(self, num_feasible_children: int) -> float:
+        """Use dynamic root-alpha scaling over feasible root children."""
+        if num_feasible_children <= 0:
+            return max(float(self.dirichlet_alpha), 1e-6)
+        return float(np.clip(10.0 / float(num_feasible_children), 0.03, 0.30))
+
+    def _apply_root_dirichlet_noise(
+        self,
+        priors: List[float],
+        candidate_states: List[State],
+    ) -> List[float]:
+        """Mix Dirichlet noise over surviving feasible root children only."""
+        if not candidate_states:
+            return []
+
+        mixed_priors = list(priors)
+        feasible_indices = [i for i, st in enumerate(candidate_states) if int(st.p_node_id) >= 0]
+        if not feasible_indices:
+            return self._renormalize_priors(mixed_priors)
+
+        base = np.array([max(0.0, float(mixed_priors[i])) for i in feasible_indices], dtype=np.float64)
+        base_sum = float(base.sum())
+        if base_sum <= 1e-12:
+            base = np.full(len(feasible_indices), 1.0 / float(len(feasible_indices)), dtype=np.float64)
+        else:
+            base /= base_sum
+
+        alpha = self._effective_root_dirichlet_alpha(len(feasible_indices))
+        noise = np.random.dirichlet([alpha] * len(feasible_indices))
+        mixed = (1.0 - float(self.dirichlet_epsilon)) * base + float(self.dirichlet_epsilon) * noise
+        mixed_sum = float(mixed.sum())
+        if mixed_sum <= 1e-12:
+            mixed = np.full(len(feasible_indices), 1.0 / float(len(feasible_indices)), dtype=np.float64)
+        else:
+            mixed /= mixed_sum
+
+        for local_idx, prior_idx in enumerate(feasible_indices):
+            mixed_priors[prior_idx] = float(mixed[local_idx])
+
+        return self._renormalize_priors(mixed_priors)
 
     def set_timers(self, timers: dict | None) -> None:
         """Attach a per-solve timers dict for benchmarking."""
@@ -98,38 +151,19 @@ class NodeExpander:
         """
         expansion = self._prepare_expansion(node.state, v_node_id)
         candidate_states = expansion["candidate_states"]
-        priors = expansion["priors"]
+        priors = self._renormalize_priors(expansion["priors"])
         cand_action_ids = expansion["action_ids"]
-
-        # Apply Dirichlet noise for root exploration (AlphaZero style)
-        if add_dirichlet_noise and len(candidate_states) > 0:
-            valid_indices = [i for i, st in enumerate(candidate_states) if st.p_node_id >= 0]
-            if len(valid_indices) > 0:
-                noise = np.random.dirichlet([self.dirichlet_alpha] * len(valid_indices))
-                noise_map = {valid_indices[i]: noise[i] for i in range(len(valid_indices))}
-                for i, state in enumerate(candidate_states):
-                    prior_base = priors[i]
-                    prior_noise = noise_map.get(i, 0.0)
-                    prior = (1 - self.dirichlet_epsilon) * prior_base + self.dirichlet_epsilon * prior_noise
-                    Node(node, state, prior=prior)
-                if node.parent is None:
-                    node._diag_root_priors = [
-                        (1 - self.dirichlet_epsilon) * p + self.dirichlet_epsilon * noise_map.get(i, 0.0)
-                        for i, p in enumerate(priors)
-                    ]
-                    node._diag_root_action_ids = cand_action_ids
-            else:
-                for i, state in enumerate(candidate_states):
-                    Node(node, state, prior=priors[i])
-                if node.parent is None:
-                    node._diag_root_priors = priors[:]
-                    node._diag_root_action_ids = cand_action_ids
+        final_priors = priors
+        if add_dirichlet_noise and node.parent is None and candidate_states:
+            final_priors = self._apply_root_dirichlet_noise(priors, candidate_states)
         else:
-            for i, state in enumerate(candidate_states):
-                Node(node, state, prior=priors[i])
-            if node.parent is None:
-                node._diag_root_priors = priors[:]
-                node._diag_root_action_ids = cand_action_ids
+            final_priors = self._renormalize_priors(priors)
+
+        for i, state in enumerate(candidate_states):
+            Node(node, state, prior=final_priors[i])
+        if node.parent is None:
+            node._diag_root_priors = final_priors[:]
+            node._diag_root_action_ids = cand_action_ids
 
         node.leaf_value = expansion["leaf_value"]
         if node.parent is None and expansion["diag_value"] is not None:
@@ -220,13 +254,7 @@ class NodeExpander:
                 priors = [1.0 / n] * len(candidate_states)
                 cand_action_ids = [st.p_node_id for st in candidate_states]
 
-        priors = [p if (p == p and p > 0.0 and p < float('inf')) else 0.0 for p in priors]
-        total = sum(priors)
-        if total <= 1e-12:
-            n = max(len(candidate_states), 1)
-            priors = [1.0 / n] * len(candidate_states)
-        else:
-            priors = [p / total for p in priors]
+        priors = self._renormalize_priors(priors)
 
         num_actions = getattr(self.policy_network.model.actor.decoder, 'num_actions', None)
         if num_actions is None:
