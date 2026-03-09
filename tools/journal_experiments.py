@@ -488,9 +488,13 @@ def _build_job_overrides(
         *job_specific,
     ]
 
-    # Ensure AlphaZero-SFC uses the pure C++ backend for apples-to-apples comparisons.
+    # Ensure AlphaZero-SFC uses the pure C++ backend and stops workers once learner finishes.
     if solver_name == 'alpha_zero_sfc':
-        for entry in ('training.use_cpp_mcts=true', 'training.pure_cpp=true'):
+        for entry in (
+            'training.use_cpp_mcts=true',
+            'training.pure_cpp=true',
+            'training.signal_stop_event_on_learner_complete=true',
+        ):
             if entry not in overrides:
                 overrides.append(entry)
 

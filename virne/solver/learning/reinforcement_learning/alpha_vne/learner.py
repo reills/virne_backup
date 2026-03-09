@@ -96,11 +96,18 @@ class TransitionBuffer:
         Returns the number of new transitions added.
         """
         self._replay_dir = replay_dir
-        all_files = sorted(
-            [f for f in os.listdir(replay_dir) if f.endswith('.json')],
-            key=lambda f: os.path.getmtime(os.path.join(replay_dir, f)),
-            reverse=True,
-        )
+        # Collect (filename, mtime) in one pass to avoid race conditions
+        # where workers rename/delete files between listdir and sort.
+        file_mtimes = []
+        for f in os.listdir(replay_dir):
+            if f.endswith('.json'):
+                try:
+                    mtime = os.path.getmtime(os.path.join(replay_dir, f))
+                    file_mtimes.append((f, mtime))
+                except FileNotFoundError:
+                    pass  # File renamed/removed by worker between listdir and stat
+        file_mtimes.sort(key=lambda x: x[1], reverse=True)
+        all_files = [f for f, _ in file_mtimes]
         current_files = set(all_files)
         stale_refs_exist = any(
             (fname not in current_files and fname not in self._episode_cache)
@@ -380,6 +387,7 @@ class AlphaZeroLearner:
         tb_log_dir = os.path.join(get_run_id_dir(config), "logs")
         self.writer = SummaryWriter(tb_log_dir)
         self.global_step = 0
+        self._warned_ts_trace_fallback = False
 
     # ------------------------------------------------------------------
     def train_steps(self, num_steps: int) -> None:
@@ -578,34 +586,62 @@ class AlphaZeroLearner:
         from .net import ActorCritic, ActorCriticScriptWrapper
 
         ts_path = os.path.join(os.path.dirname(self.policy_path), "policy_latest.ts")
-        tmp = ts_path + ".tmp"
+        tmp = f"{ts_path}.tmp.{os.getpid()}"
+        mode_path = f"{ts_path}.mode"
+        mode_tmp = f"{mode_path}.tmp.{os.getpid()}"
 
-        model = ActorCritic(**self.model_config).cpu()
+        training_cfg = getattr(self.config, "training", None)
+        use_cuda_cfg = True
+        if isinstance(training_cfg, dict):
+            use_cuda_cfg = bool(training_cfg.get("use_cuda", True))
+        elif training_cfg is not None and hasattr(training_cfg, "use_cuda"):
+            use_cuda_cfg = bool(getattr(training_cfg, "use_cuda"))
+
+        if use_cuda_cfg:
+            if torch.cuda.is_available():
+                export_device = torch.device("cuda")
+            else:
+                export_device = torch.device("cpu")
+                if self.logger is not None:
+                    self.logger.warning(
+                        "training.use_cuda=true but CUDA is unavailable; falling back to CPU for TorchScript export."
+                    )
+        else:
+            export_device = torch.device("cpu")
+
+        model = ActorCritic(**self.model_config).to(export_device)
         model.load_state_dict(self.policy.state_dict())
         model.eval()
-        wrapper = ActorCriticScriptWrapper(model)
+        wrapper = ActorCriticScriptWrapper(model).to(export_device)
         wrapper.eval()
 
+        used_trace = False
+        export_succeeded = False
         try:
             scripted = torch.jit.script(wrapper)
-        except Exception:
+            scripted.save(tmp)
+            export_succeeded = True
+        except Exception as script_exc:
+            used_trace = True
             num_nodes = self.model_config['p_net_num_nodes']
             p_feat = self.model_config['p_net_feature_dim']
             p_edge_feat = self.model_config['p_net_edge_dim']
             v_feat = self.model_config['v_net_feature_dim']
             max_seq_len = self.model_config.get('max_seq_len', 15)
 
-            p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32)
-            edge_index = torch.zeros((2, max(1, num_nodes - 1)), dtype=torch.long)
-            edge_attr = torch.zeros((edge_index.size(1), p_edge_feat), dtype=torch.float32)
-            p_batch = torch.zeros((num_nodes,), dtype=torch.long)
-            selected_p_nodes = torch.zeros((0,), dtype=torch.long)
-            encoder_outputs = torch.zeros((1, max_seq_len, model.backbone.embedding_dim), dtype=torch.float32)
-            curr_v_node_id = torch.zeros((1,), dtype=torch.long)
-            vnfs_remaining = torch.zeros((1,), dtype=torch.long)
-            action_mask = torch.ones((1, model._policy_head.num_actions), dtype=torch.bool)
-            history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32)
-            history_lengths = torch.tensor([1], dtype=torch.long)
+            p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32, device=export_device)
+            edge_index = torch.zeros((2, max(1, num_nodes - 1)), dtype=torch.long, device=export_device)
+            edge_attr = torch.zeros((edge_index.size(1), p_edge_feat), dtype=torch.float32, device=export_device)
+            p_batch = torch.zeros((num_nodes,), dtype=torch.long, device=export_device)
+            selected_p_nodes = torch.zeros((0,), dtype=torch.long, device=export_device)
+            encoder_outputs = torch.zeros(
+                (1, max_seq_len, model.backbone.embedding_dim), dtype=torch.float32, device=export_device
+            )
+            curr_v_node_id = torch.zeros((1,), dtype=torch.long, device=export_device)
+            vnfs_remaining = torch.zeros((1,), dtype=torch.long, device=export_device)
+            action_mask = torch.ones((1, model._policy_head.num_actions), dtype=torch.bool, device=export_device)
+            history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32, device=export_device)
+            history_lengths = torch.tensor([1], dtype=torch.long, device=export_device)
 
             example = {
                 "p_net_x": p_net_x,
@@ -620,10 +656,29 @@ class AlphaZeroLearner:
                 "vnfs_remaining": vnfs_remaining,
                 "action_mask": action_mask,
             }
-            scripted = torch.jit.trace(wrapper, example, check_trace=False)
+            try:
+                scripted = torch.jit.trace(wrapper, example, check_trace=False)
+                scripted.save(tmp)
+                export_succeeded = True
+                if self.logger is not None and not self._warned_ts_trace_fallback:
+                    self.logger.warning(f"TorchScript script export failed; using trace fallback: {script_exc}")
+                    self._warned_ts_trace_fallback = True
+            except Exception as trace_exc:
+                if self.logger is not None:
+                    self.logger.warning(
+                        f"TorchScript export failed (script and trace); keeping previous .ts if present. "
+                        f"script_error={script_exc}; trace_error={trace_exc}"
+                    )
+                return
 
-        scripted.save(tmp)
+        if not export_succeeded:
+            return
+
+        mode = "trace" if used_trace else "script"
+        with open(mode_tmp, "w", encoding="ascii") as f:
+            f.write(mode)
         self._atomic_rename(tmp, ts_path)
+        self._atomic_rename(mode_tmp, mode_path)
 
     def _obs_to_device(self, obs: dict) -> dict:
         """Convert observation tensors from CPU to target device."""

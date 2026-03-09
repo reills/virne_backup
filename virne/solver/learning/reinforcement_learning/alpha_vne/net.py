@@ -153,33 +153,19 @@ class SharedBackbone(nn.Module):
         positions = torch.arange(seq_len, device=history_features.device).unsqueeze(0)
         return positions >= history_lengths.unsqueeze(1)
 
-    def forward_backbone(self, obs=None, *,
-                         p_net_x=None, p_net_edge_index=None, p_net_edge_attr=None,
-                         p_net_batch=None, history_features=None, encoder_outputs=None,
-                         curr_v_node_id=None, vnfs_remaining=None, history_lengths=None):
-        """Run GNN + Transformer decoder, return (decoder_output, graph_embedding, final_context).
-
-        Can be called with an obs dict (PyG path) or raw tensors (TorchScript path).
-        """
-        if obs is not None:
-            batch_p_net = obs['p_net']
-            node_features = batch_p_net.x.float()
-            edge_index = batch_p_net.edge_index
-            edge_attr = batch_p_net.edge_attr
-            if hasattr(batch_p_net, 'batch') and batch_p_net.batch is not None:
-                node_batch = batch_p_net.batch
-            else:
-                node_batch = torch.zeros(batch_p_net.num_nodes, dtype=torch.long, device=batch_p_net.x.device)
-            history_features = obs['history_features']
-            history_lengths = obs.get('history_lengths')
-            encoder_outputs = obs['encoder_outputs']
-            curr_v_node_id = obs['curr_v_node_id']
-            vnfs_remaining = obs['vnfs_remaining']
-        else:
-            node_features = p_net_x.float()
-            edge_index = p_net_edge_index
-            edge_attr = p_net_edge_attr
-            node_batch = p_net_batch
+    def _forward_backbone_core(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        node_batch: torch.Tensor,
+        history_features: torch.Tensor,
+        encoder_outputs: torch.Tensor,
+        curr_v_node_id: torch.Tensor,
+        vnfs_remaining: torch.Tensor,
+        history_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Core backbone forward used by both Python and TorchScript paths."""
 
         # GNN forward
         for gat_layer in self.gat_layers:
@@ -214,6 +200,68 @@ class SharedBackbone(nn.Module):
         final_context = self.norm(last_decoder_output + step_emb + remaining_emb)
 
         return decoder_output, graph_embedding, final_context, node_batch
+
+    def forward_backbone(self, obs=None,
+                         p_net_x=None, p_net_edge_index=None, p_net_edge_attr=None,
+                         p_net_batch=None, history_features=None, encoder_outputs=None,
+                         curr_v_node_id=None, vnfs_remaining=None, history_lengths=None):
+        """Run GNN + Transformer decoder, return (decoder_output, graph_embedding, final_context)."""
+        if obs is not None:
+            batch_p_net = obs['p_net']
+            node_features = batch_p_net.x.float()
+            edge_index = batch_p_net.edge_index
+            edge_attr = batch_p_net.edge_attr
+            if hasattr(batch_p_net, 'batch') and batch_p_net.batch is not None:
+                node_batch = batch_p_net.batch
+            else:
+                node_batch = torch.zeros(batch_p_net.num_nodes, dtype=torch.long, device=batch_p_net.x.device)
+            history_features = obs['history_features']
+            history_lengths = obs.get('history_lengths')
+            encoder_outputs = obs['encoder_outputs']
+            curr_v_node_id = obs['curr_v_node_id']
+            vnfs_remaining = obs['vnfs_remaining']
+        else:
+            node_features = p_net_x.float()
+            edge_index = p_net_edge_index
+            edge_attr = p_net_edge_attr
+            node_batch = p_net_batch
+
+        return self._forward_backbone_core(
+            node_features=node_features,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            node_batch=node_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
+            history_lengths=history_lengths,
+        )
+
+    def forward_backbone_tensors(
+        self,
+        p_net_x: torch.Tensor,
+        p_net_edge_index: torch.Tensor,
+        p_net_edge_attr: torch.Tensor,
+        p_net_batch: torch.Tensor,
+        history_features: torch.Tensor,
+        encoder_outputs: torch.Tensor,
+        curr_v_node_id: torch.Tensor,
+        vnfs_remaining: torch.Tensor,
+        history_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """TorchScript-friendly tensor-only forward."""
+        return self._forward_backbone_core(
+            node_features=p_net_x.float(),
+            edge_index=p_net_edge_index,
+            edge_attr=p_net_edge_attr,
+            node_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
+            history_lengths=history_lengths,
+        )
 
 
 # --- Compatibility shim for policy.actor.decoder.* access patterns ---
@@ -305,11 +353,13 @@ class ActorCritic(nn.Module):
         self._actor_compat = _ActorCompat(self._decoder_compat)
 
     @property
+    @torch.jit.unused
     def actor(self):
         """Backward-compatible: returns shim with .decoder attribute."""
         return self._actor_compat
 
     @property
+    @torch.jit.unused
     def critic(self):
         """Backward-compatible: returns the value head module."""
         return self._value_head
@@ -444,7 +494,14 @@ class PolicyHead(nn.Module):
                     nn.init.xavier_uniform_(layer.weight)
                     nn.init.zeros_(layer.bias)
 
-    def forward(self, final_context, graph_embedding, node_batch, action_mask, temperature=1.0):
+    def forward(
+        self,
+        final_context: torch.Tensor,
+        graph_embedding: torch.Tensor,
+        node_batch: torch.Tensor,
+        action_mask: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
         """Compute policy logits from shared backbone outputs.
 
         Args:
@@ -463,7 +520,8 @@ class PolicyHead(nn.Module):
         node_padding_mask = torch.ones(B, max_nodes, dtype=torch.bool, device=graph_embedding.device)
 
         for i in range(B):
-            idxs = (node_batch == i).nonzero(as_tuple=True)[0]
+            # TorchScript does not support nonzero(as_tuple=True).
+            idxs = torch.nonzero(node_batch == i).flatten()
             padded_nodes[i, :len(idxs)] = graph_embedding[idxs]
             node_padding_mask[i, :len(idxs)] = False
 
@@ -500,7 +558,7 @@ class PolicyHead(nn.Module):
 
         # Apply action mask and clamp
         safe_logits = torch.clamp(raw_logits, min=-15.0, max=15.0)
-        mask = action_mask.bool()
+        mask = action_mask.to(dtype=torch.bool)
         neg_large = torch.full_like(safe_logits, -1e9)
         final_logits = torch.where(mask, safe_logits, neg_large)
 
@@ -530,13 +588,13 @@ class ValueHead(nn.Module):
 
     def forward(
         self,
-        final_context,
-        graph_embedding,
-        node_batch,
-        curr_v_node_id=None,
-        vnfs_remaining=None,
-        action_mask=None,
-    ):
+        final_context: torch.Tensor,
+        graph_embedding: torch.Tensor,
+        node_batch: torch.Tensor,
+        curr_v_node_id: Optional[torch.Tensor] = None,
+        vnfs_remaining: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute value from shared backbone outputs.
 
         Args:
@@ -661,12 +719,15 @@ class AutoregressiveDecoder(nn.Module):
         history_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return decoder and graph embeddings from raw tensors."""
-        decoder_output, graph_embedding, final_context, node_batch = self._backbone.forward_backbone(
-            obs=None,
-            p_net_x=p_net_x, p_net_edge_index=p_net_edge_index,
-            p_net_edge_attr=p_net_edge_attr, p_net_batch=p_net_batch,
-            history_features=history_features, encoder_outputs=encoder_outputs,
-            curr_v_node_id=curr_v_node_id, vnfs_remaining=vnfs_remaining,
+        decoder_output, graph_embedding, final_context, node_batch = self._backbone.forward_backbone_tensors(
+            p_net_x=p_net_x,
+            p_net_edge_index=p_net_edge_index,
+            p_net_edge_attr=p_net_edge_attr,
+            p_net_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
             history_lengths=history_lengths,
         )
         return decoder_output, graph_embedding
@@ -686,12 +747,15 @@ class AutoregressiveDecoder(nn.Module):
         return_last_embed: bool = False,
     ) -> torch.Tensor:
         """TorchScript-friendly forward that accepts raw tensors."""
-        decoder_output, graph_embedding, final_context, node_batch = self._backbone.forward_backbone(
-            obs=None,
-            p_net_x=p_net_x, p_net_edge_index=p_net_edge_index,
-            p_net_edge_attr=p_net_edge_attr, p_net_batch=p_net_batch,
-            history_features=history_features, encoder_outputs=encoder_outputs,
-            curr_v_node_id=curr_v_node_id, vnfs_remaining=vnfs_remaining,
+        decoder_output, graph_embedding, final_context, node_batch = self._backbone.forward_backbone_tensors(
+            p_net_x=p_net_x,
+            p_net_edge_index=p_net_edge_index,
+            p_net_edge_attr=p_net_edge_attr,
+            p_net_batch=p_net_batch,
+            history_features=history_features,
+            encoder_outputs=encoder_outputs,
+            curr_v_node_id=curr_v_node_id,
+            vnfs_remaining=vnfs_remaining,
             history_lengths=history_lengths,
         )
 
@@ -891,8 +955,7 @@ class ActorCriticScriptWrapper(nn.Module):
             history_lengths = torch.tensor([history_len], dtype=torch.long, device=p_net_x.device)
 
         # Run shared backbone once
-        decoder_output, graph_embedding, final_context, node_batch = self.model.backbone.forward_backbone(
-            obs=None,
+        decoder_output, graph_embedding, final_context, node_batch = self.model.backbone.forward_backbone_tensors(
             p_net_x=p_net_x,
             p_net_edge_index=p_net_edge_index,
             p_net_edge_attr=p_net_edge_attr,

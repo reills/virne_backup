@@ -669,6 +669,10 @@ class CppFullSolver:
             raise RuntimeError("alpha_zero_cpp_core.solve is not available.")
         self.actor = actor
         self.computation_budget = int(computation_budget)
+        self._last_export_used_trace = False
+        self._warned_cuda_unavailable = False
+        self._warned_trace_fallback = False
+        self._warned_trace_batchsize = False
         self._node_resource_names = [
             getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "node_resource_attrs", [])
         ]
@@ -794,6 +798,66 @@ class CppFullSolver:
             time.sleep(0.05)
         return False
 
+    def _torchscript_wait_timeout_s(self) -> float:
+        timeout_s = 5.0
+        cfg_obj = getattr(self.actor, "config", None)
+        training_cfg = getattr(cfg_obj, "training", None) if cfg_obj is not None else None
+        try:
+            if isinstance(training_cfg, dict):
+                timeout_s = float(training_cfg.get("torchscript_wait_timeout_s", timeout_s))
+            elif training_cfg is not None and hasattr(training_cfg, "torchscript_wait_timeout_s"):
+                timeout_s = float(getattr(training_cfg, "torchscript_wait_timeout_s"))
+        except Exception:
+            timeout_s = 5.0
+        return max(0.5, timeout_s)
+
+    def _torchscript_needs_export(self, policy_ts_path: str) -> bool:
+        if not os.path.exists(policy_ts_path):
+            return True
+        policy_pt_path = getattr(self.actor, "policy_path", "") or ""
+        if not policy_pt_path or not os.path.exists(policy_pt_path):
+            return False
+        try:
+            return os.path.getmtime(policy_ts_path) < os.path.getmtime(policy_pt_path)
+        except OSError:
+            return True
+
+    def _torchscript_mode_path(self, policy_ts_path: str) -> str:
+        return f"{policy_ts_path}.mode"
+
+    def _read_torchscript_mode(self, policy_ts_path: str) -> str | None:
+        mode_path = self._torchscript_mode_path(policy_ts_path)
+        try:
+            with open(mode_path, "r", encoding="ascii") as f:
+                mode = f.read().strip()
+            if mode in ("script", "trace"):
+                return mode
+        except OSError:
+            return None
+        return None
+
+    def _config_use_cuda(self) -> bool:
+        cfg_obj = getattr(self.actor, "config", None)
+        training_cfg = getattr(cfg_obj, "training", None) if cfg_obj is not None else None
+        if isinstance(training_cfg, dict):
+            return bool(training_cfg.get("use_cuda", True))
+        if training_cfg is not None and hasattr(training_cfg, "use_cuda"):
+            return bool(getattr(training_cfg, "use_cuda"))
+        return bool(getattr(self.actor, "device", torch.device("cpu")).type == "cuda")
+
+    def _resolve_runtime_device(self) -> torch.device:
+        if self._config_use_cuda():
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            logger = getattr(self.actor, "logger", None)
+            if logger is not None and not self._warned_cuda_unavailable:
+                logger.warning(
+                    "training.use_cuda=true but CUDA is unavailable; falling back to CPU for C++ policy execution."
+                )
+                self._warned_cuda_unavailable = True
+            return torch.device("cpu")
+        return torch.device("cpu")
+
     def solve(self, p_net, v_net, training: bool = None, pure_cpp: bool = False,
               replay_dir: str | None = None, max_buffer_size: int | None = None) -> dict:
         if training is None:
@@ -821,13 +885,33 @@ class CppFullSolver:
         if not policy_ts_path:
             raise RuntimeError("Could not resolve TorchScript policy path.")
 
-        if glob.glob(policy_ts_path + ".tmp*"):
-            if not self._wait_for_torchscript(policy_ts_path):
-                raise RuntimeError("TorchScript policy is still being written; skipping C++ load.")
-        if not os.path.exists(policy_ts_path):
+        tmp_writes = glob.glob(policy_ts_path + ".tmp*")
+        writer_active = bool(tmp_writes)
+        if writer_active and not os.path.exists(policy_ts_path):
+            wait_s = self._torchscript_wait_timeout_s()
+            if not self._wait_for_torchscript(policy_ts_path, timeout_s=wait_s):
+                raise RuntimeError(
+                    f"TorchScript policy is still being written after {wait_s:.1f}s "
+                    f"and no stable policy exists yet: {policy_ts_path}"
+                )
+            writer_active = bool(glob.glob(policy_ts_path + ".tmp*"))
+
+        # If another process is writing, continue with the last stable .ts.
+        # Export uses atomic replace, so the current file remains valid.
+        if self._torchscript_needs_export(policy_ts_path) and not writer_active:
             self._export_torchscript(policy_ts_path)
 
-        device = "cuda" if getattr(self.actor, "device", torch.device("cpu")).type == "cuda" else "cpu"
+        runtime_device = self._resolve_runtime_device()
+        device = "cuda" if runtime_device.type == "cuda" else "cpu"
+        ts_mode = self._read_torchscript_mode(policy_ts_path)
+        if device == "cuda" and int(getattr(search_cfg, "eval_batch_size", 1)) > 1 and ts_mode != "script":
+            search_cfg.eval_batch_size = 1
+            logger = getattr(self.actor, "logger", None)
+            if logger is not None and not self._warned_trace_batchsize:
+                logger.warning(
+                    "Using traced TorchScript policy on CUDA; forcing eval_batch_size=1 to avoid trace-shape mismatches."
+                )
+                self._warned_trace_batchsize = True
         seed = None
         try:
             seed = int(getattr(getattr(self.actor, "config", None).experiment, "seed", None))
@@ -836,9 +920,6 @@ class CppFullSolver:
 
         policy_meta_path = getattr(self.actor, "policy_path", "") or ""
         write_replay = bool(pure_cpp and training and not getattr(self.actor, "disable_trajectory_writing", False))
-        if write_replay:
-            # Ensure TorchScript export includes the replay-required helpers.
-            self._export_torchscript(policy_ts_path)
         if replay_dir is None:
             replay_dir = getattr(self.actor, "replay_dir", "") or ""
         if not replay_dir:
@@ -924,16 +1005,21 @@ class CppFullSolver:
         if model_config is None:
             raise RuntimeError("Policy model config is unavailable for TorchScript export.")
 
-        model = ActorCritic(**model_config).cpu()
+        export_device = self._resolve_runtime_device()
+        model = ActorCritic(**model_config).to(export_device)
         model.load_state_dict(self.actor.policy.state_dict())
         model.eval()
-        wrapper = ActorCriticScriptWrapper(model)
+        wrapper = ActorCriticScriptWrapper(model).to(export_device)
         wrapper.eval()
 
         tmp = f"{policy_ts_path}.tmp.{os.getpid()}"
+        mode_tmp = f"{self._torchscript_mode_path(policy_ts_path)}.tmp.{os.getpid()}"
+        used_trace = False
         try:
             scripted = torch.jit.script(wrapper)
-        except Exception:
+            scripted.save(tmp)
+        except Exception as script_exc:
+            used_trace = True
             # Fallback to trace with nominal shapes
             num_nodes = model_config['p_net_num_nodes']
             p_feat = model_config['p_net_feature_dim']
@@ -941,17 +1027,19 @@ class CppFullSolver:
             v_feat = model_config['v_net_feature_dim']
             max_seq_len = model_config.get('max_seq_len', 15)
 
-            p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32)
-            edge_index = torch.zeros((2, max(1, num_nodes - 1)), dtype=torch.long)
-            edge_attr = torch.zeros((edge_index.size(1), p_edge_feat), dtype=torch.float32)
-            p_batch = torch.zeros((num_nodes,), dtype=torch.long)
-            selected_p_nodes = torch.zeros((0,), dtype=torch.long)
-            encoder_outputs = torch.zeros((1, max_seq_len, model.actor.decoder.embedding_dim), dtype=torch.float32)
-            curr_v_node_id = torch.zeros((1,), dtype=torch.long)
-            vnfs_remaining = torch.zeros((1,), dtype=torch.long)
-            action_mask = torch.ones((1, model.actor.decoder.num_actions), dtype=torch.bool)
-            history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32)
-            history_lengths = torch.tensor([1], dtype=torch.long)
+            p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32, device=export_device)
+            edge_index = torch.zeros((2, max(1, num_nodes - 1)), dtype=torch.long, device=export_device)
+            edge_attr = torch.zeros((edge_index.size(1), p_edge_feat), dtype=torch.float32, device=export_device)
+            p_batch = torch.zeros((num_nodes,), dtype=torch.long, device=export_device)
+            selected_p_nodes = torch.zeros((0,), dtype=torch.long, device=export_device)
+            encoder_outputs = torch.zeros(
+                (1, max_seq_len, model.backbone.embedding_dim), dtype=torch.float32, device=export_device
+            )
+            curr_v_node_id = torch.zeros((1,), dtype=torch.long, device=export_device)
+            vnfs_remaining = torch.zeros((1,), dtype=torch.long, device=export_device)
+            action_mask = torch.ones((1, model._policy_head.num_actions), dtype=torch.bool, device=export_device)
+            history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32, device=export_device)
+            history_lengths = torch.tensor([1], dtype=torch.long, device=export_device)
 
             example = {
                 "p_net_x": p_net_x,
@@ -967,5 +1055,14 @@ class CppFullSolver:
                 "action_mask": action_mask,
             }
             scripted = torch.jit.trace(wrapper, example, check_trace=False)
-        scripted.save(tmp)
+            scripted.save(tmp)
+            logger = getattr(self.actor, "logger", None)
+            if logger is not None and not self._warned_trace_fallback:
+                logger.warning(f"TorchScript script export failed; using trace fallback: {script_exc}")
+                self._warned_trace_fallback = True
+        mode = "trace" if used_trace else "script"
+        with open(mode_tmp, "w", encoding="ascii") as f:
+            f.write(mode)
         os.replace(tmp, policy_ts_path)
+        os.replace(mode_tmp, self._torchscript_mode_path(policy_ts_path))
+        self._last_export_used_trace = used_trace

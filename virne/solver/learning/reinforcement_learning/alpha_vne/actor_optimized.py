@@ -233,9 +233,18 @@ class OptimizedAlphaZeroActor(Solver):
                 if self.cpp_full_solver is not None:
                     self.logger.info("🧠 Using full C++ solve backend.")
             except Exception as exc:
+                if self.pure_cpp:
+                    raise RuntimeError(
+                        "training.pure_cpp=true requires the full C++ solve backend, but initialization failed."
+                    ) from exc
                 self.logger.warning(f"C++ full solve backend unavailable: {exc}")
 
         if use_cpp_flag and self.cpp_full_solver is None:
+            if self.pure_cpp:
+                raise RuntimeError(
+                    "training.pure_cpp=true requires the full C++ solve backend, "
+                    "but it is unavailable in this environment."
+                )
             try:
                 self.cpp_adapter = create_cpp_adapter(self, self.computation_budget)
                 if self.cpp_adapter is not None:
@@ -268,6 +277,10 @@ class OptimizedAlphaZeroActor(Solver):
             try:
                 return self._solve_with_cpp_full(instance, training)
             except Exception as exc:
+                if self.pure_cpp:
+                    raise RuntimeError(
+                        "C++ full solve failed while training.pure_cpp=true; refusing Python fallback."
+                    ) from exc
                 self.logger.warning(f"C++ full solve failed, falling back to Python: {exc}")
 
         from virne.solver.learning.utils import load_pyg_data_from_network
@@ -1087,10 +1100,9 @@ class OptimizedAlphaZeroActor(Solver):
         build_trajectory = write_trajectory and (not pure_cpp or not replay_written)
         trajectory: List[dict] = [] if build_trajectory else None
         if pure_cpp and not replay_written and write_trajectory:
-            try:
-                self.logger.warning(f"C++ replay write failed, falling back to Python reconstruction: {replay_error}")
-            except Exception:
-                pass
+            raise RuntimeError(
+                f"C++ replay write failed while training.pure_cpp=true; refusing Python reconstruction fallback: {replay_error}"
+            )
 
         use_cpp_link_mapping = isinstance(cpp_link_paths, dict) and isinstance(cpp_link_paths_info, dict)
         if not build_trajectory and pure_cpp and isinstance(cpp_node_slots, (list, tuple)):
@@ -1247,6 +1259,10 @@ class OptimizedAlphaZeroActor(Solver):
             try:
                 return self._solve_with_cpp_full({"v_net": v_net, "p_net": p_net}, training=training)
             except Exception as exc:
+                if self.pure_cpp:
+                    raise RuntimeError(
+                        "C++ full solve failed in worker while training.pure_cpp=true; refusing Python fallback."
+                    ) from exc
                 self.logger.warning(f"C++ full solve failed in worker path, falling back: {exc}")
         # Same implementation as original, but with optimizations
         from virne.solver.learning.utils import load_pyg_data_from_network
