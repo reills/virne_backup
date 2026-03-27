@@ -77,8 +77,15 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         .def(py::init<>())
         .def_readwrite("node_resource_names", &az::VNRConfig::node_resource_names)
         .def_readwrite("link_resource_names", &az::VNRConfig::link_resource_names)
+        .def_readwrite("node_attr_benchmarks", &az::VNRConfig::node_attr_benchmarks)
+        .def_readwrite("link_attr_benchmarks", &az::VNRConfig::link_attr_benchmarks)
+        .def_readwrite("link_sum_attr_benchmarks", &az::VNRConfig::link_sum_attr_benchmarks)
         .def_readwrite("node_constraint_names", &az::VNRConfig::node_constraint_names)
         .def_readwrite("hard_constraint_names", &az::VNRConfig::hard_constraint_names)
+        .def_readwrite("feature_use_node_status_flags", &az::VNRConfig::feature_use_node_status_flags)
+        .def_readwrite("feature_use_aggregated_link_attrs", &az::VNRConfig::feature_use_aggregated_link_attrs)
+        .def_readwrite("feature_use_degree_metric", &az::VNRConfig::feature_use_degree_metric)
+        .def_readwrite("feature_use_more_topological_metrics", &az::VNRConfig::feature_use_more_topological_metrics)
         .def_readwrite("allow_rejection", &az::VNRConfig::allow_rejection)
         .def_readwrite("reject_penalty", &az::VNRConfig::reject_penalty)
         .def_readwrite("shortest_method", &az::VNRConfig::shortest_method)
@@ -92,6 +99,8 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
              py::arg("virtual_net"),
              py::arg("config"))
         .def("get_candidate_nodes", &az::VNRState::get_candidate_nodes, py::call_guard<py::gil_scoped_release>())
+        .def("build_candidate_feature_tensor", &az::VNRState::build_candidate_feature_tensor, py::call_guard<py::gil_scoped_release>())
+        .def("candidate_feature_dim", &az::VNRState::candidate_feature_dim)
         .def("is_terminal", &az::VNRState::is_terminal)
         .def("compute_final_reward", &az::VNRState::compute_final_reward)
         .def("create_child", &az::VNRState::create_child, py::call_guard<py::gil_scoped_release>())
@@ -118,6 +127,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         .def_readwrite("c_puct", &az::SearchConfig::c_puct)
         .def_readwrite("dirichlet_alpha", &az::SearchConfig::dirichlet_alpha)
         .def_readwrite("dirichlet_epsilon", &az::SearchConfig::dirichlet_epsilon)
+        .def_readwrite("top_k_candidates", &az::SearchConfig::top_k_candidates)
         .def_readwrite("virtual_loss", &az::SearchConfig::virtual_loss)
         .def_readwrite("add_root_noise", &az::SearchConfig::add_root_noise)
         .def_readwrite("use_neural_network", &az::SearchConfig::use_neural_network)
@@ -216,6 +226,9 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::string& device,
            py::object seed_obj,
            float temperature,
+           int temperature_move_threshold,
+           float temperature_after_threshold,
+           float replay_policy_temperature,
            bool use_nn_policy,
            bool use_nn_value,
            bool write_replay,
@@ -252,6 +265,9 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
                 device,
                 seed,
                 temperature,
+                temperature_move_threshold,
+                temperature_after_threshold,
+                replay_policy_temperature,
                 use_nn_policy,
                 use_nn_value,
                 write_replay,
@@ -322,6 +338,9 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("device") = "cpu",
         py::arg("seed") = py::none(),
         py::arg("temperature") = 1.0f,
+        py::arg("temperature_move_threshold") = -1,
+        py::arg("temperature_after_threshold") = 0.0f,
+        py::arg("replay_policy_temperature") = 1.0f,
         py::arg("use_nn_policy") = true,
         py::arg("use_nn_value") = true,
         py::arg("write_replay") = false,

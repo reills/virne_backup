@@ -227,6 +227,12 @@ void write_observation(std::ostream& os, const Observation& obs, int indent) {
     os << ",\n";
 
     write_indent(os, indent + 2);
+    write_string(os, "candidate_features");
+    os << ": ";
+    write_tensor_3d(os, obs.candidate_features);
+    os << ",\n";
+
+    write_indent(os, indent + 2);
     write_string(os, "v_net_x");
     os << ": ";
     write_tensor_3d(os, obs.v_net_x);

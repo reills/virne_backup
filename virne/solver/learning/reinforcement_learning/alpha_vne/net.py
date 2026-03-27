@@ -10,6 +10,8 @@ from torch_geometric.nn import GENConv
 from torch_geometric.utils import scatter
 from torch_geometric.nn import global_mean_pool
 
+DEFAULT_CANDIDATE_FEATURE_DIM = 8
+
 
 class MultiHeadGENLayer(nn.Module):
     def __init__(self, in_dim, out_dim, aggr='softmax', edge_dim=1, gnn_dropout: float = 0.1):
@@ -371,7 +373,14 @@ class ActorCritic(nn.Module):
     def act(self, obs, training=False):
         """Run shared backbone once and return policy logits."""
         decoder_output, graph_embedding, final_context, node_batch = self.backbone.forward_backbone(obs)
-        return self._policy_head(final_context, graph_embedding, node_batch, obs['action_mask'], self.temperature)
+        return self._policy_head(
+            final_context,
+            graph_embedding,
+            node_batch,
+            obs['action_mask'],
+            self.temperature,
+            obs.get('candidate_features'),
+        )
 
     @torch.jit.ignore
     def evaluate(self, obs):
@@ -384,13 +393,21 @@ class ActorCritic(nn.Module):
             curr_v_node_id=obs.get('curr_v_node_id'),
             vnfs_remaining=obs.get('vnfs_remaining'),
             action_mask=obs.get('action_mask'),
+            candidate_features=obs.get('candidate_features'),
         )
 
     @torch.jit.ignore
     def act_and_evaluate(self, obs, training=False):
         """Run shared backbone ONCE and return both logits and value."""
         decoder_output, graph_embedding, final_context, node_batch = self.backbone.forward_backbone(obs)
-        logits = self._policy_head(final_context, graph_embedding, node_batch, obs['action_mask'], self.temperature)
+        logits = self._policy_head(
+            final_context,
+            graph_embedding,
+            node_batch,
+            obs['action_mask'],
+            self.temperature,
+            obs.get('candidate_features'),
+        )
         value = self._value_head(
             final_context=final_context,
             graph_embedding=graph_embedding,
@@ -398,6 +415,7 @@ class ActorCritic(nn.Module):
             curr_v_node_id=obs.get('curr_v_node_id'),
             vnfs_remaining=obs.get('vnfs_remaining'),
             action_mask=obs.get('action_mask'),
+            candidate_features=obs.get('candidate_features'),
         )
         return logits, value
 
@@ -460,6 +478,7 @@ class PolicyHead(nn.Module):
         self.allow_rejection = allow_rejection
         self.num_actions = p_net_num_nodes + (1 if allow_rejection else 0)
         self.embedding_dim = embedding_dim
+        self.candidate_feature_dim = DEFAULT_CANDIDATE_FEATURE_DIM
 
         # Cross-attention between decoder output and node embeddings
         self.node_cross_attention = nn.MultiheadAttention(
@@ -467,9 +486,15 @@ class PolicyHead(nn.Module):
             dropout=dropout, batch_first=False
         )
 
+        self.candidate_feature_proj = nn.Sequential(
+            nn.Linear(self.candidate_feature_dim, embedding_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embedding_dim // 2),
+        )
+
         # Predict 1 score per physical node
         self.node_score_head = nn.Sequential(
-            nn.Linear(2 * embedding_dim, embedding_dim),
+            nn.Linear(2 * embedding_dim + embedding_dim // 2, embedding_dim),
             nn.GELU(),
             nn.Linear(embedding_dim, 1)
         )
@@ -488,11 +513,48 @@ class PolicyHead(nn.Module):
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
+        for layer in self.candidate_feature_proj:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
         if self.allow_rejection and self.reject_head is not None:
             for layer in self.reject_head:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight)
                     nn.init.zeros_(layer.bias)
+
+    def _prepare_candidate_features(
+        self,
+        candidate_features: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if candidate_features is None:
+            return torch.zeros(
+                (batch_size, self.num_actions, self.candidate_feature_dim),
+                dtype=dtype,
+                device=device,
+            )
+        if candidate_features.dim() == 2:
+            candidate_features = candidate_features.unsqueeze(0)
+        candidate_features = candidate_features.to(device=device, dtype=dtype)
+        if candidate_features.size(-1) != self.candidate_feature_dim:
+            if candidate_features.size(-1) > self.candidate_feature_dim:
+                candidate_features = candidate_features[..., :self.candidate_feature_dim]
+            else:
+                pad = self.candidate_feature_dim - candidate_features.size(-1)
+                candidate_features = F.pad(candidate_features, (0, pad, 0, 0, 0, 0))
+        if candidate_features.size(0) != batch_size:
+            if candidate_features.size(0) == 1:
+                candidate_features = candidate_features.expand(batch_size, -1, -1)
+            else:
+                candidate_features = candidate_features[:batch_size]
+        if candidate_features.size(1) < self.num_actions:
+            candidate_features = F.pad(candidate_features, (0, 0, 0, self.num_actions - candidate_features.size(1), 0, 0))
+        elif candidate_features.size(1) > self.num_actions:
+            candidate_features = candidate_features[:, :self.num_actions, :]
+        return candidate_features
 
     def forward(
         self,
@@ -501,6 +563,7 @@ class PolicyHead(nn.Module):
         node_batch: torch.Tensor,
         action_mask: torch.Tensor,
         temperature: float = 1.0,
+        candidate_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute policy logits from shared backbone outputs.
 
@@ -512,6 +575,12 @@ class PolicyHead(nn.Module):
             temperature: logit temperature scaling
         """
         B = final_context.size(0)
+        candidate_features = self._prepare_candidate_features(
+            candidate_features,
+            batch_size=B,
+            device=graph_embedding.device,
+            dtype=graph_embedding.dtype,
+        )
 
         # Cross-attend to nodes
         nodes_per_graph = scatter(torch.ones_like(node_batch), node_batch, dim=0, reduce='sum').long()
@@ -531,10 +600,24 @@ class PolicyHead(nn.Module):
         attn_context = attn_output.squeeze(0)
         attn_context_per_node = attn_context[node_batch]
 
+        candidate_features_per_node = torch.zeros(
+            (graph_embedding.size(0), self.candidate_feature_dim),
+            device=graph_embedding.device,
+            dtype=graph_embedding.dtype,
+        )
+        current_node_idx = 0
+        for i in range(B):
+            num_nodes = nodes_per_graph[i].item()
+            if num_nodes > 0:
+                candidate_features_per_node[current_node_idx:current_node_idx + num_nodes] = candidate_features[i, :num_nodes, :]
+            current_node_idx += num_nodes
+        candidate_embedding = self.candidate_feature_proj(candidate_features_per_node)
+
         # Compute node scores
         combined = torch.cat([
             F.normalize(graph_embedding, dim=-1, eps=1e-6),
             F.normalize(attn_context_per_node, dim=-1, eps=1e-6),
+            candidate_embedding,
         ], dim=-1)
         node_scores = self.node_score_head(combined).squeeze(-1)
 
@@ -576,7 +659,8 @@ class ValueHead(nn.Module):
     def __init__(self, embedding_dim=128, max_seq_len=15):
         super().__init__()
         self.max_seq_len = max(int(max_seq_len), 1)
-        combined_dim = embedding_dim + embedding_dim + 3
+        self.candidate_feature_dim = DEFAULT_CANDIDATE_FEATURE_DIM
+        combined_dim = embedding_dim + embedding_dim + 3 + (2 * self.candidate_feature_dim)
         self.value_head = nn.Sequential(
             nn.Linear(combined_dim, embedding_dim),
             nn.GELU(),
@@ -594,6 +678,7 @@ class ValueHead(nn.Module):
         curr_v_node_id: Optional[torch.Tensor] = None,
         vnfs_remaining: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
+        candidate_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute value from shared backbone outputs.
 
@@ -627,8 +712,51 @@ class ValueHead(nn.Module):
                 mask = mask.unsqueeze(0)
             feasible_ratio = mask.mean(dim=-1, keepdim=True)
 
+        if candidate_features is None:
+            candidate_summary = torch.zeros(
+                (batch_size, 2 * self.candidate_feature_dim),
+                dtype=final_context.dtype,
+                device=final_context.device,
+            )
+        else:
+            cand = candidate_features.to(dtype=final_context.dtype, device=final_context.device)
+            if cand.dim() == 2:
+                cand = cand.unsqueeze(0)
+            if cand.size(-1) != self.candidate_feature_dim:
+                if cand.size(-1) > self.candidate_feature_dim:
+                    cand = cand[..., :self.candidate_feature_dim]
+                else:
+                    cand = F.pad(cand, (0, self.candidate_feature_dim - cand.size(-1), 0, 0, 0, 0))
+            if cand.size(0) != batch_size:
+                if cand.size(0) == 1:
+                    cand = cand.expand(batch_size, -1, -1)
+                else:
+                    cand = cand[:batch_size]
+            if action_mask is None:
+                cand_mask = torch.ones(cand.size(0), cand.size(1), dtype=torch.bool, device=cand.device)
+            else:
+                cand_mask = action_mask.to(device=cand.device, dtype=torch.bool)
+                if cand_mask.dim() == 1:
+                    cand_mask = cand_mask.unsqueeze(0)
+                if cand_mask.size(1) < cand.size(1):
+                    pad = torch.zeros(
+                        (cand_mask.size(0), cand.size(1) - cand_mask.size(1)),
+                        dtype=torch.bool,
+                        device=cand.device,
+                    )
+                    cand_mask = torch.cat([cand_mask, pad], dim=1)
+                elif cand_mask.size(1) > cand.size(1):
+                    cand_mask = cand_mask[:, :cand.size(1)]
+            cand_mask_f = cand_mask.unsqueeze(-1).to(dtype=final_context.dtype)
+            cand_count = cand_mask_f.sum(dim=1).clamp_min(1.0)
+            cand_mean = (cand * cand_mask_f).sum(dim=1) / cand_count
+            neg_large = torch.full_like(cand, -1e9)
+            cand_max = torch.where(cand_mask.unsqueeze(-1), cand, neg_large).max(dim=1).values
+            cand_max = torch.where(torch.isfinite(cand_max), cand_max, torch.zeros_like(cand_max))
+            candidate_summary = torch.cat([cand_mean, cand_max], dim=-1)
+
         scalar_feats = torch.cat([step_feat, remaining_feat, feasible_ratio], dim=-1)
-        combined = torch.cat([final_context, graph_summary, scalar_feats], dim=-1)
+        combined = torch.cat([final_context, graph_summary, scalar_feats, candidate_summary], dim=-1)
         return self.value_head(combined)
 
 
@@ -704,7 +832,14 @@ class AutoregressiveDecoder(nn.Module):
         if return_last_embed or not self.is_actor:
             return final_context
 
-        return self._policy_head(final_context, graph_embedding, node_batch, obs['action_mask'], self.temperature)
+        return self._policy_head(
+            final_context,
+            graph_embedding,
+            node_batch,
+            obs['action_mask'],
+            self.temperature,
+            obs.get('candidate_features'),
+        )
 
     def embeddings_from_tensors(
         self,
@@ -787,6 +922,11 @@ class AutoregressiveDecoder(nn.Module):
         combined = torch.cat([
             F.normalize(graph_embedding_flat, dim=-1, eps=1e-6),
             F.normalize(attn_context_per_node, dim=-1, eps=1e-6),
+            torch.zeros(
+                (graph_embedding_flat.size(0), self._policy_head.candidate_feature_proj[0].out_features),
+                dtype=graph_embedding_flat.dtype,
+                device=graph_embedding_flat.device,
+            ),
         ], dim=-1)
         node_scores = self._policy_head.node_score_head(combined).squeeze(-1)
 
@@ -937,6 +1077,7 @@ class ActorCriticScriptWrapper(nn.Module):
         curr_v_node_id = inputs["curr_v_node_id"]
         vnfs_remaining = inputs["vnfs_remaining"]
         action_mask = inputs["action_mask"]
+        candidate_features = inputs["candidate_features"] if "candidate_features" in inputs else None
         history_lengths = inputs["history_lengths"] if "history_lengths" in inputs else None
 
         if "history_features" in inputs:
@@ -968,7 +1109,14 @@ class ActorCriticScriptWrapper(nn.Module):
         )
 
         # Policy logits
-        logits = self.model._policy_head(final_context, graph_embedding, node_batch, action_mask, self.model.temperature)
+        logits = self.model._policy_head(
+            final_context,
+            graph_embedding,
+            node_batch,
+            action_mask,
+            self.model.temperature,
+            candidate_features,
+        )
 
         # Value
         value = self.model._value_head(
@@ -978,6 +1126,7 @@ class ActorCriticScriptWrapper(nn.Module):
             curr_v_node_id=curr_v_node_id,
             vnfs_remaining=vnfs_remaining,
             action_mask=action_mask,
+            candidate_features=candidate_features,
         )
 
         return logits, value

@@ -1,6 +1,7 @@
 #include "vnr_state.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 
@@ -8,6 +9,7 @@ namespace azsfc {
 
 namespace {
 constexpr double kEpsilon = 1e-8;
+constexpr int kCandidateFeatureDim = 8;
 
 double safe_lookup(const std::unordered_map<std::string, double>& table, const std::string& key) {
     auto it = table.find(key);
@@ -27,6 +29,34 @@ std::vector<std::pair<int, int>> path_to_links(const std::vector<int>& nodes) {
         links.emplace_back(nodes[i - 1], nodes[i]);
     }
     return links;
+}
+
+double safe_ratio(double numerator, double denominator) {
+    if (std::abs(denominator) <= kEpsilon) {
+        return 0.0;
+    }
+    return numerator / denominator;
+}
+
+double clamp01(double value) {
+    if (value < 0.0) {
+        return 0.0;
+    }
+    if (value > 1.0) {
+        return 1.0;
+    }
+    return value;
+}
+
+double sum_attrs(
+    const std::unordered_map<std::string, double>& attrs,
+    const std::vector<std::string>& names
+) {
+    double total = 0.0;
+    for (const auto& name : names) {
+        total += safe_lookup(attrs, name);
+    }
+    return total;
 }
 }  // namespace
 
@@ -263,51 +293,12 @@ std::vector<int> VNRState::get_candidate_nodes() const {
 
     int v_target = v_order_[next_index];
 
-    struct LinkRequirement {
-        int p_neighbor;
-        ResourceMap demands;
-    };
-    std::vector<LinkRequirement> link_requirements;
-    if (!config_.link_resource_names.empty()) {
-        const auto& v_adj = v_net_->adjacency[v_target];
-        for (const auto& [neighbor, edge_id] : v_adj) {
-            int neighbor_pos = v_pos_[neighbor];
-            if (neighbor_pos > v_node_index_) {
-                continue;
-            }
-            int mapped_neighbor = lookup_placement(neighbor);
-            if (mapped_neighbor < 0) {
-                continue;
-            }
-            LinkRequirement req;
-            req.p_neighbor = mapped_neighbor;
-            const auto& edge_attrs = v_net_->edge_attrs[edge_id];
-            req.demands.reserve(config_.link_resource_names.size());
-            for (const auto& attr_name : config_.link_resource_names) {
-                double demand = safe_lookup(edge_attrs, attr_name);
-                if (demand > 0.0) {
-                    req.demands[attr_name] = demand;
-                }
-            }
-            if (!req.demands.empty()) {
-                link_requirements.push_back(std::move(req));
-            }
-        }
-    }
-
     for (int p = 0; p < p_net_->num_nodes; ++p) {
         if (is_physical_selected(p)) {
             continue;
         }
         if (check_node_constraints_feasible(v_target, p)) {
-            bool reachable = true;
-            for (const auto& req : link_requirements) {
-                if (!has_reachable_path(p, req.p_neighbor, req.demands)) {
-                    reachable = false;
-                    break;
-                }
-            }
-            if (reachable) {
+            if (check_link_constraints_feasible(v_target, p)) {
                 candidates.push_back(p);
             }
         }
@@ -322,6 +313,229 @@ std::vector<int> VNRState::get_candidate_nodes() const {
     }
 
     return candidates;
+}
+
+int VNRState::candidate_feature_dim() const noexcept {
+    return kCandidateFeatureDim;
+}
+
+torch::Tensor VNRState::build_candidate_feature_tensor() const {
+    auto features = torch::zeros(
+        {1, static_cast<long>(action_space_size()), static_cast<long>(kCandidateFeatureDim)},
+        torch::TensorOptions().dtype(torch::kFloat32));
+
+    if (!p_net_ || !v_net_) {
+        return features;
+    }
+
+    int next_index = v_node_index_ + 1;
+    if (next_index < 0 || next_index >= static_cast<int>(v_order_.size())) {
+        return features;
+    }
+
+    const int v_target = v_order_[next_index];
+    const auto candidates = get_candidate_nodes();
+    const auto& v_node_attrs = v_net_->node_attrs[v_target];
+    const double node_demand_total = sum_attrs(v_node_attrs, config_.node_resource_names);
+    const double reward_scale = std::max(total_v_revenue_, 1.0);
+    const double max_hops = std::max(1, p_net_->num_nodes - 1);
+    const double total_virtual_neighbors = std::max<int>(1, static_cast<int>(v_net_->adjacency[v_target].size()));
+
+    std::vector<int> mapped_neighbors;
+    std::vector<ResourceMap> mapped_demands;
+    mapped_neighbors.reserve(v_net_->adjacency[v_target].size());
+    mapped_demands.reserve(v_net_->adjacency[v_target].size());
+    for (const auto& [neighbor, edge_id] : v_net_->adjacency[v_target]) {
+        int neighbor_pos = v_pos_[neighbor];
+        if (neighbor_pos > v_node_index_) {
+            continue;
+        }
+        int mapped_neighbor = lookup_placement(neighbor);
+        if (mapped_neighbor < 0) {
+            continue;
+        }
+        ResourceMap demands;
+        const auto& edge_attrs = v_net_->edge_attrs[edge_id];
+        for (const auto& attr_name : config_.link_resource_names) {
+            const double demand = safe_lookup(edge_attrs, attr_name);
+            if (demand > 0.0) {
+                demands.emplace(attr_name, demand);
+            }
+        }
+        mapped_neighbors.push_back(mapped_neighbor);
+        mapped_demands.push_back(std::move(demands));
+    }
+
+    int k = std::max(1, config_.k_shortest);
+    std::string method = config_.shortest_method.empty() ? "bfs_shortest" : config_.shortest_method;
+    if (method == "bfs_shortest" || method == "first_shortest" || method == "available_shortest") {
+        k = 1;
+    }
+
+    auto acc = features.accessor<float, 3>();
+    for (int action : candidates) {
+        if (action < 0 || action >= p_net_->num_nodes) {
+            continue;
+        }
+
+        const auto& p_node_attrs = p_net_->node_attrs[action];
+        const double node_capacity_total = std::max(sum_attrs(p_node_attrs, config_.node_resource_names), 1.0);
+        double node_available_total = 0.0;
+        for (const auto& attr_name : config_.node_resource_names) {
+            node_available_total += get_available_node_resource(action, attr_name);
+        }
+        const double node_available_ratio = clamp01(safe_ratio(node_available_total, node_capacity_total));
+        const double node_post_slack_ratio = clamp01(
+            safe_ratio(std::max(node_available_total - node_demand_total, 0.0), node_capacity_total));
+
+        double local_util_total = 0.0;
+        int local_util_count = 0;
+        for (const auto& [neighbor, edge_id] : p_net_->adjacency[action]) {
+            (void)neighbor;
+            const auto& edge_attrs = p_net_->edge_attrs[edge_id];
+            for (const auto& attr_name : config_.link_resource_names) {
+                const double capacity = safe_lookup(edge_attrs, attr_name);
+                if (capacity <= kEpsilon) {
+                    continue;
+                }
+                const double available = get_available_link_resource(edge_id, attr_name);
+                local_util_total += clamp01(1.0 - safe_ratio(available, capacity));
+                ++local_util_count;
+            }
+        }
+        const double local_edge_utilization = (local_util_count > 0)
+            ? clamp01(local_util_total / static_cast<double>(local_util_count))
+            : 0.0;
+
+        const double mapped_neighbor_ratio = clamp01(
+            static_cast<double>(mapped_neighbors.size()) / total_virtual_neighbors);
+
+        double hop_total = 0.0;
+        double added_link_cost_total = 0.0;
+        double bottleneck_post_slack = 1.0;
+        double feasible_path_fraction = 0.0;
+
+        if (!mapped_neighbors.empty()) {
+            auto capacity_fn = [this](int edge_id, const std::string& attr) {
+                return get_available_link_resource(edge_id, attr);
+            };
+
+            int feasible_path_total = 0;
+            int feasible_path_budget = 0;
+            bool saw_any_feasible_path = false;
+
+            for (std::size_t i = 0; i < mapped_neighbors.size(); ++i) {
+                const int mapped_neighbor = mapped_neighbors[i];
+                const auto& demands = mapped_demands[i];
+                feasible_path_budget += k;
+                auto paths = path_finder_.find_paths(
+                    *p_net_,
+                    action,
+                    mapped_neighbor,
+                    k,
+                    demands,
+                    method,
+                    capacity_fn);
+                feasible_path_total += static_cast<int>(paths.size());
+                if (paths.empty()) {
+                    bottleneck_post_slack = 0.0;
+                    continue;
+                }
+
+                saw_any_feasible_path = true;
+                const auto& best_path = paths.front();
+                const double hops = std::max<std::size_t>(best_path.nodes.size(), 1U) - 1.0;
+                hop_total += hops;
+
+                const double demand_sum = sum_attrs(demands, config_.link_resource_names);
+                added_link_cost_total += hops * demand_sum;
+
+                auto links = path_to_links(best_path.nodes);
+                for (const auto& [u, v] : links) {
+                    auto edge_lookup = p_net_->edge_index.find({u, v});
+                    if (edge_lookup == p_net_->edge_index.end()) {
+                        edge_lookup = p_net_->edge_index.find({v, u});
+                    }
+                    if (edge_lookup == p_net_->edge_index.end()) {
+                        bottleneck_post_slack = 0.0;
+                        continue;
+                    }
+                    int edge_id = edge_lookup->second;
+                    const auto& edge_attrs = p_net_->edge_attrs[edge_id];
+                    for (const auto& [attr_name, demand] : demands) {
+                        const double capacity = std::max(safe_lookup(edge_attrs, attr_name), demand);
+                        const double available = get_available_link_resource(edge_id, attr_name);
+                        const double post_slack = clamp01(
+                            safe_ratio(std::max(available - demand, 0.0), std::max(capacity, 1.0)));
+                        bottleneck_post_slack = std::min(bottleneck_post_slack, post_slack);
+                    }
+                }
+            }
+
+            feasible_path_fraction = clamp01(
+                safe_ratio(static_cast<double>(feasible_path_total), static_cast<double>(std::max(feasible_path_budget, 1))));
+            if (!saw_any_feasible_path) {
+                bottleneck_post_slack = 0.0;
+            }
+        } else {
+            bottleneck_post_slack = 0.0;
+        }
+
+        const double mapped_neighbor_count = static_cast<double>(std::max<std::size_t>(mapped_neighbors.size(), 1U));
+        const double mean_hops_norm = mapped_neighbors.empty()
+            ? 0.0
+            : clamp01(safe_ratio(hop_total / mapped_neighbor_count, max_hops));
+        const double added_link_cost_norm = clamp01(safe_ratio(added_link_cost_total, reward_scale));
+
+        acc[0][action][0] = static_cast<float>(node_available_ratio);
+        acc[0][action][1] = static_cast<float>(node_post_slack_ratio);
+        acc[0][action][2] = static_cast<float>(mapped_neighbor_ratio);
+        acc[0][action][3] = static_cast<float>(mean_hops_norm);
+        acc[0][action][4] = static_cast<float>(added_link_cost_norm);
+        acc[0][action][5] = static_cast<float>(clamp01(bottleneck_post_slack));
+        acc[0][action][6] = static_cast<float>(feasible_path_fraction);
+        acc[0][action][7] = static_cast<float>(local_edge_utilization);
+    }
+
+    return features;
+}
+
+bool VNRState::check_link_constraints_feasible(int v_node_id, int p_node_id) const {
+    if (config_.link_resource_names.empty()) {
+        return true;
+    }
+
+    bool has_mapped_neighbor = false;
+    const auto& v_adj = v_net_->adjacency[v_node_id];
+    for (const auto& [neighbor, _edge_id] : v_adj) {
+        int neighbor_pos = v_pos_[neighbor];
+        if (neighbor_pos > v_node_index_) {
+            continue;
+        }
+        if (lookup_placement(neighbor) >= 0) {
+            has_mapped_neighbor = true;
+            break;
+        }
+    }
+    if (!has_mapped_neighbor) {
+        return true;
+    }
+
+    VNRState probe(*this);
+    probe.selected_p_nodes_cache_valid_ = false;
+    probe.node_slots_cache_valid_ = false;
+    probe.node_slots_cache_.clear();
+    probe.allocation_totals_cache_valid_ = false;
+    probe.node_allocation_totals_cache_.clear();
+    probe.link_allocation_totals_cache_.clear();
+    probe.v_node_index_ = v_node_index_ + 1;
+    probe.p_node_id_ = p_node_id;
+
+    auto step_delta = std::make_shared<AllocationDelta>();
+    step_delta->parent = allocation_deltas_;
+    probe.allocation_deltas_ = step_delta;
+
+    return reserve_link_resources(v_node_id, p_node_id, probe, *step_delta);
 }
 
 bool VNRState::has_reachable_path(int p_src, int p_dst, const ResourceMap& demands) const {

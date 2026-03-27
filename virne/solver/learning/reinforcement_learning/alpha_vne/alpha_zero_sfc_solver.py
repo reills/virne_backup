@@ -17,6 +17,8 @@ from virne.utils.config import get_run_id_dir
 
 from .actor_optimized import OptimizedAlphaZeroActor
 from .learner import AlphaZeroLearner
+from .model_factory import build_actor_critic
+from .utils import build_model_config
 
 
 
@@ -45,20 +47,7 @@ class AlphaZeroSFCSolver(RLSolver):
             pass
         # AlphaZero uses its own neural network, provide required functions for RLSolver
         def make_policy(solver):
-            from .net import ActorCritic
-            policy = ActorCritic(
-                p_net_num_nodes=solver.config.simulation.p_net_setting_num_nodes,
-                p_net_feature_dim=solver.config.simulation.p_net_setting_num_node_resource_attrs,
-                v_net_feature_dim=solver.config.simulation.v_sim_setting_num_node_resource_attrs,
-                p_net_edge_dim=solver.config.simulation.p_net_setting_num_link_resource_attrs,
-                embedding_dim=getattr(solver.config.nn, 'embedding_dim', 128),
-                n_heads=getattr(solver.config.nn, 'n_heads', 8),
-                n_layers=getattr(solver.config.nn, 'transformer_layers', 4),
-                gnn_layers=getattr(solver.config.nn, 'num_gnn_layers', 3),
-                dropout=getattr(solver.config.nn, 'dropout_prob', 0.1),
-                allow_revocable=getattr(solver.config.solver, 'allow_revocable', False),
-                allow_rejection=getattr(solver.config.solver, 'allow_rejection', False),
-            )
+            policy = build_actor_critic(build_model_config(solver.config))
             optimizer = torch.optim.Adam(
                 policy.parameters(), 
                 lr=solver.config.rl.learning_rate.actor
@@ -694,12 +683,16 @@ def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, b
         except Exception as exc:
             logger.warning(f"Failed to emit fallback checkpoint on learner shutdown: {exc}")
         logger.info(f"Learner terminated after {total_steps} training steps")
-        # Optionally signal actors after learner completion. Default is disabled
-        # so workers are not force-stopped when the learner reaches step cap.
+        # Signal workers after learner completion so training can transition
+        # promptly to shutdown/eval once model updates have stopped.
         signal_stop = bool(
             getattr(config.training, 'signal_stop_event_on_learner_complete', False)
         )
         if stop_event is not None and trained_any_steps and signal_stop:
+            logger.info(
+                "Setting stop_event because training.signal_stop_event_on_learner_complete=true "
+                "and learner has finished updating weights."
+            )
             stop_event.set()
 
 def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: str, policy_path: str):
@@ -713,6 +706,17 @@ def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: st
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
+
+    # Keep the worker-local config seed aligned with the actual worker seed so
+    # the pure_cpp solve path does not reuse the parent process seed.
+    try:
+        config.experiment.seed = int(seed)
+    except Exception:
+        pass
+    try:
+        config.training.seed = int(seed)
+    except Exception:
+        pass
     
     # Create fresh environment for this worker
     from virne.system.base_system import BaseSystem
@@ -746,6 +750,8 @@ def _create_worker_environment(worker_id: int, config, seed: int, replay_dir: st
         shortest_method=getattr(config.solver, 'shortest_method', getattr(controller, 'shortest_method', 'k_shortest')),
         k_shortest=getattr(config.solver, 'k_shortest', 10),
     )
+    worker_actor._cpp_worker_seed = int(seed)
+    worker_actor._cpp_request_seed = None
 
     return env, controller, worker_actor
 
@@ -800,6 +806,8 @@ def _worker_training_loop(worker_id: int, config, num_epochs: int, seed: int, re
                     # Ensure model is on correct device after loading
                     worker_actor.policy.to(worker_actor.device)
                     cached_model_mtime = current_mtime
+
+            worker_actor._cpp_request_seed = int(seed + epoch * total_vnrs + vnr_count)
             
             # Use MCTS to solve this VNR - simplified version for worker
             node_mapping_result = worker_actor.solve_vnr_with_mcts(v_net, p_net, solution, controller)

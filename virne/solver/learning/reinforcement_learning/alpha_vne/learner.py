@@ -13,9 +13,10 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
 from torch.utils.tensorboard import SummaryWriter
 
-from .net import ActorCritic
+from .model_factory import build_actor_critic, get_model_classes, prefers_trace_torchscript
+from .utils import build_model_config
 from .value_target import (
-    AcceptanceFirstValueTarget,
+    build_value_target_builder,
     infer_total_cost_from_reward,
     infer_total_revenue_from_static_env,
 )
@@ -32,16 +33,42 @@ class TransitionBuffer:
     small LRU cache of parsed episodes to avoid repeated JSON parsing.
     """
 
-    def __init__(self, max_size: int = 200_000, episode_cache_size: int = 128):
+    def __init__(
+        self,
+        max_size: int = 200_000,
+        episode_cache_size: int = 128,
+        accepted_ratio: float = 0.0,
+        reject_tail_ratio: float = 0.0,
+        reject_tail_k: int = 2,
+        recent_fraction: float = 0.0,
+        recent_window_size: int = 0,
+    ):
         self.max_size = max_size
         self.buffer: List[Tuple[str, int]] = []
+        self._buffer_entry_seq: List[int] = []
         self._write_idx = 0
+        self._next_entry_seq = 0
         self._loaded_files: set = set()
         self._episode_meta: Dict[str, dict] = {}
         self._episode_ref_counts: Dict[str, int] = {}
         self._episode_cache: "OrderedDict[str, list]" = OrderedDict()
         self._episode_cache_size = max(1, int(episode_cache_size))
         self._replay_dir: Optional[str] = None
+        self._accepted_ratio = max(0.0, float(accepted_ratio))
+        self._reject_tail_ratio = max(0.0, float(reject_tail_ratio))
+        ratio_total = self._accepted_ratio + self._reject_tail_ratio
+        if ratio_total > 1.0:
+            self._accepted_ratio /= ratio_total
+            self._reject_tail_ratio /= ratio_total
+        self._reject_tail_k = max(1, int(reject_tail_k))
+        self._recent_fraction = min(max(float(recent_fraction), 0.0), 1.0)
+        self._recent_window_size = max(0, int(recent_window_size))
+        self.last_sample_stats: Dict[str, float] = {
+            'accepted_fraction': 0.0,
+            'reject_tail_fraction': 0.0,
+            'uniform_fraction': 1.0,
+            'recent_fraction': 0.0,
+        }
 
     def _cache_put(self, fname: str, trajectory: list) -> None:
         self._episode_cache[fname] = trajectory
@@ -80,14 +107,17 @@ class TransitionBuffer:
         if not self.buffer:
             return
         keep: List[Tuple[str, int]] = []
+        keep_entry_seq: List[int] = []
         self._episode_ref_counts.clear()
-        for ref in self.buffer:
+        for ref, entry_seq in zip(self.buffer, self._buffer_entry_seq):
             fname = ref[0]
             if fname in current_files or fname in self._episode_cache:
                 keep.append(ref)
+                keep_entry_seq.append(entry_seq)
                 self._episode_ref_counts[fname] = self._episode_ref_counts.get(fname, 0) + 1
         if len(keep) != len(self.buffer):
             self.buffer = keep
+            self._buffer_entry_seq = keep_entry_seq
             self._write_idx = len(self.buffer) % max(1, self.max_size)
 
     def ingest_directory(self, replay_dir: str, limit: int = 5000) -> int:
@@ -158,6 +188,7 @@ class TransitionBuffer:
                 'total_revenue': total_revenue,
                 'value_target': value_target,
                 'static_environment': static_environment,
+                'trajectory_len': len(trajectory),
             }
             # Cache parsed trajectory now; hot recent episodes are then sampled
             # without reparsing JSON on every learner step.
@@ -165,12 +196,16 @@ class TransitionBuffer:
 
             for step_idx in valid_step_indices:
                 ref = (fname, step_idx)
+                entry_seq = self._next_entry_seq
+                self._next_entry_seq += 1
                 if len(self.buffer) < self.max_size:
                     self.buffer.append(ref)
+                    self._buffer_entry_seq.append(entry_seq)
                 else:
                     slot = self._write_idx % self.max_size
                     old_ref = self.buffer[slot]
                     self.buffer[slot] = ref
+                    self._buffer_entry_seq[slot] = entry_seq
                     self._on_ref_removed(old_ref)
                 self._on_ref_added(fname)
                 self._write_idx += 1
@@ -194,18 +229,169 @@ class TransitionBuffer:
             return []
 
         max_candidates = min(len(self.buffer), max(batch_size * 8, batch_size + 32))
-        candidate_refs = random.sample(self.buffer, max_candidates)
-        transitions: List[dict] = []
+        candidate_refs, sampled_recent_fraction = self._sample_candidate_refs(max_candidates=max_candidates)
+        if self._accepted_ratio <= 0.0 and self._reject_tail_ratio <= 0.0:
+            transitions: List[dict] = []
+            for fname, step_idx in candidate_refs:
+                transition = self._resolve_transition(fname, step_idx)
+                if transition is None:
+                    continue
+                transitions.append(transition)
+                if len(transitions) >= batch_size:
+                    break
+            if len(transitions) < batch_size:
+                return []
+            self.last_sample_stats = {
+                'accepted_fraction': 0.0,
+                'reject_tail_fraction': 0.0,
+                'uniform_fraction': 1.0,
+                'recent_fraction': sampled_recent_fraction,
+            }
+            return transitions
+
+        accepted_bucket: List[dict] = []
+        reject_tail_bucket: List[dict] = []
+        uniform_bucket: List[dict] = []
         for fname, step_idx in candidate_refs:
             transition = self._resolve_transition(fname, step_idx)
             if transition is None:
                 continue
-            transitions.append(transition)
-            if len(transitions) >= batch_size:
-                break
+            category = self._classify_ref(fname, step_idx)
+            transition['_sample_bucket'] = category
+            if category == 'accepted':
+                accepted_bucket.append(transition)
+            elif category == 'reject_tail':
+                reject_tail_bucket.append(transition)
+            else:
+                uniform_bucket.append(transition)
+
+        transitions = self._sample_rebalanced_batch(
+            batch_size=batch_size,
+            accepted_bucket=accepted_bucket,
+            reject_tail_bucket=reject_tail_bucket,
+            uniform_bucket=uniform_bucket,
+            sampled_recent_fraction=sampled_recent_fraction,
+        )
         if len(transitions) < batch_size:
             return []
         return transitions
+
+    def _classify_ref(self, fname: str, step_idx: int) -> str:
+        meta = self._episode_meta.get(fname)
+        if meta is None:
+            return 'uniform'
+        if bool(meta.get('accepted', False)):
+            return 'accepted'
+        trajectory_len = int(meta.get('trajectory_len', 0))
+        if trajectory_len > 0 and step_idx >= max(0, trajectory_len - self._reject_tail_k):
+            return 'reject_tail'
+        return 'uniform'
+
+    def _sample_rebalanced_batch(
+        self,
+        batch_size: int,
+        accepted_bucket: List[dict],
+        reject_tail_bucket: List[dict],
+        uniform_bucket: List[dict],
+        sampled_recent_fraction: float,
+    ) -> List[dict]:
+        accepted_target = min(len(accepted_bucket), int(round(batch_size * self._accepted_ratio)))
+        reject_tail_target = min(len(reject_tail_bucket), int(round(batch_size * self._reject_tail_ratio)))
+
+        selected: List[dict] = []
+        if accepted_target > 0:
+            selected.extend(random.sample(accepted_bucket, accepted_target))
+        if reject_tail_target > 0:
+            selected.extend(random.sample(reject_tail_bucket, reject_tail_target))
+
+        remaining = max(0, batch_size - len(selected))
+        remainder_pool = uniform_bucket[:]
+        remainder_pool.extend(item for item in accepted_bucket if item not in selected)
+        remainder_pool.extend(item for item in reject_tail_bucket if item not in selected)
+        if remaining > 0 and remainder_pool:
+            take = min(remaining, len(remainder_pool))
+            selected.extend(random.sample(remainder_pool, take))
+
+        if len(selected) >= batch_size:
+            selected = selected[:batch_size]
+
+        total = max(len(selected), 1)
+        accepted_hits = sum(1 for t in selected if t.get('_sample_bucket') == 'accepted')
+        reject_tail_hits = sum(1 for t in selected if t.get('_sample_bucket') == 'reject_tail')
+        uniform_hits = max(0, len(selected) - accepted_hits - reject_tail_hits)
+        self.last_sample_stats = {
+            'accepted_fraction': accepted_hits / total,
+            'reject_tail_fraction': reject_tail_hits / total,
+            'uniform_fraction': uniform_hits / total,
+            'recent_fraction': sampled_recent_fraction,
+        }
+        random.shuffle(selected)
+        return selected
+
+    def _sample_candidate_refs(self, max_candidates: int) -> Tuple[List[Tuple[str, int]], float]:
+        if self._recent_fraction <= 0.0 or self._recent_window_size <= 0 or not self._buffer_entry_seq:
+            return random.sample(self.buffer, max_candidates), 0.0
+
+        newest_entry_seq = max(self._buffer_entry_seq)
+        cutoff = newest_entry_seq - self._recent_window_size + 1
+        recent_refs = [
+            ref for ref, entry_seq in zip(self.buffer, self._buffer_entry_seq)
+            if entry_seq >= cutoff
+        ]
+        if not recent_refs:
+            return random.sample(self.buffer, max_candidates), 0.0
+
+        recent_target = min(len(recent_refs), int(round(max_candidates * self._recent_fraction)))
+        global_target = max_candidates - recent_target
+
+        selected: List[Tuple[str, int]] = []
+        selected_set = set()
+        recent_set = set(recent_refs)
+        if recent_target > 0:
+            recent_selected = random.sample(recent_refs, recent_target)
+            selected.extend(recent_selected)
+            selected_set.update(recent_selected)
+
+        if global_target > 0:
+            remaining_pool = [ref for ref in self.buffer if ref not in selected_set]
+            if len(remaining_pool) < global_target:
+                remaining_pool = self.buffer[:]
+            global_selected = random.sample(remaining_pool, min(global_target, len(remaining_pool)))
+            selected.extend(global_selected)
+            selected_set.update(global_selected)
+
+        if len(selected) < max_candidates:
+            remainder = [ref for ref in self.buffer if ref not in selected_set]
+            if remainder:
+                take = min(max_candidates - len(selected), len(remainder))
+                remainder_selected = random.sample(remainder, take)
+                selected.extend(remainder_selected)
+                selected_set.update(remainder_selected)
+
+        if not selected:
+            return [], 0.0
+
+        unique_selected: List[Tuple[str, int]] = []
+        seen = set()
+        for ref in selected:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            unique_selected.append(ref)
+            if len(unique_selected) >= max_candidates:
+                break
+
+        if len(unique_selected) < max_candidates:
+            for ref in self.buffer:
+                if ref in seen:
+                    continue
+                unique_selected.append(ref)
+                seen.add(ref)
+                if len(unique_selected) >= max_candidates:
+                    break
+
+        recent_selected = sum(1 for ref in unique_selected if ref in recent_set)
+        return unique_selected[:max_candidates], (recent_selected / max(len(unique_selected), 1))
 
     def _resolve_transition(self, fname: str, step_idx: int) -> Optional[dict]:
         meta = self._episode_meta.get(fname)
@@ -237,6 +423,7 @@ class TransitionBuffer:
             'observation': obs,
             'pi': pi,
             'mask': step.get('mask'),
+            'step_idx': step_idx,
             'final_reward': meta.get('final_reward', 0.0),
             'final_reward_raw': meta.get('final_reward_raw', 0.0),
             'accepted': meta.get('accepted', None),
@@ -244,6 +431,7 @@ class TransitionBuffer:
             'total_revenue': meta.get('total_revenue', None),
             'value_target': meta.get('value_target', None),
             'static_environment': meta.get('static_environment', None),
+            'trajectory_len': meta.get('trajectory_len', 0),
         }
 
     def __len__(self):
@@ -281,33 +469,10 @@ class AlphaZeroLearner:
             self.device = device
         else:
             self.device = torch.device("cuda" if (use_cuda_cfg and torch.cuda.is_available()) else "cpu")
-        # Ensure architectural hyperparameters match the actor/worker for consistency
-        embedding_dim = getattr(config.nn, 'embedding_dim', 96)
-        n_heads = getattr(config.nn, 'n_heads', 6)
-        n_layers = getattr(config.nn, 'transformer_layers', 2)
-        gnn_layers = getattr(config.nn, 'num_gnn_layers', 3)
-        dropout = getattr(config.nn, 'dropout_prob', 0.1)
-        self.model_config = {
-            'p_net_num_nodes': config.simulation.p_net_setting_num_nodes,
-            'p_net_feature_dim': config.simulation.p_net_setting_num_node_resource_attrs,
-            'v_net_feature_dim': config.simulation.v_sim_setting_num_node_resource_attrs,
-            'p_net_edge_dim': config.simulation.p_net_setting_num_link_resource_attrs,
-            'embedding_dim': embedding_dim,
-            'n_heads': n_heads,
-            'n_layers': n_layers,
-            'gnn_layers': gnn_layers,
-            'dropout': dropout,
-            'allow_rejection': getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
-            'max_seq_len': getattr(config.nn, 'max_seq_len', 15),
-        }
-        self.policy = ActorCritic(**self.model_config).to(self.device)
-        configured_mode = str(getattr(config.training, "value_target_mode", "acceptance_first")).lower()
-        if configured_mode != "acceptance_first":
-            logger.warning(
-                "Unsupported value_target_mode=%s; forcing acceptance_first.",
-                configured_mode,
-            )
-        self.value_target_mode = "acceptance_first"
+        self.model_config = build_model_config(config)
+        self.policy = build_actor_critic(self.model_config).to(self.device)
+        configured_mode = str(getattr(config.training, "value_target_mode", "tanh")).lower()
+        self.value_target_mode = configured_mode
 
         # Load pretrained weights if specified
         model_loaded = False
@@ -352,11 +517,7 @@ class AlphaZeroLearner:
         learning_rate = getattr(config.training, 'policy_learning_rate', 1e-4)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=learning_rate)
 
-        self.value_target_builder = AcceptanceFirstValueTarget(
-            reject_value=float(getattr(config.training, "value_target_reject", -1.0)),
-            accept_value_min=float(getattr(config.training, "value_target_accept_min", 0.2)),
-            accept_value_max=float(getattr(config.training, "value_target_accept_max", 1.0)),
-        )
+        self.value_target_builder = build_value_target_builder(self.value_target_mode, config.training)
         # If we loaded a full checkpoint, restore optimizer state
         try:
             if resume_training:
@@ -370,16 +531,26 @@ class AlphaZeroLearner:
                         logger.info("Optimizer state restored from latest full checkpoint")
                     if 'value_target_builder' in ckpt:
                         self.value_target_builder.load_state_dict(ckpt['value_target_builder'])
-                        logger.info("Acceptance-first value target stats restored")
+                        logger.info("Value target builder state restored")
         except Exception as e:
             logger.warning(f"Failed to restore optimizer state: {e}")
 
         # Transition-level replay index + bounded episode cache.
         buffer_max = getattr(config.training, 'transition_buffer_max_size', 200_000)
         episode_cache_size = getattr(config.training, 'episode_cache_size', 128)
+        replay_sample_accepted_ratio = getattr(config.training, 'replay_sample_accepted_ratio', 0.5)
+        replay_sample_reject_tail_ratio = getattr(config.training, 'replay_sample_reject_tail_ratio', 0.25)
+        replay_reject_tail_k = getattr(config.training, 'replay_reject_tail_k', 2)
+        replay_recent_fraction = getattr(config.training, 'replay_recent_fraction', 0.75)
+        replay_recent_window_size = getattr(config.training, 'replay_recent_window_size', 25000)
         self.transition_buffer = TransitionBuffer(
             max_size=buffer_max,
             episode_cache_size=episode_cache_size,
+            accepted_ratio=replay_sample_accepted_ratio,
+            reject_tail_ratio=replay_sample_reject_tail_ratio,
+            reject_tail_k=replay_reject_tail_k,
+            recent_fraction=replay_recent_fraction,
+            recent_window_size=replay_recent_window_size,
         )
 
         # TensorBoard logging
@@ -433,7 +604,7 @@ class AlphaZeroLearner:
             else:
                 loss_policy = -(batch_policies * log_probs).sum(dim=-1).mean()
 
-            # Value loss: MSE on acceptance-first bounded targets.
+            # Value loss: MSE on configured value targets.
             loss_value = F.mse_loss(predicted_values, batch_values)
 
             # L2 regularization
@@ -463,16 +634,40 @@ class AlphaZeroLearner:
                 self.writer.add_scalar('Training/GradNorm', grad_norm.item(), self.global_step)
                 self.writer.add_scalar('Training/LearningRate', self.optimizer.param_groups[0]['lr'], self.global_step)
                 self.writer.add_scalar('Training/BufferSize', len(self.transition_buffer), self.global_step)
-                if self.value_target_builder.accepted_cost_min is not None:
+                sample_stats = getattr(self.transition_buffer, 'last_sample_stats', {})
+                if sample_stats:
                     self.writer.add_scalar(
-                        'Training/AcceptedCostMin',
-                        float(self.value_target_builder.accepted_cost_min),
+                        'Replay/AcceptedFraction',
+                        float(sample_stats.get('accepted_fraction', 0.0)),
                         self.global_step,
                     )
-                if self.value_target_builder.accepted_cost_max is not None:
+                    self.writer.add_scalar(
+                        'Replay/RejectTailFraction',
+                        float(sample_stats.get('reject_tail_fraction', 0.0)),
+                        self.global_step,
+                    )
+                    self.writer.add_scalar(
+                        'Replay/UniformFraction',
+                        float(sample_stats.get('uniform_fraction', 1.0)),
+                        self.global_step,
+                    )
+                    self.writer.add_scalar(
+                        'Replay/RecentFraction',
+                        float(sample_stats.get('recent_fraction', 0.0)),
+                        self.global_step,
+                    )
+                accepted_cost_min = getattr(self.value_target_builder, 'accepted_cost_min', None)
+                accepted_cost_max = getattr(self.value_target_builder, 'accepted_cost_max', None)
+                if accepted_cost_min is not None:
+                    self.writer.add_scalar(
+                        'Training/AcceptedCostMin',
+                        float(accepted_cost_min),
+                        self.global_step,
+                    )
+                if accepted_cost_max is not None:
                     self.writer.add_scalar(
                         'Training/AcceptedCostMax',
-                        float(self.value_target_builder.accepted_cost_max),
+                        float(accepted_cost_max),
                         self.global_step,
                     )
 
@@ -583,8 +778,6 @@ class AlphaZeroLearner:
 
     def _export_torchscript(self):
         """Export a TorchScript model for C++ inference."""
-        from .net import ActorCritic, ActorCriticScriptWrapper
-
         ts_path = os.path.join(os.path.dirname(self.policy_path), "policy_latest.ts")
         tmp = f"{ts_path}.tmp.{os.getpid()}"
         mode_path = f"{ts_path}.mode"
@@ -609,24 +802,29 @@ class AlphaZeroLearner:
         else:
             export_device = torch.device("cpu")
 
-        model = ActorCritic(**self.model_config).to(export_device)
+        model = build_actor_critic(self.model_config).to(export_device)
         model.load_state_dict(self.policy.state_dict())
         model.eval()
+        _, ActorCriticScriptWrapper = get_model_classes(self.model_config)
         wrapper = ActorCriticScriptWrapper(model).to(export_device)
         wrapper.eval()
 
-        used_trace = False
+        force_trace = prefers_trace_torchscript(self.model_config)
+        used_trace = force_trace
         export_succeeded = False
-        try:
-            scripted = torch.jit.script(wrapper)
-            scripted.save(tmp)
-            export_succeeded = True
-        except Exception as script_exc:
-            used_trace = True
+        script_exc = None
+        if not force_trace:
+            try:
+                scripted = torch.jit.script(wrapper)
+                scripted.save(tmp)
+                export_succeeded = True
+            except Exception as exc:
+                script_exc = exc
+                used_trace = True
+        if used_trace and not export_succeeded:
             num_nodes = self.model_config['p_net_num_nodes']
             p_feat = self.model_config['p_net_feature_dim']
             p_edge_feat = self.model_config['p_net_edge_dim']
-            v_feat = self.model_config['v_net_feature_dim']
             max_seq_len = self.model_config.get('max_seq_len', 15)
 
             p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32, device=export_device)
@@ -640,6 +838,11 @@ class AlphaZeroLearner:
             curr_v_node_id = torch.zeros((1,), dtype=torch.long, device=export_device)
             vnfs_remaining = torch.zeros((1,), dtype=torch.long, device=export_device)
             action_mask = torch.ones((1, model._policy_head.num_actions), dtype=torch.bool, device=export_device)
+            candidate_features = torch.zeros(
+                (1, model._policy_head.num_actions, model._policy_head.candidate_feature_dim),
+                dtype=torch.float32,
+                device=export_device,
+            )
             history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32, device=export_device)
             history_lengths = torch.tensor([1], dtype=torch.long, device=export_device)
 
@@ -655,20 +858,31 @@ class AlphaZeroLearner:
                 "curr_v_node_id": curr_v_node_id,
                 "vnfs_remaining": vnfs_remaining,
                 "action_mask": action_mask,
+                "candidate_features": candidate_features,
             }
             try:
                 scripted = torch.jit.trace(wrapper, example, check_trace=False)
                 scripted.save(tmp)
                 export_succeeded = True
-                if self.logger is not None and not self._warned_ts_trace_fallback:
+                if (
+                    script_exc is not None
+                    and self.logger is not None
+                    and not self._warned_ts_trace_fallback
+                ):
                     self.logger.warning(f"TorchScript script export failed; using trace fallback: {script_exc}")
                     self._warned_ts_trace_fallback = True
             except Exception as trace_exc:
                 if self.logger is not None:
-                    self.logger.warning(
-                        f"TorchScript export failed (script and trace); keeping previous .ts if present. "
-                        f"script_error={script_exc}; trace_error={trace_exc}"
-                    )
+                    if script_exc is None:
+                        self.logger.warning(
+                            f"TorchScript trace export failed; keeping previous .ts if present. "
+                            f"trace_error={trace_exc}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"TorchScript export failed (script and trace); keeping previous .ts if present. "
+                            f"script_error={script_exc}; trace_error={trace_exc}"
+                        )
                 return
 
         if not export_succeeded:
@@ -788,8 +1002,30 @@ class AlphaZeroLearner:
 
     def _collate_batch(self, obs_list, batch_policies, batch_values, batch_masks):
         """Collate individual observations into a batched tensor dict."""
+        candidate_feature_dim = int(getattr(self.policy._policy_head, 'candidate_feature_dim', 8))
+
+        def ensure_candidate_features(obs: dict) -> dict:
+            if 'candidate_features' in obs:
+                return obs
+            obs = dict(obs)
+            action_mask = obs.get('action_mask')
+            if isinstance(action_mask, torch.Tensor):
+                batch_dim = int(action_mask.size(0)) if action_mask.dim() > 1 else 1
+                num_actions = int(action_mask.size(-1))
+                device = action_mask.device
+            else:
+                batch_dim = 1
+                num_actions = int(getattr(self.policy._policy_head, 'num_actions', 0))
+                device = self.device
+            obs['candidate_features'] = torch.zeros(
+                (batch_dim, num_actions, candidate_feature_dim),
+                dtype=torch.float32,
+                device=device,
+            )
+            return obs
+
         if len(obs_list) == 1:
-            batch_obs = obs_list[0]
+            batch_obs = ensure_candidate_features(obs_list[0])
             if 'history_lengths' not in batch_obs and 'history_features' in batch_obs:
                 batch_obs = dict(batch_obs)
                 batch_obs['history_lengths'] = torch.tensor(
@@ -798,6 +1034,7 @@ class AlphaZeroLearner:
                     device=self.device,
                 )
         else:
+            obs_list = [ensure_candidate_features(obs) for obs in obs_list]
             p_net_batch = Batch.from_data_list([o['p_net'] for o in obs_list]).to(self.device)
 
             def pad_cat_3d(ts_list):
@@ -821,6 +1058,7 @@ class AlphaZeroLearner:
             curr = torch.cat([o['curr_v_node_id'] for o in obs_list], dim=0).to(self.device)
             remain = torch.cat([o['vnfs_remaining'] for o in obs_list], dim=0).to(self.device)
             mask = torch.cat([o['action_mask'] for o in obs_list], dim=0).to(self.device)
+            candidate_features = torch.cat([o['candidate_features'] for o in obs_list], dim=0).to(self.device)
             v_x = pad_cat_3d([o['v_net_x'] for o in obs_list]).to(self.device)
 
             batch_obs = {
@@ -831,6 +1069,7 @@ class AlphaZeroLearner:
                 'curr_v_node_id': curr,
                 'vnfs_remaining': remain,
                 'action_mask': mask,
+                'candidate_features': candidate_features,
                 'v_net_x': v_x,
             }
 

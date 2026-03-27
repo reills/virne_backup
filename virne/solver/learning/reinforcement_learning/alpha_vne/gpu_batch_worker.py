@@ -15,6 +15,8 @@ import os
 import torch
 from torch import amp as torch_amp
 
+from .model_factory import build_actor_critic
+
 
 def _batch_observations(observations: List[Dict], device: torch.device) -> Dict:
     """Convert list of observations to a batched observation on device."""
@@ -148,7 +150,7 @@ def _sha256_state_dict(model: torch.nn.Module) -> str:
 
 
 def _gpu_worker_main(model_config: Dict[str, Any], policy_path: str, device_id: int, batch_size: int,
-                     timeout_ms: int, request_queue: mp.queues.Queue):
+                     timeout_ms: int, request_queue: mp.queues.Queue, status_queue: mp.queues.Queue):
     """Spawned worker process entry point."""
     try:
         print(f"🚀 Starting GPU Worker on device {device_id}")
@@ -157,8 +159,7 @@ def _gpu_worker_main(model_config: Dict[str, Any], policy_path: str, device_id: 
             torch.cuda.set_device(device_id)
 
         # Lazy import to avoid CUDA init in parent
-        from .net import ActorCritic
-        model = ActorCritic(**model_config).to(device)
+        model = build_actor_critic(model_config).to(device)
         model.eval()
 
         if policy_path and os.path.exists(policy_path):
@@ -169,6 +170,8 @@ def _gpu_worker_main(model_config: Dict[str, Any], policy_path: str, device_id: 
                 sha = _sha256_state_dict(model)
                 n_params = sum(p.numel() for p in model.parameters())
                 first_lin = getattr(model.encoder, 'token_embed', None)
+                if first_lin is None:
+                    first_lin = getattr(model.encoder, 'input_proj', None)
                 l2 = float(first_lin.weight.detach().norm().item()) if first_lin is not None else float('nan')
                 mem_alloc = torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
                 mem_res = torch.cuda.memory_reserved(device) if torch.cuda.is_available() else 0
@@ -176,6 +179,14 @@ def _gpu_worker_main(model_config: Dict[str, Any], policy_path: str, device_id: 
             except Exception as e:
                 print(f"⚠️  Could not compute model stats: {e}")
         print(f"✅ GPU Worker ready on {device}")
+        try:
+            status_queue.put_nowait({
+                "status": "ready",
+                "device": str(device),
+                "cuda_available": bool(torch.cuda.is_available()),
+            })
+        except Exception:
+            pass
 
         timeout_s = timeout_ms / 1000.0
         while True:
@@ -271,6 +282,14 @@ def _gpu_worker_main(model_config: Dict[str, Any], policy_path: str, device_id: 
                 continue
 
     except Exception as e:
+        try:
+            status_queue.put_nowait({
+                "status": "error",
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
+        except Exception:
+            pass
         print(f"❌ GPU Worker crashed: {e}")
         traceback.print_exc()
     finally:
@@ -282,7 +301,9 @@ class BatchedGPUManager:
     def __init__(self, model_config: Dict, policy_path: str, batch_size: int = 32, timeout_ms: int = 10,
                  device_id: int = 0, max_queue_size: int = 1000, min_reload_interval_s: int = 10):
         self.ctx = mp.get_context('spawn')
+        self.max_queue_size = max_queue_size
         self.request_queue: mp.queues.Queue = self.ctx.Queue(maxsize=max_queue_size)
+        self.status_queue: mp.queues.Queue = self.ctx.Queue(maxsize=8)
         self.batch_size = batch_size
         self.timeout_ms = timeout_ms
         self.device_id = device_id
@@ -295,6 +316,11 @@ class BatchedGPUManager:
         self._min_reload_interval_s = float(min_reload_interval_s)
         # Max time to wait for a worker response (seconds); prevents hangs on dead workers.
         self._max_wait_s = max(5.0, (float(timeout_ms) / 1000.0) * 50.0)
+        self._startup_timeout_s = max(15.0, self._max_wait_s)
+
+    def _reset_ipc(self):
+        self.request_queue = self.ctx.Queue(maxsize=self.max_queue_size)
+        self.status_queue = self.ctx.Queue(maxsize=8)
 
     def start(self):
         if not self.started:
@@ -302,26 +328,47 @@ class BatchedGPUManager:
                 self._cached_mtime = os.path.getmtime(self.policy_path) if self.policy_path and os.path.exists(self.policy_path) else None
             except Exception:
                 self._cached_mtime = None
+            self._reset_ipc()
             self.process = self.ctx.Process(
                 target=_gpu_worker_main,
-                args=(self.model_config, self.policy_path, self.device_id, self.batch_size, self.timeout_ms, self.request_queue),
+                args=(
+                    self.model_config,
+                    self.policy_path,
+                    self.device_id,
+                    self.batch_size,
+                    self.timeout_ms,
+                    self.request_queue,
+                    self.status_queue,
+                ),
                 daemon=True,
             )
             self.process.start()
             self.started = True
-            time.sleep(0.2)
-            # Quick ping to confirm worker is responsive
-            try:
-                parent_conn, child_conn = self.ctx.Pipe(duplex=False)
-                self.request_queue.put(({"__ping__": True}, child_conn), timeout=1.0)
-                if not parent_conn.poll(2.0):
-                    raise RuntimeError("GPU worker did not respond to ping.")
-                _status, _result = parent_conn.recv()
-            finally:
+            deadline = time.time() + self._startup_timeout_s
+            last_status = None
+            while time.time() < deadline:
+                if self.process is not None and not self.process.is_alive():
+                    exit_code = self.process.exitcode
+                    raise RuntimeError(
+                        f"GPU worker exited during startup with code {exit_code}. "
+                        f"Last status: {last_status}"
+                    )
                 try:
-                    parent_conn.close()
-                except Exception:
-                    pass
+                    status = self.status_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                last_status = status
+                if status.get("status") == "ready":
+                    return
+                if status.get("status") == "error":
+                    raise RuntimeError(
+                        "GPU worker failed during startup: "
+                        f"{status.get('message')}\n{status.get('traceback', '')}"
+                    )
+            raise RuntimeError(
+                "GPU worker did not report ready status within "
+                f"{self._startup_timeout_s:.1f}s. Last status: {last_status}"
+            )
 
     def _obs_ipc_safe(self, observation: Dict) -> Dict:
         """Ensure all tensors are detached CPU tensors for IPC."""
@@ -376,9 +423,12 @@ class BatchedGPUManager:
                 self.request_queue.put(None, timeout=0.1)
             except Exception:
                 pass
-            self.process.join(timeout=2.0)
-            if self.process.is_alive():
-                self.process.terminate()
+            if self.process is not None:
+                self.process.join(timeout=2.0)
+                if self.process.is_alive():
+                    self.process.terminate()
+                    self.process.join(timeout=1.0)
+            self.process = None
             self.started = False
 
     def restart(self):

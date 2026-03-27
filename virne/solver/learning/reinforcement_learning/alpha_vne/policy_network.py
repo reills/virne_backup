@@ -11,8 +11,8 @@ from typing import Tuple, Optional
 
 import torch
 
-from .net import ActorCritic
 from .gpu_batch_worker import BatchedGPUManager
+from .model_factory import build_actor_critic
 
 
 class PolicyNetwork:
@@ -42,12 +42,16 @@ class PolicyNetwork:
         self.model_config = model_config
         self.policy_path = policy_path
         self.device = device
-        self.use_batched_gpu = use_batched_gpu and torch.cuda.is_available()
+        self.use_batched_gpu = (
+            use_batched_gpu
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
         self.logger = logger
         self._batched_failures = 0
 
         # Initialize the neural network model
-        self.model = ActorCritic(**model_config).to(device)
+        self.model = build_actor_critic(model_config).to(device)
 
         # Setup batched GPU worker if enabled
         if self.use_batched_gpu:
@@ -62,7 +66,8 @@ class PolicyNetwork:
         else:
             self.gpu_manager = None
             if self.logger:
-                self.logger.info("⚠️  PolicyNetwork using single-threaded GPU inference (slower)")
+                mode = "CPU" if self.device.type == "cpu" else "single-threaded GPU"
+                self.logger.info(f"⚠️  PolicyNetwork using {mode} inference")
 
     def load_weights(self, alphazero_model_path: str = '', resume_training: bool = True) -> bool:
         """Load model weights with priority logic.
@@ -123,6 +128,8 @@ class PolicyNetwork:
 
             # First layer L2 norm
             first_lin = getattr(self.model.encoder, 'token_embed', None)
+            if first_lin is None:
+                first_lin = getattr(self.model.encoder, 'input_proj', None)
             l2 = float(first_lin.weight.detach().norm().item()) if first_lin is not None else float('nan')
 
             # GPU memory usage

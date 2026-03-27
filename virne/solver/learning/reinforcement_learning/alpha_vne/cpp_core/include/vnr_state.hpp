@@ -3,6 +3,8 @@
 #include "network.hpp"
 #include "shortest_path.hpp"
 
+#include <torch/torch.h>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -16,10 +18,17 @@ namespace azsfc {
 struct VNRConfig {
     std::vector<std::string> node_resource_names;
     std::vector<std::string> link_resource_names;
+    std::unordered_map<std::string, double> node_attr_benchmarks;
+    std::unordered_map<std::string, double> link_attr_benchmarks;
+    std::unordered_map<std::string, double> link_sum_attr_benchmarks;
     // Optional constraint name lists (defaults to node_resource_names if empty).
     std::vector<std::string> node_constraint_names;
     // Names of hard constraints (defaults to all node constraints if empty).
     std::vector<std::string> hard_constraint_names;
+    bool feature_use_node_status_flags{false};
+    bool feature_use_aggregated_link_attrs{false};
+    bool feature_use_degree_metric{false};
+    bool feature_use_more_topological_metrics{false};
     bool allow_rejection{false};
     double reject_penalty{50.0};
     std::string shortest_method{"bfs_shortest"};
@@ -60,6 +69,8 @@ public:
     VNRState& operator=(const VNRState&) = default;
 
     std::vector<int> get_candidate_nodes() const;
+    torch::Tensor build_candidate_feature_tensor() const;
+    int candidate_feature_dim() const noexcept;
     bool is_terminal() const;
     float compute_final_reward() const;
     VNRState create_child(int p_node_id) const;
@@ -175,6 +186,7 @@ private:
                                        int p_dst,
                                        VNRState& target,
                                        AllocationDelta& delta) const;
+    bool check_link_constraints_feasible(int v_node_id, int p_node_id) const;
     bool has_reachable_path(int p_src, int p_dst, const ResourceMap& demands) const;
     bool check_node_constraints_feasible(int v_node_id, int p_node_id) const;
     PlacementInfo check_node_constraints(int v_node_id, int p_node_id) const;

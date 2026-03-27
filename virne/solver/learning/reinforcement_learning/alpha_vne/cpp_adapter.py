@@ -8,6 +8,9 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from .feature_constructor import (
+    AlphaZeroFeatureAdapter,
+)
 from .node import Node, State
 
 try:
@@ -101,6 +104,7 @@ class CppMCTSAdapter:
                 c_puct,
                 dirichlet_alpha,
                 dirichlet_epsilon,
+                int(getattr(actor, "top_k_candidates", 0)),
                 self.use_neural_network,
                 rollout_depth_limit,
             )
@@ -149,6 +153,7 @@ class CppMCTSAdapter:
         c_puct: float,
         dirichlet_alpha: float,
         dirichlet_epsilon: float,
+        top_k_candidates: int,
         use_neural_network: bool = True,
         rollout_depth_limit: int = 100,
     ) -> cpp_core.SearchConfig:
@@ -157,6 +162,7 @@ class CppMCTSAdapter:
         cfg.c_puct = float(c_puct)
         cfg.dirichlet_alpha = float(dirichlet_alpha)
         cfg.dirichlet_epsilon = float(dirichlet_epsilon)
+        cfg.top_k_candidates = int(top_k_candidates)
         cfg.use_neural_network = bool(use_neural_network)
         cfg.rollout_depth_limit = int(rollout_depth_limit)
         return cfg
@@ -603,14 +609,19 @@ class CppMCTSAdapter:
         return child
 
     def _build_obs_from_cpp_state(self, cpp_state: "cpp_core.VNRState") -> dict:
-        # Delegate to actor's observation builder
-        return self.actor.obs_builder.build_from_cpp_state(
-            cpp_state=cpp_state,
-            policy=self.actor.policy,
-            node_resource_names=self._node_resource_names,
-            link_resource_names=self._link_resource_names,
-            edge_lookup=self._edge_lookup
+        root_state = State(
+            self.actor.obs_builder._episode_p_net,
+            self.actor.obs_builder._episode_v_net,
+            self.actor.controller,
+            self.actor.recorder,
+            self.actor.counter,
+            link_params={
+                "shortest_method": getattr(self.actor, "shortest_method", "bfs_shortest"),
+                "k": int(getattr(self.actor, "k_shortest", 1)),
+            },
         )
+        python_state = self._python_state_from_cpp(root_state, cpp_state)
+        return self.actor.obs_builder.build(python_state, self.actor.policy)
 
     def _num_actions(self) -> int:
         """Get number of actions using actor's public API."""
@@ -680,8 +691,9 @@ class CppFullSolver:
             getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "link_resource_attrs", [])
         ]
 
-    def _build_network_payload(self, net, node_resource_names: list, link_resource_names: list):
+    def _build_network_payload(self, net, node_resource_names: list, link_resource_names: list, topological_metrics: dict | None = None):
         node_attrs = []
+        topological_metrics = topological_metrics or {}
         for node_id in net.nodes:
             attrs = {}
             data = net.nodes[node_id]
@@ -689,6 +701,11 @@ class CppFullSolver:
                 value = data.get(name, 0.0)
                 if isinstance(value, (int, float, bool)):
                     attrs[str(name)] = float(value)
+            for topo_name, topo_values in topological_metrics.items():
+                try:
+                    attrs[str(topo_name)] = float(topo_values[int(node_id)][0])
+                except Exception:
+                    attrs[str(topo_name)] = 0.0
             node_attrs.append(attrs)
 
         edges = list(net.links)
@@ -716,6 +733,7 @@ class CppFullSolver:
         cfg.c_puct = float(getattr(self.actor, "c_puct", 1.0))
         cfg.dirichlet_alpha = float(getattr(self.actor, "dirichlet_alpha", 0.1))
         cfg.dirichlet_epsilon = float(getattr(self.actor, "dirichlet_epsilon", 0.25))
+        cfg.top_k_candidates = int(getattr(self.actor, "top_k_candidates", 0))
         cfg.use_neural_network = bool(getattr(self.actor, "use_neural_network", True))
         cfg.rollout_depth_limit = int(getattr(self.actor, "rollout_depth_limit", 100))
         if training is not None:
@@ -726,19 +744,26 @@ class CppFullSolver:
         training_cfg = getattr(cfg_obj, "training", None) if cfg_obj is not None else None
         if isinstance(training_cfg, dict):
             batch_size = int(training_cfg.get("gpu_batch_size", batch_size))
-            cfg.value_normalization = str(training_cfg.get("value_normalization", "acceptance_first"))
+            cfg.value_normalization = str(training_cfg.get("value_normalization", "tanh"))
             cfg.value_scale = float(training_cfg.get("value_scale", 1000.0))
         elif training_cfg is not None:
             batch_size = int(getattr(training_cfg, "gpu_batch_size", batch_size))
-            cfg.value_normalization = str(getattr(training_cfg, "value_normalization", "acceptance_first"))
+            cfg.value_normalization = str(getattr(training_cfg, "value_normalization", "tanh"))
             cfg.value_scale = float(getattr(training_cfg, "value_scale", 1000.0))
         cfg.eval_batch_size = max(1, batch_size)
         return cfg
 
-    def _build_vnr_config(self) -> "cpp_core.VNRConfig":
+    def _build_vnr_config(self, feature_metadata: dict) -> "cpp_core.VNRConfig":
         cfg = cpp_core.VNRConfig()
         cfg.node_resource_names = list(self._node_resource_names)
         cfg.link_resource_names = list(self._link_resource_names)
+        cfg.node_attr_benchmarks = dict(feature_metadata.get("node_attr_benchmarks", {}))
+        cfg.link_attr_benchmarks = dict(feature_metadata.get("link_attr_benchmarks", {}))
+        cfg.link_sum_attr_benchmarks = dict(feature_metadata.get("link_sum_attr_benchmarks", {}))
+        cfg.feature_use_node_status_flags = bool(feature_metadata.get("feature_use_node_status_flags", False))
+        cfg.feature_use_aggregated_link_attrs = bool(feature_metadata.get("feature_use_aggregated_link_attrs", False))
+        cfg.feature_use_degree_metric = bool(feature_metadata.get("feature_use_degree_metric", False))
+        cfg.feature_use_more_topological_metrics = bool(feature_metadata.get("feature_use_more_topological_metrics", False))
         try:
             node_constraints = getattr(self.actor.controller, "node_constraint_attrs_checking_at_node", [])
             cfg.node_constraint_names = [getattr(attr, "name", str(attr)) for attr in node_constraints]
@@ -867,14 +892,22 @@ class CppFullSolver:
         else:
             temperature = getattr(self.actor, "temperature_train", 1.0) if training else getattr(self.actor, "temperature_eval", 0.0)
 
+        feature_adapter = AlphaZeroFeatureAdapter(self.actor.config, p_net, v_net)
+        feature_metadata = feature_adapter.build_cpp_feature_metadata()
         p_node_attrs, p_edges, p_edge_attrs, p_directed = self._build_network_payload(
-            p_net, self._node_resource_names, self._link_resource_names
+            p_net,
+            self._node_resource_names,
+            self._link_resource_names,
+            topological_metrics=feature_metadata.get("p_topological_metrics"),
         )
         v_node_attrs, v_edges, v_edge_attrs, v_directed = self._build_network_payload(
-            v_net, self._node_resource_names, self._link_resource_names
+            v_net,
+            self._node_resource_names,
+            self._link_resource_names,
+            topological_metrics=feature_metadata.get("v_topological_metrics"),
         )
 
-        vnr_cfg = self._build_vnr_config()
+        vnr_cfg = self._build_vnr_config(feature_metadata)
         search_cfg = self._build_search_config(training=training)
 
         policy_ts_path = None
@@ -914,7 +947,15 @@ class CppFullSolver:
                 self._warned_trace_batchsize = True
         seed = None
         try:
-            seed = int(getattr(getattr(self.actor, "config", None).experiment, "seed", None))
+            explicit_request_seed = getattr(self.actor, "_cpp_request_seed", None)
+            if explicit_request_seed is not None:
+                seed = int(explicit_request_seed)
+            else:
+                worker_seed = getattr(self.actor, "_cpp_worker_seed", None)
+                if worker_seed is not None:
+                    seed = int(worker_seed)
+                else:
+                    seed = int(getattr(getattr(self.actor, "config", None).experiment, "seed", None))
         except Exception:
             seed = None
 
@@ -950,6 +991,9 @@ class CppFullSolver:
                 device,
                 seed,
                 float(temperature),
+                int(getattr(self.actor, "temperature_move_threshold", -1)),
+                float(getattr(self.actor, "temperature_after_threshold", 0.0)),
+                float(getattr(self.actor, "replay_policy_temperature", 1.0)),
                 bool(getattr(self.actor, "use_nn_policy", True)),
                 bool(getattr(self.actor, "use_nn_value", True)),
                 write_replay,
@@ -990,6 +1034,9 @@ class CppFullSolver:
                     device,
                     seed,
                     float(temperature),
+                    int(getattr(self.actor, "temperature_move_threshold", -1)),
+                    float(getattr(self.actor, "temperature_after_threshold", 0.0)),
+                    float(getattr(self.actor, "replay_policy_temperature", 1.0)),
                     bool(getattr(self.actor, "use_nn_policy", True)),
                     bool(getattr(self.actor, "use_nn_value", True)),
                     write_replay,
@@ -999,32 +1046,37 @@ class CppFullSolver:
             raise
 
     def _export_torchscript(self, policy_ts_path: str) -> None:
-        from .net import ActorCritic, ActorCriticScriptWrapper
+        from .model_factory import build_actor_critic, get_model_classes, prefers_trace_torchscript
 
         model_config = getattr(self.actor.policy_network, "model_config", None)
         if model_config is None:
             raise RuntimeError("Policy model config is unavailable for TorchScript export.")
 
         export_device = self._resolve_runtime_device()
-        model = ActorCritic(**model_config).to(export_device)
+        model = build_actor_critic(model_config).to(export_device)
         model.load_state_dict(self.actor.policy.state_dict())
         model.eval()
+        _, ActorCriticScriptWrapper = get_model_classes(model_config)
         wrapper = ActorCriticScriptWrapper(model).to(export_device)
         wrapper.eval()
 
         tmp = f"{policy_ts_path}.tmp.{os.getpid()}"
         mode_tmp = f"{self._torchscript_mode_path(policy_ts_path)}.tmp.{os.getpid()}"
-        used_trace = False
-        try:
-            scripted = torch.jit.script(wrapper)
-            scripted.save(tmp)
-        except Exception as script_exc:
-            used_trace = True
+        force_trace = prefers_trace_torchscript(model_config)
+        used_trace = force_trace
+        script_exc = None
+        if not force_trace:
+            try:
+                scripted = torch.jit.script(wrapper)
+                scripted.save(tmp)
+            except Exception as exc:
+                script_exc = exc
+                used_trace = True
+        if used_trace:
             # Fallback to trace with nominal shapes
             num_nodes = model_config['p_net_num_nodes']
             p_feat = model_config['p_net_feature_dim']
             p_edge_feat = model_config['p_net_edge_dim']
-            v_feat = model_config['v_net_feature_dim']
             max_seq_len = model_config.get('max_seq_len', 15)
 
             p_net_x = torch.zeros((num_nodes, p_feat), dtype=torch.float32, device=export_device)
@@ -1038,6 +1090,11 @@ class CppFullSolver:
             curr_v_node_id = torch.zeros((1,), dtype=torch.long, device=export_device)
             vnfs_remaining = torch.zeros((1,), dtype=torch.long, device=export_device)
             action_mask = torch.ones((1, model._policy_head.num_actions), dtype=torch.bool, device=export_device)
+            candidate_features = torch.zeros(
+                (1, model._policy_head.num_actions, model._policy_head.candidate_feature_dim),
+                dtype=torch.float32,
+                device=export_device,
+            )
             history_features = torch.zeros((1, 1, p_feat), dtype=torch.float32, device=export_device)
             history_lengths = torch.tensor([1], dtype=torch.long, device=export_device)
 
@@ -1053,11 +1110,16 @@ class CppFullSolver:
                 "curr_v_node_id": curr_v_node_id,
                 "vnfs_remaining": vnfs_remaining,
                 "action_mask": action_mask,
+                "candidate_features": candidate_features,
             }
             scripted = torch.jit.trace(wrapper, example, check_trace=False)
             scripted.save(tmp)
             logger = getattr(self.actor, "logger", None)
-            if logger is not None and not self._warned_trace_fallback:
+            if (
+                script_exc is not None
+                and logger is not None
+                and not self._warned_trace_fallback
+            ):
                 logger.warning(f"TorchScript script export failed; using trace fallback: {script_exc}")
                 self._warned_trace_fallback = True
         mode = "trace" if used_trace else "script"

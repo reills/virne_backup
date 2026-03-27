@@ -70,6 +70,70 @@ std::vector<float> normalize_nonnegative(const std::vector<float>& values) {
     return probs;
 }
 
+std::vector<int> select_top_k_actions(
+    const std::vector<int>& actions,
+    const torch::Tensor& logits,
+    const torch::Tensor& mask,
+    int top_k,
+    int action_space_size
+) {
+    if (top_k <= 0 || static_cast<int>(actions.size()) <= top_k) {
+        return actions;
+    }
+
+    auto probs = masked_softmax(logits, mask);
+    auto probs_cpu = probs.device().is_cuda() ? probs.to(torch::kCPU) : probs;
+    probs_cpu = probs_cpu.contiguous();
+    auto probs_acc = probs_cpu.accessor<float, 1>();
+
+    int reject_action = -1;
+    if (action_space_size > 0) {
+        int candidate_reject = action_space_size - 1;
+        if (std::find(actions.begin(), actions.end(), candidate_reject) != actions.end()) {
+            reject_action = candidate_reject;
+        }
+    }
+
+    std::vector<std::pair<float, int>> scored;
+    scored.reserve(actions.size());
+    for (int action : actions) {
+        if (action == reject_action) {
+            continue;
+        }
+        float prior = 0.0f;
+        if (action >= 0 && action < probs_cpu.size(0)) {
+            prior = probs_acc[action];
+        }
+        scored.emplace_back(prior, action);
+    }
+    if (scored.empty()) {
+        return actions;
+    }
+
+    int keep = std::min<int>(top_k, scored.size());
+    std::partial_sort(
+        scored.begin(),
+        scored.begin() + keep,
+        scored.end(),
+        [](const auto& lhs, const auto& rhs) {
+            if (lhs.first == rhs.first) {
+                return lhs.second < rhs.second;
+            }
+            return lhs.first > rhs.first;
+        }
+    );
+
+    std::vector<int> selected;
+    selected.reserve(static_cast<std::size_t>(keep + (reject_action >= 0 ? 1 : 0)));
+    for (int i = 0; i < keep; ++i) {
+        selected.push_back(scored[static_cast<std::size_t>(i)].second);
+    }
+    if (reject_action >= 0) {
+        selected.push_back(reject_action);
+    }
+    return selected;
+}
+
 float dynamic_root_dirichlet_alpha(std::size_t num_children) {
     if (num_children == 0) {
         return 0.1f;
@@ -336,6 +400,22 @@ float MCTSEngine::expand(TreeNode& node) {
     std::vector<std::pair<int64_t, std::shared_ptr<StateView>>> options;
     if (state->domain_state) {
         auto actions = state->domain_state->get_candidate_nodes();
+        if (config_.top_k_candidates > 0 && config_.use_neural_network && state->policy_logits.defined()) {
+            torch::Tensor logits = state->policy_logits.squeeze();
+            torch::Tensor mask;
+            if (state->action_mask.defined()) {
+                mask = state->action_mask.squeeze().to(torch::kBool);
+            } else {
+                mask = torch::ones_like(logits, torch::TensorOptions().dtype(torch::kBool));
+            }
+            actions = select_top_k_actions(
+                actions,
+                logits,
+                mask,
+                config_.top_k_candidates,
+                state->domain_state->action_space_size()
+            );
+        }
         options.reserve(actions.size());
         for (int64_t action : actions) {
             auto child_domain = std::make_shared<VNRState>(state->domain_state->create_child(static_cast<int>(action)));
@@ -484,7 +564,9 @@ void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
 
     base_priors = normalize_nonnegative(base_priors);
 
-    const float alpha = dynamic_root_dirichlet_alpha(valid_actions.size());
+    const float alpha = (config_.dirichlet_alpha > 0.0f)
+        ? config_.dirichlet_alpha
+        : dynamic_root_dirichlet_alpha(valid_actions.size());
     std::gamma_distribution<float> gamma(alpha, 1.0f);
     std::vector<float> noise_vals;
     noise_vals.reserve(valid_actions.size());

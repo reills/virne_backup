@@ -18,13 +18,14 @@ struct SearchConfig {
     float c_puct = 1.0f;
     float dirichlet_alpha = 0.1f;
     float dirichlet_epsilon = 0.25f;
+    int top_k_candidates = 0;
     float virtual_loss = 1.0f;
     bool add_root_noise = true;
     // Plain MCTS mode (vanilla MCTS without neural network)
     bool use_neural_network = true;  // If false, use uniform priors and random rollouts
     int rollout_depth_limit = 100;   // Maximum depth for rollout simulations
     int eval_batch_size = 1;         // Batch size for neural network evaluation
-    std::string value_normalization{"acceptance_first"};  // acceptance_first | raw | sign | tanh
+    std::string value_normalization{"tanh"};  // acceptance_first | raw | sign | tanh
     float value_scale = 1000.0f;              // scale for tanh normalization
 };
 

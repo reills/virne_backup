@@ -177,6 +177,13 @@ journal_suite:
       methods: [alpha_zero_sfc]
       k_eval_values: [1, 3, 5, 10, 15]
       generalization_cells: []
+    seed0_k10_probe:
+      seeds: [0]
+      topologies: [wx100, geant, brain]
+      scenarios: [nominal]
+      methods: [alpha_zero_sfc]
+      k_eval_values: [10]
+      generalization_cells: []
     alpha_core_seed3_budget64:
       seeds: [3]
       topologies: [wx100, geant, brain]

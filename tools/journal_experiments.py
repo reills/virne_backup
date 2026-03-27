@@ -170,6 +170,30 @@ def _as_list(value: Any) -> List[Any]:
     return result
 
 
+def _format_override_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if value is None:
+        return 'null'
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _flatten_override_mapping(prefix: str, value: Any) -> List[str]:
+    if isinstance(value, (DictConfig, ListConfig)):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        flattened: List[str] = []
+        for key, child in value.items():
+            child_prefix = f'{prefix}.{key}' if prefix else str(key)
+            flattened.extend(_flatten_override_mapping(child_prefix, child))
+        return flattened
+    return [f'{prefix}={_format_override_value(value)}']
+
+
 def _resolve_path(path_text: str, root: Path) -> Path:
     path = Path(path_text)
     if path.is_absolute():
@@ -427,6 +451,7 @@ def _build_job_overrides(
     dataset_dir: Path,
     method_cfg: Optional[DictConfig] = None,
     topology_cfg: Optional[DictConfig] = None,
+    scenario_cfg: Optional[DictConfig] = None,
     is_offline_system: bool = False,
 ) -> List[str]:
     overrides_cfg = suite_cfg.overrides
@@ -460,6 +485,19 @@ def _build_job_overrides(
         if stage in topology_overrides_cfg:
             topology_stage_overrides = [str(v) for v in _as_list(topology_overrides_cfg[stage])]
 
+    scenario_common: List[str] = []
+    if scenario_cfg is not None:
+        p_net_overrides = scenario_cfg.get('p_net_setting_overrides')
+        if p_net_overrides is not None:
+            scenario_common.extend(
+                _flatten_override_mapping('p_net_setting', _as_dict(p_net_overrides))
+            )
+        v_sim_overrides = scenario_cfg.get('v_sim_setting_overrides')
+        if v_sim_overrides is not None:
+            scenario_common.extend(
+                _flatten_override_mapping('v_sim_setting', _as_dict(v_sim_overrides))
+            )
+
     hydra_dir = save_root / solver_name / run_id / 'hydra'
     job_specific = [
         f'solver.solver_name={solver_name}',
@@ -481,6 +519,7 @@ def _build_job_overrides(
         *stage_overrides,
         *method_common,
         *method_stage_overrides,
+        *scenario_common,
         *profile_common,
         *profile_stage_overrides,
         *topology_common,
@@ -488,14 +527,22 @@ def _build_job_overrides(
         *job_specific,
     ]
 
-    # Ensure AlphaZero-SFC uses the pure C++ backend and stops workers once learner finishes.
+    # Ensure AlphaZero-SFC uses the C++ backend by default and stops workers once
+    # learner finishes, but respect explicit caller overrides.
     if solver_name == 'alpha_zero_sfc':
-        for entry in (
-            'training.use_cpp_mcts=true',
-            'training.pure_cpp=true',
-            'training.signal_stop_event_on_learner_complete=true',
-        ):
-            if entry not in overrides:
+        def _has_override_key(items: list[str], key: str) -> bool:
+            return any(str(item).split('=', 1)[0].strip() == key for item in items)
+
+        default_overrides = (
+            ('training.use_cpp_mcts', 'training.use_cpp_mcts=true'),
+            ('training.pure_cpp', 'training.pure_cpp=true'),
+            (
+                'training.signal_stop_event_on_learner_complete',
+                'training.signal_stop_event_on_learner_complete=true',
+            ),
+        )
+        for key, entry in default_overrides:
+            if not _has_override_key(overrides, key):
                 overrides.append(entry)
 
     return overrides
@@ -722,6 +769,7 @@ def _build_planned_jobs(
                                 dataset_dir=dataset_dir,
                                 method_cfg=method_cfg,
                                 topology_cfg=topology_cfg,
+                                scenario_cfg=scenario_cfg,
                                 is_offline_system=False,
                             )
                             jobs.append(
@@ -777,6 +825,7 @@ def _build_planned_jobs(
                             dataset_dir=dataset_dir,
                             method_cfg=method_cfg,
                             topology_cfg=topology_cfg,
+                            scenario_cfg=scenario_cfg,
                             is_offline_system=False,
                         )
                         jobs.append(
@@ -844,6 +893,7 @@ def _build_planned_jobs(
                     dataset_dir=dataset_dir,
                     method_cfg=method_cfg,
                     topology_cfg=topology_cfg,
+                    scenario_cfg=eval_scenario_cfg,
                     is_offline_system=False,
                 )
                 jobs.append(
@@ -914,6 +964,7 @@ def _build_planned_jobs(
                                 dataset_dir=offline_dataset_dir,
                                 method_cfg=method_cfg,
                                 topology_cfg=topology_cfg,
+                                scenario_cfg=scenario_cfg,
                                 is_offline_system=True,
                             )
                             jobs.append(

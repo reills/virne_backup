@@ -38,6 +38,7 @@ struct Observation {
     torch::Tensor curr_v_node_id;
     torch::Tensor vnfs_remaining;
     torch::Tensor action_mask;
+    torch::Tensor candidate_features;
     torch::Tensor v_net_x;
 };
 

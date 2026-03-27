@@ -22,13 +22,22 @@ training:
   max_empty_batches: 50     # Stop if no data for N consecutive attempts
   # MCTS parameters for AlphaZero (OPTIMIZED FOR SPEED)
   computation_budget: 5     # Reduced from 20 for 4x speedup 
-  c_puct: 1.4               # Higher exploration for complex space
+  c_puct: 1.0               # Lower exploration keeps visits less diffuse
+  dirichlet_alpha: 0.03     # C++ root-noise alpha (<=0 falls back to dynamic alpha)
+  dirichlet_epsilon: 0.10   # Mix less root noise into NN priors
+  top_k_candidates: 24      # 0 disables prior-ranked candidate truncation in pure_cpp search
   # Learning parameters
   policy_learning_rate: 1e-4  # Learning rate for policy network
   replay_buffer_max_size: 500000  # Maximum number of episodes to keep in replay buffer
+  replay_sample_accepted_ratio: 0.50   # Prefer successful prefixes in learner batches
+  replay_sample_reject_tail_ratio: 0.25  # Keep some near-terminal failures for contrast
+  replay_reject_tail_k: 2
+  replay_recent_fraction: 0.75  # Heavily bias learner batches toward recent self-play
+  replay_recent_window_size: 25000
   # Model loading options
   resume_training: true     # If true, load policy_latest.pt if it exists
   alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)
+  alpha_zero_backbone: gcn  # gcn | transformer
   # GPU batching optimizations
   use_batched_gpu: true     # Use batched GPU worker for MCTS evaluation
   gpu_batch_size: 32        # Batch size for GPU worker
@@ -38,23 +47,27 @@ training:
   use_nn_policy: true
   use_nn_value: true
   uniform_prior: false
-  value_normalization: acceptance_first  # acceptance_first | sign | tanh | raw
-  value_target_mode: acceptance_first
+  value_normalization: tanh  # acceptance_first | sign | tanh | raw
+  value_target_mode: tanh
   value_target_reject: -1.0
   value_target_accept_min: 0.2
   value_target_accept_max: 1.0
-  transition_buffer_max_size: 200000  # Max transitions in memory for efficient sampling
+  value_scale: 1000.0
+  transition_buffer_max_size: 50000  # Keep AlphaZero replay fresher in memory
   # Temperature annealing for MCTS action selection
   temperature_start: 1.0        # Initial temperature (exploration)
-  temperature_end: 0.5          # Final temperature (exploitation)
-  temperature_anneal_steps: 15000  # Steps over which to anneal temperature
+  temperature_end: 0.0          # Final temperature (greedy late training)
+  temperature_anneal_steps: 5000  # Reach greedy behavior earlier in training
+  temperature_move_threshold: 2   # After this many placements, use the post-threshold temperature
+  temperature_after_threshold: 0.0
+  replay_policy_temperature: 0.67  # Sharpen replay pi from visit counts before training
   # Execution mode toggles
   inference_only: false        # Skip learner/training loop and run inference-only
   enable_async_learner: true   # Disable to prevent spawning background learner
   # Learner control
   guaranteed_save_step: 50
   learner_throttle_ms: 0
-  signal_stop_event_on_learner_complete: false  # If true, learner sets stop_event when it exits
+  signal_stop_event_on_learner_complete: true  # Keep this enabled: once the learner stops updating weights, actors should stop too.
   # C++ MCTS implementation toggle
   use_cpp_mcts: true        # Use C++ implementation for MCTS (much faster)
   use_neural_network: true  # Enable neural network usage

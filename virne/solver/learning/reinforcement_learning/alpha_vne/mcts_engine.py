@@ -30,7 +30,7 @@ class MCTSEngine:
         computation_budget: int = 5,
         c_puct: float = 1.0,
         logger=None,
-        value_normalization: str = "acceptance_first",
+        value_normalization: str = "tanh",
         value_scale: float = 1000.0,
         reject_value: float = -1.0,
         accept_value_min: float = 0.2,
@@ -48,7 +48,7 @@ class MCTSEngine:
         self.computation_budget = computation_budget
         self.c_puct = c_puct
         self.logger = logger
-        self.value_normalization = value_normalization or "raw"
+        self.value_normalization = value_normalization or "tanh"
         self.value_scale = float(value_scale) if value_scale is not None else 1000.0
         self.value_target_builder = AcceptanceFirstValueTarget(
             reject_value=float(reject_value),
@@ -57,7 +57,7 @@ class MCTSEngine:
         )
 
     def _normalize_terminal_value(self, value: float, state=None) -> float:
-        mode = (self.value_normalization or "raw").lower()
+        mode = (self.value_normalization or "tanh").lower()
         if mode == "acceptance_first":
             accepted = bool(value > 0.0)
             total_revenue = None

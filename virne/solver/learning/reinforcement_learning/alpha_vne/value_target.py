@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -138,3 +139,132 @@ class AcceptanceFirstValueTarget:
         self.accepted_cost_min = _safe_float(state.get("accepted_cost_min"), self.accepted_cost_min)
         self.accepted_cost_max = _safe_float(state.get("accepted_cost_max"), self.accepted_cost_max)
         self.accepted_count = int(state.get("accepted_count", self.accepted_count))
+
+
+@dataclass
+class SignValueTarget:
+    reject_value: float = -1.0
+    accept_value: float = 1.0
+
+    def update_cost_stats(self, total_cost: float | None) -> None:
+        return None
+
+    def compute_target(
+        self,
+        *,
+        accepted: bool,
+        total_cost: float | None = None,
+        total_revenue: float | None = None,
+        raw_reward: float | None = None,
+        update_stats: bool = True,
+    ) -> float:
+        del total_cost, total_revenue, raw_reward, update_stats
+        return float(self.accept_value if accepted else self.reject_value)
+
+    def state_dict(self) -> dict:
+        return {
+            "reject_value": float(self.reject_value),
+            "accept_value": float(self.accept_value),
+        }
+
+    def load_state_dict(self, state: dict | None) -> None:
+        if not isinstance(state, dict):
+            return
+        self.reject_value = float(state.get("reject_value", self.reject_value))
+        self.accept_value = float(state.get("accept_value", self.accept_value))
+
+
+@dataclass
+class RawRewardValueTarget:
+    reject_value: float = -1.0
+
+    def update_cost_stats(self, total_cost: float | None) -> None:
+        return None
+
+    def compute_target(
+        self,
+        *,
+        accepted: bool,
+        total_cost: float | None = None,
+        total_revenue: float | None = None,
+        raw_reward: float | None = None,
+        update_stats: bool = True,
+    ) -> float:
+        del total_cost, total_revenue, update_stats
+        reward = _safe_float(raw_reward, None)
+        if reward is None:
+            return float(self.reject_value if not accepted else 0.0)
+        return float(reward)
+
+    def state_dict(self) -> dict:
+        return {"reject_value": float(self.reject_value)}
+
+    def load_state_dict(self, state: dict | None) -> None:
+        if not isinstance(state, dict):
+            return
+        self.reject_value = float(state.get("reject_value", self.reject_value))
+
+
+@dataclass
+class TanhRewardValueTarget:
+    reject_value: float = -1.0
+    value_scale: float = 1000.0
+
+    def update_cost_stats(self, total_cost: float | None) -> None:
+        return None
+
+    def compute_target(
+        self,
+        *,
+        accepted: bool,
+        total_cost: float | None = None,
+        total_revenue: float | None = None,
+        raw_reward: float | None = None,
+        update_stats: bool = True,
+    ) -> float:
+        del total_cost, total_revenue, update_stats
+        reward = _safe_float(raw_reward, None)
+        if reward is None:
+            return float(self.reject_value if not accepted else 0.0)
+        scale = float(self.value_scale) if abs(float(self.value_scale)) > 1e-8 else 1.0
+        return float(math.tanh(float(reward) / scale))
+
+    def state_dict(self) -> dict:
+        return {
+            "reject_value": float(self.reject_value),
+            "value_scale": float(self.value_scale),
+        }
+
+    def load_state_dict(self, state: dict | None) -> None:
+        if not isinstance(state, dict):
+            return
+        self.reject_value = float(state.get("reject_value", self.reject_value))
+        self.value_scale = float(state.get("value_scale", self.value_scale))
+
+
+def build_value_target_builder(mode: str, training_cfg: Any):
+    mode_key = str(mode or "tanh").lower()
+    reject_value = float(getattr(training_cfg, "value_target_reject", -1.0))
+    accept_value_min = float(getattr(training_cfg, "value_target_accept_min", 0.2))
+    accept_value_max = float(getattr(training_cfg, "value_target_accept_max", 1.0))
+    value_scale = float(getattr(training_cfg, "value_scale", 1000.0))
+
+    if mode_key == "acceptance_first":
+        return AcceptanceFirstValueTarget(
+            reject_value=reject_value,
+            accept_value_min=accept_value_min,
+            accept_value_max=accept_value_max,
+        )
+    if mode_key == "sign":
+        return SignValueTarget(
+            reject_value=reject_value,
+            accept_value=max(accept_value_max, 1.0),
+        )
+    if mode_key == "raw":
+        return RawRewardValueTarget(reject_value=reject_value)
+    if mode_key == "tanh":
+        return TanhRewardValueTarget(
+            reject_value=reject_value,
+            value_scale=value_scale,
+        )
+    raise ValueError(f"Unsupported value_target_mode={mode}")

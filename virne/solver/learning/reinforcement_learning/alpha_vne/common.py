@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from .feature_constructor import AlphaZeroFeatureAdapter
 from .node import State
-from ...utils import load_pyg_data_from_network
 
 
 def state_to_obs(
@@ -19,9 +19,18 @@ def state_to_obs(
     """Build an observation dictionary for the given state."""
 
     if p_data is None or v_data is None or encoder_outputs is None:
-        p_data = load_pyg_data_from_network(state.p_net).to(device)
-        v_data = load_pyg_data_from_network(state.v_net).to(device)
-        encoder_outputs = policy.encode({"v_net_x": v_data.x.unsqueeze(0)})
+        adapter = AlphaZeroFeatureAdapter(
+            config=state.controller.config,
+            p_net=state._original_p_net,
+            v_net=state.v_net,
+        )
+        p_data, v_data = adapter.build_graphs(state, v_node_id=v_node_id)
+        p_data = p_data.to(device)
+        v_data = v_data.to(device)
+        policy_device = next(policy.parameters()).device
+        with torch.inference_mode():
+            encoder_outputs = policy.encode({"v_net_x": v_data.x.unsqueeze(0).to(policy_device)})
+        encoder_outputs = encoder_outputs.detach().to(device)
 
     history_len = len(state.selected_p_net_nodes) + 1
     hist = torch.zeros(
@@ -31,7 +40,9 @@ def state_to_obs(
         dtype=p_data.x.dtype,
         device=device,
     )
-    hist[0, 0] = policy.actor.decoder.start_embedding
+    start_embedding = policy.actor.decoder.start_embedding.detach().to(device=device, dtype=p_data.x.dtype)
+    if start_embedding.numel() > 0:
+        hist[0, 0, : min(hist.size(-1), start_embedding.numel())] = start_embedding[: hist.size(-1)]
     for i, idx in enumerate(state.selected_p_net_nodes):
         if 0 <= idx < p_data.num_nodes:
             hist[0, i + 1] = p_data.x[idx]
@@ -65,6 +76,15 @@ def state_to_obs(
         if 0 <= idx < action_mask.size(1):
             action_mask[0, idx] = True
 
+    candidate_feature_dim = int(getattr(getattr(policy, "_policy_head", None), "candidate_feature_dim", 8))
+    candidate_features = torch.zeros(
+        1,
+        num_actions,
+        candidate_feature_dim,
+        dtype=p_data.x.dtype,
+        device=device,
+    )
+
     # Step index for positional embedding in decoder: use placement step, not virtual node id
     curr_step_idx = len(state.selected_p_net_nodes)
     # Remaining vnfs by step count (independent of virtual id values)
@@ -78,6 +98,7 @@ def state_to_obs(
         "curr_v_node_id": torch.tensor([curr_step_idx], dtype=torch.long, device=device),
         "vnfs_remaining": torch.tensor([vnfs_remaining], dtype=torch.long, device=device),
         "action_mask": action_mask,
+        "candidate_features": candidate_features,
         "v_net_x": v_data.x.unsqueeze(0),
     }
     return obs

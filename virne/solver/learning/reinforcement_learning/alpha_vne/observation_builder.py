@@ -5,12 +5,13 @@ import torch
 from torch_geometric.data import Data
 
 from .common import state_to_obs
+from .feature_constructor import AlphaZeroFeatureAdapter
 
 
 class ObservationBuilder:
     """Converts game state to neural network observation."""
 
-    def __init__(self, controller, device: torch.device = None):
+    def __init__(self, controller, config, device: torch.device = None):
         """Initialize ObservationBuilder.
 
         Args:
@@ -18,9 +19,16 @@ class ObservationBuilder:
             device: Device to build observations on (default: CPU for IPC safety)
         """
         self.controller = controller
+        self.config = config
         self.device = device if device is not None else torch.device("cpu")
 
-        # Caches used during one solve episode (set by actor)
+        # Request-local caches
+        self._episode_p_net = None
+        self._episode_v_net = None
+        self._feature_adapter = None
+        self._feature_adapter_key = None
+
+        # Legacy caches used by the old C++ observation mutation path.
         self._p_data = None
         self._v_data = None
         self._encoder_outputs = None
@@ -31,25 +39,44 @@ class ObservationBuilder:
         self._edge_lookup_ref = None
         self._resource_signature = None
 
-    def set_episode_data(self, p_data, v_data, encoder_outputs):
-        """Set cached data for the current episode.
+    def set_episode_data(self, p_net, v_net, encoder_outputs=None):
+        """Set request-local data for the current episode.
 
         Args:
-            p_data: Physical network PyG Data
-            v_data: Virtual network PyG Data
-            encoder_outputs: Pre-computed encoder outputs
+            p_net: Physical network object
+            v_net: Virtual network object
+            encoder_outputs: Optional legacy encoder cache for compatibility
         """
-        self._p_data = p_data
-        self._v_data = v_data
+        self._episode_p_net = p_net
+        self._episode_v_net = v_net
+        adapter_key = (id(p_net), id(v_net))
+        if self._feature_adapter is None or self._feature_adapter_key != adapter_key:
+            self._feature_adapter = AlphaZeroFeatureAdapter(self.config, p_net, v_net)
+            self._feature_adapter_key = adapter_key
         self._encoder_outputs = encoder_outputs
         self._reset_cpp_observation_cache()
 
     def clear_episode_data(self):
         """Clear cached episode data (used when NN guidance is disabled)."""
+        self._episode_p_net = None
+        self._episode_v_net = None
+        self._feature_adapter = None
+        self._feature_adapter_key = None
         self._p_data = None
         self._v_data = None
         self._encoder_outputs = None
         self._reset_cpp_observation_cache()
+
+    def _get_feature_adapter(self, state) -> AlphaZeroFeatureAdapter:
+        p_net = getattr(state, "_original_p_net", None)
+        v_net = getattr(state, "v_net", None)
+        if p_net is None or v_net is None:
+            raise RuntimeError("State does not expose the original p_net/v_net required for feature construction.")
+        adapter_key = (id(p_net), id(v_net))
+        if self._feature_adapter is None or self._feature_adapter_key != adapter_key:
+            self._feature_adapter = AlphaZeroFeatureAdapter(self.config, p_net, v_net)
+            self._feature_adapter_key = adapter_key
+        return self._feature_adapter
 
     def build(self, state, policy, v_node_id: int = None) -> dict:
         """Build observation dict from state.
@@ -65,18 +92,24 @@ class ObservationBuilder:
         if v_node_id is None:
             v_node_id = state.v_node_id + 1
 
-        if self._p_data is None or self._v_data is None or self._encoder_outputs is None:
-            raise RuntimeError("Episode data not prepared; call set_episode_data() before build().")
+        adapter = self._get_feature_adapter(state)
+        p_data, v_data = adapter.build_graphs(state, v_node_id=v_node_id)
+        p_data = p_data.to(self.device)
+        v_data = v_data.to(self.device)
 
-        # Use real encoder outputs (computed once per episode, kept on CPU for IPC)
+        policy_device = next(policy.parameters()).device
+        with torch.inference_mode():
+            encoder_outputs = policy.encode({"v_net_x": v_data.x.unsqueeze(0).to(policy_device)})
+        encoder_outputs = encoder_outputs.detach().to(self.device)
+
         return state_to_obs(
             state,
             policy,
             self.controller,
             self.device,  # Always build obs on CPU for IPC safety
-            p_data=self._p_data,
-            v_data=self._v_data,
-            encoder_outputs=self._encoder_outputs,
+            p_data=p_data,
+            v_data=v_data,
+            encoder_outputs=encoder_outputs,
             v_node_id=v_node_id,
         )
 
@@ -147,6 +180,19 @@ class ObservationBuilder:
             if 0 <= action < action_mask.numel():
                 action_mask[action] = True
 
+        candidate_feature_dim_attr = getattr(cpp_state, "candidate_feature_dim", None)
+        if callable(candidate_feature_dim_attr):
+            candidate_feature_dim = int(candidate_feature_dim_attr())
+        elif candidate_feature_dim_attr is not None:
+            candidate_feature_dim = int(candidate_feature_dim_attr)
+        else:
+            candidate_feature_dim = 8
+        candidate_feature_builder = getattr(cpp_state, "build_candidate_feature_tensor", None)
+        if candidate_feature_builder is not None:
+            candidate_features = candidate_feature_builder().to(dtype=hist_dtype)
+        else:
+            candidate_features = torch.zeros((1, num_actions, candidate_feature_dim), dtype=hist_dtype)
+
         obs = {
             "p_net": p_data,
             "history_features": history_features,
@@ -155,6 +201,7 @@ class ObservationBuilder:
             "curr_v_node_id": torch.tensor([curr_step_idx], dtype=torch.long),
             "vnfs_remaining": torch.tensor([vnfs_remaining], dtype=torch.long),
             "action_mask": action_mask.unsqueeze(0),
+            "candidate_features": candidate_features,
             "v_net_x": v_data.x.unsqueeze(0),
         }
         return obs

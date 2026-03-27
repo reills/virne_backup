@@ -30,7 +30,8 @@ from .observation_builder import ObservationBuilder
 from .policy_network import PolicyNetwork
 from .node_expander import NodeExpander
 from .mcts_engine import MCTSEngine
-from .value_target import AcceptanceFirstValueTarget
+from .utils import build_model_config
+from .value_target import build_value_target_builder
 
 
 class OptimizedAlphaZeroActor(Solver):
@@ -74,6 +75,7 @@ class OptimizedAlphaZeroActor(Solver):
         # Initialize observation builder (always use CPU for IPC safety)
         self.obs_builder = ObservationBuilder(
             controller=controller,
+            config=config,
             device=torch.device("cpu")
         )
 
@@ -84,6 +86,7 @@ class OptimizedAlphaZeroActor(Solver):
         # Dirichlet noise for root exploration (AlphaZero style)
         self.dirichlet_epsilon = getattr(config.training, 'dirichlet_epsilon', 0.25)
         self.dirichlet_alpha = getattr(config.training, 'dirichlet_alpha', 0.1)
+        self.top_k_candidates = int(getattr(config.training, 'top_k_candidates', 0))
 
         # Temperature schedule for MCTS action selection.
         # Keep legacy temperature_train/temperature_eval fields for compatibility.
@@ -92,21 +95,25 @@ class OptimizedAlphaZeroActor(Solver):
         self.temperature_start = float(getattr(config.training, 'temperature_start', legacy_train_temp))
         self.temperature_end = float(getattr(config.training, 'temperature_end', 0.5))
         self.temperature_anneal_steps = int(getattr(config.training, 'temperature_anneal_steps', 0))
+        self.temperature_move_threshold = int(getattr(config.training, 'temperature_move_threshold', -1))
+        self.temperature_after_threshold = float(
+            getattr(config.training, 'temperature_after_threshold', self.temperature_end)
+        )
+        self.replay_policy_temperature = float(getattr(config.training, 'replay_policy_temperature', 1.0))
         self._temperature_step = 0
         self.temperature_train = self.temperature_start
 
-        self.value_target_mode = str(getattr(config.training, "value_target_mode", "acceptance_first")).lower()
-        self.value_target_builder = AcceptanceFirstValueTarget(
-            reject_value=float(getattr(config.training, "value_target_reject", -1.0)),
-            accept_value_min=float(getattr(config.training, "value_target_accept_min", 0.2)),
-            accept_value_max=float(getattr(config.training, "value_target_accept_max", 1.0)),
-        )
+        self.value_target_mode = str(getattr(config.training, "value_target_mode", "tanh")).lower()
+        self.value_target_builder = build_value_target_builder(self.value_target_mode, config.training)
 
         # Link mapping parameters (inherited from MctsSolver)
         self.shortest_method = kwargs.get('shortest_method', 'bfs_shortest')
         self.k_shortest = kwargs.get('k_shortest', 10)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_cuda_cfg = bool(getattr(config.training, "use_cuda", True))
+        self.device = torch.device(
+            "cuda" if (use_cuda_cfg and torch.cuda.is_available()) else "cpu"
+        )
         # Ablation and instrumentation flags
         self.use_nn_policy = getattr(config.training, 'use_nn_policy', True)
         self.use_nn_value = getattr(config.training, 'use_nn_value', True)
@@ -117,26 +124,14 @@ class OptimizedAlphaZeroActor(Solver):
         self.rollout_depth_limit = getattr(config.training, 'rollout_depth_limit', 100)
 
         # Setup GPU evaluation
-        model_config = {
-            'p_net_num_nodes': config.simulation.p_net_setting_num_nodes,
-            'p_net_feature_dim': config.simulation.p_net_setting_num_node_resource_attrs,
-            'v_net_feature_dim': config.simulation.v_sim_setting_num_node_resource_attrs,
-            'p_net_edge_dim': config.simulation.p_net_setting_num_link_resource_attrs,
-            'embedding_dim': getattr(config.nn, 'embedding_dim', 96),
-            'n_heads': getattr(config.nn, 'n_heads', 6),
-            'n_layers': getattr(config.nn, 'transformer_layers', 2),
-            'gnn_layers': getattr(config.nn, 'num_gnn_layers', 3),
-            'dropout': getattr(config.nn, 'dropout_prob', 0.1),
-            'allow_rejection': getattr(getattr(config, 'solver', {}), 'allow_rejection', False),
-            'max_seq_len': getattr(config.nn, 'max_seq_len', 15),
-        }
+        model_config = build_model_config(config)
 
         # Initialize PolicyNetwork wrapper
         self.policy_network = PolicyNetwork(
             model_config=model_config,
             policy_path=self.policy_path,
             device=self.device,
-            use_batched_gpu=use_batched_gpu and torch.cuda.is_available(),
+            use_batched_gpu=use_batched_gpu,
             batch_size=getattr(config.training, 'gpu_batch_size', 32),
             gpu_timeout_ms=getattr(config.training, 'gpu_timeout_ms', 10),
             logger=self.logger
@@ -166,7 +161,7 @@ class OptimizedAlphaZeroActor(Solver):
         )
 
         # Initialize MCTSEngine
-        value_norm = "acceptance_first"
+        value_norm = "tanh"
         value_scale = 1000.0
         try:
             cfg_obj = getattr(config, "training", None)
@@ -283,8 +278,6 @@ class OptimizedAlphaZeroActor(Solver):
                     ) from exc
                 self.logger.warning(f"C++ full solve failed, falling back to Python: {exc}")
 
-        from virne.solver.learning.utils import load_pyg_data_from_network
-
         solve_start = time.perf_counter()
         timers = {
             "encode_ms": 0.0,
@@ -299,33 +292,7 @@ class OptimizedAlphaZeroActor(Solver):
         }
         self.node_expander.set_timers(timers)
 
-        # Keep data on CPU for pickle-safe IPC with batched GPU worker
-        self._p_data = load_pyg_data_from_network(p_net)
-        self._v_data = load_pyg_data_from_network(v_net)
-
-        if self.use_neural_network or self.cpp_adapter is None:
-            # Compute encoder outputs once per episode (required for NN-guided policies)
-            if self._sync_cuda_timing and self.device.type == 'cuda':
-                try:
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
-            t_encode = time.perf_counter()
-            v_data_gpu = self._v_data.to(self.device)
-            encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
-            self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
-            if self._sync_cuda_timing and self.device.type == 'cuda':
-                try:
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
-            timers["encode_ms"] += (time.perf_counter() - t_encode) * 1000.0
-            # Set episode data in observation builder
-            self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
-        else:
-            # Plain MCTS mode does not require encoder features
-            self._encoder_outputs = None
-            self.obs_builder.clear_episode_data()
+        self.obs_builder.set_episode_data(p_net, v_net)
         if self.cpp_adapter is not None:
             self.cpp_adapter.begin_request(p_net, v_net)
 
@@ -388,7 +355,10 @@ class OptimizedAlphaZeroActor(Solver):
 
                 # Select the best child based on visit counts with appropriate temperature
                 try:
-                    best_child = self._select_best_child(current_node, temperature=temperature)
+                    best_child = self._select_best_child(
+                        current_node,
+                        temperature=self.get_action_selection_temperature(training, move_index=v_node_idx),
+                    )
                 except ValueError as exc:
                     solution["place_result"] = False
                     self.logger.warning(
@@ -505,14 +475,18 @@ class OptimizedAlphaZeroActor(Solver):
         # Delegate to MCTSEngine
         self.mcts_engine.search(root_node, v_node_id)
 
-    def get_action_selection_temperature(self, training: bool) -> float:
+    def get_action_selection_temperature(self, training: bool, move_index: int | None = None) -> float:
         """Return action-selection temperature for current episode."""
         if not training:
             return float(self.temperature_eval)
         if self.temperature_anneal_steps <= 0:
-            return float(self.temperature_start)
-        frac = min(1.0, float(self._temperature_step) / float(self.temperature_anneal_steps))
-        return float(self.temperature_start + frac * (self.temperature_end - self.temperature_start))
+            base_temperature = float(self.temperature_start)
+        else:
+            frac = min(1.0, float(self._temperature_step) / float(self.temperature_anneal_steps))
+            base_temperature = float(self.temperature_start + frac * (self.temperature_end - self.temperature_start))
+        if move_index is not None and self.temperature_move_threshold >= 0 and move_index >= self.temperature_move_threshold:
+            return float(self.temperature_after_threshold)
+        return base_temperature
 
     def _advance_temperature_schedule(self, training: bool) -> None:
         """Advance annealing progress after each completed training episode."""
@@ -570,10 +544,9 @@ class OptimizedAlphaZeroActor(Solver):
         if num_actions is not None:
             return num_actions
 
-        # Fallback: compute from current _p_data if available
-        if self._p_data is not None and hasattr(self._p_data, 'x'):
-            num_nodes = self._p_data.x.size(0)
-            allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
+        num_nodes = int(getattr(self.config.simulation, 'p_net_setting_num_nodes', 0))
+        allow_rejection = getattr(self.policy.actor.decoder, 'allow_rejection', False)
+        if num_nodes > 0:
             return num_nodes + (1 if allow_rejection else 0)
 
         return 0
@@ -1137,14 +1110,7 @@ class OptimizedAlphaZeroActor(Solver):
 
         # Rebuild trajectory with Python observations for replay compatibility
         if build_trajectory:
-            from virne.solver.learning.utils import load_pyg_data_from_network
-            # Keep data on CPU for serialization safety
-            self._p_data = load_pyg_data_from_network(p_net)
-            self._v_data = load_pyg_data_from_network(v_net)
-            v_data_gpu = self._v_data.to(self.device)
-            encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
-            self._encoder_outputs = encoder_outputs_gpu.cpu()
-            self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
+            self.obs_builder.set_episode_data(p_net, v_net)
 
         state = State(
             p_net,
@@ -1265,21 +1231,7 @@ class OptimizedAlphaZeroActor(Solver):
                     ) from exc
                 self.logger.warning(f"C++ full solve failed in worker path, falling back: {exc}")
         # Same implementation as original, but with optimizations
-        from virne.solver.learning.utils import load_pyg_data_from_network
-
-        # Keep data on CPU for pickle-safe IPC with batched GPU worker
-        self._p_data = load_pyg_data_from_network(p_net)
-        self._v_data = load_pyg_data_from_network(v_net)
-
-        if self.use_neural_network or self.cpp_adapter is None:
-            v_data_gpu = self._v_data.to(self.device)
-            encoder_outputs_gpu = self.policy_network.encode({"v_net_x": v_data_gpu.x.unsqueeze(0)})
-            self._encoder_outputs = encoder_outputs_gpu.cpu()  # Keep on CPU for IPC
-            # Set episode data in observation builder
-            self.obs_builder.set_episode_data(self._p_data, self._v_data, self._encoder_outputs)
-        else:
-            self._encoder_outputs = None
-            self.obs_builder.clear_episode_data()
+        self.obs_builder.set_episode_data(p_net, v_net)
         if self.cpp_adapter is not None:
             self.cpp_adapter.begin_request(p_net, v_net)
 
