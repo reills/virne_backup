@@ -13,10 +13,22 @@ TreeNode::TreeNode(TreeNode* parent,
       action_from_parent_(action_from_parent) {}
 
 TreeNode* TreeNode::add_child(int64_t action, std::shared_ptr<StateView> child_state, float prior) {
+    for (auto& [existing_action, existing_child] : children_) {
+        if (existing_action == action) {
+            if (existing_child) {
+                existing_child->set_prior(prior);
+                return existing_child.get();
+            }
+            existing_child = std::make_unique<TreeNode>(this, std::move(child_state), action);
+            existing_child->set_prior(prior);
+            return existing_child.get();
+        }
+    }
     auto child = std::make_unique<TreeNode>(this, std::move(child_state), action);
     child->set_prior(prior);
-    auto it = children_.emplace(action, std::move(child));
-    return it.first->second.get();
+    auto* child_ptr = child.get();
+    children_.emplace_back(action, std::move(child));
+    return child_ptr;
 }
 
 bool TreeNode::is_expanded() const noexcept {
@@ -47,13 +59,18 @@ void TreeNode::update_stats(float leaf_value) {
 TreeNode* TreeNode::best_child(float c_puct) {
     TreeNode* best = nullptr;
     float best_score = -std::numeric_limits<float>::infinity();
-    float parent_visits = static_cast<float>(std::max<std::size_t>(1, visit_count_));
+    float total_visits = 0.0f;
+    for (const auto& [action, child_ptr] : children_) {
+        (void)action;
+        total_visits += static_cast<float>(child_ptr->visit_count());
+    }
+    float sqrt_total = std::sqrt(total_visits + 1.0f);
 
     for (auto& [action, child_ptr] : children_) {
         TreeNode* child = child_ptr.get();
-        float child_visits = static_cast<float>(std::max<std::size_t>(1, child->visit_count_));
+        float child_visits = static_cast<float>(child->visit_count_);
         float mean_value = child->visit_count_ > 0 ? child->value_sum_ / child_visits : 0.0f;
-        float exploration = c_puct * child->prior_ * std::sqrt(parent_visits) / (1.0f + child_visits);
+        float exploration = c_puct * child->prior_ * sqrt_total / (1.0f + child_visits);
         float score = mean_value + exploration - child->virtual_loss_;
 
         if (score > best_score) {
@@ -66,11 +83,27 @@ TreeNode* TreeNode::best_child(float c_puct) {
 }
 
 TreeNode* TreeNode::child_for_action(int64_t action) {
-    auto it = children_.find(action);
-    if (it == children_.end()) {
-        return nullptr;
+    for (auto& [child_action, child] : children_) {
+        if (child_action == action) {
+            return child.get();
+        }
     }
-    return it->second.get();
+    return nullptr;
+}
+
+std::unique_ptr<TreeNode> TreeNode::extract_child(int64_t action) {
+    for (auto it = children_.begin(); it != children_.end(); ++it) {
+        if (it->first != action) {
+            continue;
+        }
+        auto child = std::move(it->second);
+        children_.erase(it);
+        if (child) {
+            child->parent_ = nullptr;
+        }
+        return child;
+    }
+    return nullptr;
 }
 
 bool TreeNode::has_children() const noexcept {

@@ -3,6 +3,7 @@
 #include "mcts_engine.hpp"
 #include "network.hpp"
 #include "policy_network.hpp"
+#include "replay_writer.hpp"
 #include "vnr_state.hpp"
 
 #include <torch/torch.h>
@@ -64,6 +65,50 @@ SolveResult solve_vnr(
     bool write_replay,
     const std::string& replay_dir,
     int max_buffer_size
+);
+
+Observation debug_build_observation(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::string& policy_path,
+    const std::string& device
+);
+
+Observation debug_build_observation_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::vector<int>& actions,
+    const std::string& policy_path,
+    const std::string& device
+);
+
+EvaluationResult debug_evaluate_root(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::string& policy_path,
+    const std::string& device
+);
+
+EvaluationResult debug_evaluate_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::vector<int>& actions,
+    const std::string& policy_path,
+    const std::string& device
+);
+
+SearchResult debug_search_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const SearchConfig& search_config,
+    const std::vector<int>& actions,
+    const std::string& policy_path,
+    const std::string& device
 );
 
 }  // namespace azsfc

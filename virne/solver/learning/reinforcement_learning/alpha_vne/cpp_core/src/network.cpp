@@ -1,5 +1,6 @@
 #include "network.hpp"
 
+#include <unordered_set>
 #include <stdexcept>
 
 namespace azsfc {
@@ -24,6 +25,12 @@ void Network::set_edges(const std::vector<std::pair<int, int>>& edge_list, bool 
     edge_attrs.assign(num_edges, {});
     edge_index.clear();
 
+    std::unordered_set<std::pair<int, int>, PairHash> explicit_edges;
+    explicit_edges.reserve(static_cast<std::size_t>(num_edges) * 2U + 1U);
+    for (const auto& edge : edge_list) {
+        explicit_edges.insert(edge);
+    }
+
     for (int edge_id = 0; edge_id < num_edges; ++edge_id) {
         auto [u, v] = edges[edge_id];
         if (u < 0 || u >= num_nodes || v < 0 || v >= num_nodes) {
@@ -31,7 +38,7 @@ void Network::set_edges(const std::vector<std::pair<int, int>>& edge_list, bool 
         }
         adjacency[u].emplace_back(v, edge_id);
         edge_index[{u, v}] = edge_id;
-        if (!directed) {
+        if (!directed && explicit_edges.find({v, u}) == explicit_edges.end()) {
             adjacency[v].emplace_back(u, edge_id);
             edge_index[{v, u}] = edge_id;
         }
@@ -53,4 +60,3 @@ void Network::set_edge_attrs(const std::vector<std::unordered_map<std::string, d
 }
 
 }  // namespace azsfc
-

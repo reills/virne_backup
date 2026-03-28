@@ -164,25 +164,57 @@ double available_link_resource(
     int edge_id,
     const std::string& attr_name
 ) {
+    auto allocated_amount = [&](int id) {
+        auto edge_it = allocated.find(id);
+        if (edge_it == allocated.end()) {
+            return 0.0;
+        }
+        auto attr_it = edge_it->second.find(attr_name);
+        if (attr_it == edge_it->second.end()) {
+            return 0.0;
+        }
+        return attr_it->second;
+    };
+
     double value = safe_lookup(net.edge_attrs[edge_id], attr_name);
-    auto edge_it = allocated.find(edge_id);
-    if (edge_it == allocated.end()) {
-        return value;
+    double used = allocated_amount(edge_id);
+
+    // Python feature construction materializes the physical substrate as the
+    // original undirected graph, so mirrored arcs (u,v)/(v,u) share the same
+    // residual bandwidth. The pure-C++ solve path serializes those links as
+    // explicit directed arcs for routing/state reconstruction, so we need to
+    // merge reverse-direction allocations back together when reading
+    // observation features.
+    if (net.directed && edge_id >= 0 && edge_id < static_cast<int>(net.edges.size())) {
+        const auto& [u, v] = net.edges[edge_id];
+        auto reverse_it = net.edge_index.find({v, u});
+        if (reverse_it != net.edge_index.end()) {
+            int reverse_edge_id = reverse_it->second;
+            if (reverse_edge_id != edge_id &&
+                reverse_edge_id >= 0 &&
+                reverse_edge_id < static_cast<int>(net.edge_attrs.size()) &&
+                net.edge_attrs[reverse_edge_id] == net.edge_attrs[edge_id]) {
+                used += allocated_amount(reverse_edge_id);
+            }
+        }
     }
-    auto attr_it = edge_it->second.find(attr_name);
-    if (attr_it == edge_it->second.end()) {
-        return value;
-    }
-    return value - attr_it->second;
+    return value - used;
 }
 
-int current_virtual_node_id(const VNRState& state) {
-    const auto& order = state.virtual_order();
+int current_virtual_node_id(const VNRState& state, int override_v_node_id = -1) {
+    if (override_v_node_id >= 0) {
+        return override_v_node_id;
+    }
     const auto& selected = state.selected_physical_nodes();
-    if (selected.size() >= order.size()) {
+    const auto total_v_nodes = state.virtual_order().size();
+    if (selected.size() >= total_v_nodes) {
         return -1;
     }
-    return order[selected.size()];
+    int step_idx = static_cast<int>(selected.size());
+    if (step_idx >= static_cast<int>(total_v_nodes)) {
+        return -1;
+    }
+    return step_idx;
 }
 
 std::unordered_map<int, int> build_node_slots(const VNRState& state) {
@@ -199,10 +231,11 @@ std::unordered_map<int, int> build_node_slots(const VNRState& state) {
 
 std::vector<int> build_selected_p_neighbors(
     const Network& virtual_net,
-    const VNRState& state
+    const VNRState& state,
+    int override_v_node_id = -1
 ) {
     std::vector<int> neighbors;
-    int curr_v_node = current_virtual_node_id(state);
+    int curr_v_node = current_virtual_node_id(state, override_v_node_id);
     if (curr_v_node < 0 || curr_v_node >= virtual_net.num_nodes) {
         return neighbors;
     }
@@ -284,23 +317,29 @@ torch::Tensor build_edge_index(const Network& net) {
     auto edge_index = torch::empty({2, out_edges}, torch::kInt64);
     auto edge_index_acc = edge_index.accessor<std::int64_t, 2>();
     for (int e = 0; e < net.num_edges; ++e) {
-        int out = net.directed ? e : (2 * e);
-        edge_index_acc[0][out] = net.edges[e].first;
-        edge_index_acc[1][out] = net.edges[e].second;
+        edge_index_acc[0][e] = net.edges[e].first;
+        edge_index_acc[1][e] = net.edges[e].second;
         if (!net.directed) {
-            edge_index_acc[0][out + 1] = net.edges[e].second;
-            edge_index_acc[1][out + 1] = net.edges[e].first;
+            int rev = net.num_edges + e;
+            edge_index_acc[0][rev] = net.edges[e].second;
+            edge_index_acc[1][rev] = net.edges[e].first;
         }
     }
     return edge_index;
 }
 
-torch::Tensor build_v_net_x(const Network& net, const VNRState& state, const VNRConfig& cfg, int p_net_num_nodes) {
+torch::Tensor build_v_net_x(
+    const Network& net,
+    const VNRState& state,
+    const VNRConfig& cfg,
+    int p_net_num_nodes,
+    int override_v_node_id = -1
+) {
     (void)p_net_num_nodes;
     auto x = torch::zeros({net.num_nodes, compute_v_net_feature_dim(cfg)}, torch::kFloat32);
     auto x_acc = x.accessor<float, 2>();
     const auto node_slots = build_node_slots(state);
-    const int curr_v_node = current_virtual_node_id(state);
+    const int curr_v_node = current_virtual_node_id(state, override_v_node_id);
     const double curr_neighbors = (curr_v_node >= 0 && net.num_nodes > 0)
         ? (static_cast<double>(net.adjacency[curr_v_node].size()) / static_cast<double>(net.num_nodes))
         : 0.0;
@@ -318,7 +357,7 @@ torch::Tensor build_v_net_x(const Network& net, const VNRState& state, const VNR
             float neighbor_flag = 0.0f;
             if (curr_v_node >= 0 && curr_v_node < net.num_nodes) {
                 for (const auto& [neighbor, _edge_id] : net.adjacency[curr_v_node]) {
-                    if (node_slots.count(neighbor)) {
+                    if (neighbor == n && node_slots.count(neighbor)) {
                         neighbor_flag = 1.0f;
                         break;
                     }
@@ -328,24 +367,25 @@ torch::Tensor build_v_net_x(const Network& net, const VNRState& state, const VNR
         }
         if (cfg.feature_use_aggregated_link_attrs) {
             for (const auto& name : cfg.link_resource_names) {
+                // Match Python's obs_handler.get_link_aggr_attrs_obs(), which
+                // aggregates over the full adjacency matrix rather than only
+                // incident edges. With non-negative resources, that makes the
+                // implicit minimum zero due to non-neighbors and the diagonal.
+                // However, residual resources can go negative after shadow
+                // reservations, so we still need to track the true min over
+                // incident edges.
                 double min_v = 0.0, max_v = 0.0, sum_v = 0.0, mean_v = 0.0;
-                if (!net.adjacency[n].empty()) {
-                    min_v = std::numeric_limits<double>::infinity();
-                    for (const auto& [_neighbor, edge_id] : net.adjacency[n]) {
-                        double value = safe_lookup(net.edge_attrs[edge_id], name);
-                        min_v = std::min(min_v, value);
-                        max_v = std::max(max_v, value);
-                        sum_v += value;
-                    }
-                    mean_v = sum_v / static_cast<double>(net.adjacency[n].size());
-                    if (!std::isfinite(min_v)) {
-                        min_v = 0.0;
-                    }
+                for (const auto& [_neighbor, edge_id] : net.adjacency[n]) {
+                    double value = safe_lookup(net.edge_attrs[edge_id], name);
+                    min_v = std::min(min_v, value);
+                    max_v = std::max(max_v, value);
+                    sum_v += value;
                 }
+                mean_v = sum_v / static_cast<double>(std::max(1, net.num_nodes));
                 x_acc[n][feat_idx++] = static_cast<float>(safe_div(min_v, safe_lookup(cfg.link_attr_benchmarks, name)));
                 x_acc[n][feat_idx++] = static_cast<float>(safe_div(max_v, safe_lookup(cfg.link_attr_benchmarks, name)));
                 x_acc[n][feat_idx++] = static_cast<float>(safe_div(sum_v, safe_lookup(cfg.link_sum_attr_benchmarks, name)));
-                x_acc[n][feat_idx++] = static_cast<float>(safe_div(mean_v, safe_lookup(cfg.link_attr_benchmarks, name)));
+                x_acc[n][feat_idx++] = static_cast<float>(mean_v);
             }
         }
         x_acc[n][feat_idx++] = static_cast<float>(curr_neighbors);
@@ -365,14 +405,15 @@ torch::Tensor build_p_net_x(
     const Network& net,
     const Network& virtual_net,
     const VNRState& state,
-    const VNRConfig& cfg
+    const VNRConfig& cfg,
+    int override_v_node_id = -1
 ) {
     auto x = torch::zeros({net.num_nodes, compute_p_net_feature_dim(cfg)}, torch::kFloat32);
     auto x_acc = x.accessor<float, 2>();
     const auto node_alloc = state.get_allocated_node_resources();
     const auto link_alloc = state.get_allocated_link_resources();
     const auto& selected = state.selected_physical_nodes();
-    const auto selected_neighbors = build_selected_p_neighbors(virtual_net, state);
+    const auto selected_neighbors = build_selected_p_neighbors(virtual_net, state, override_v_node_id);
     const auto avg_distance = compute_average_distance(net, selected);
     for (int n = 0; n < net.num_nodes; ++n) {
         int feat_idx = 0;
@@ -388,22 +429,17 @@ torch::Tensor build_p_net_x(
         }
         if (cfg.feature_use_aggregated_link_attrs) {
             for (const auto& name : cfg.link_resource_names) {
+                // Match Python's full-adjacency-matrix aggregation semantics.
                 double min_v = 0.0, mean_v = 0.0, max_v = 0.0, sum_v = 0.0;
-                if (!net.adjacency[n].empty()) {
-                    min_v = std::numeric_limits<double>::infinity();
-                    for (const auto& [_neighbor, edge_id] : net.adjacency[n]) {
-                        double value = available_link_resource(net, link_alloc, edge_id, name);
-                        min_v = std::min(min_v, value);
-                        max_v = std::max(max_v, value);
-                        sum_v += value;
-                    }
-                    mean_v = sum_v / static_cast<double>(net.adjacency[n].size());
-                    if (!std::isfinite(min_v)) {
-                        min_v = 0.0;
-                    }
+                for (const auto& [_neighbor, edge_id] : net.adjacency[n]) {
+                    double value = available_link_resource(net, link_alloc, edge_id, name);
+                    min_v = std::min(min_v, value);
+                    max_v = std::max(max_v, value);
+                    sum_v += value;
                 }
+                mean_v = sum_v / static_cast<double>(std::max(1, net.num_nodes));
                 x_acc[n][feat_idx++] = static_cast<float>(safe_div(min_v, safe_lookup(cfg.link_attr_benchmarks, name)));
-                x_acc[n][feat_idx++] = static_cast<float>(safe_div(mean_v, safe_lookup(cfg.link_attr_benchmarks, name)));
+                x_acc[n][feat_idx++] = static_cast<float>(mean_v);
                 x_acc[n][feat_idx++] = static_cast<float>(safe_div(max_v, safe_lookup(cfg.link_attr_benchmarks, name)));
                 x_acc[n][feat_idx++] = static_cast<float>(safe_div(sum_v, safe_lookup(cfg.link_sum_attr_benchmarks, name)));
             }
@@ -431,16 +467,15 @@ torch::Tensor build_p_edge_attr(
     auto attr = torch::zeros({out_edges, static_cast<long>(cfg.link_resource_names.size())}, torch::kFloat32);
     auto acc = attr.accessor<float, 2>();
     for (int e = 0; e < net.num_edges; ++e) {
-        int out = net.directed ? e : (2 * e);
         for (std::size_t j = 0; j < cfg.link_resource_names.size(); ++j) {
             const auto& name = cfg.link_resource_names[j];
             float value = static_cast<float>(safe_div(
                 available_link_resource(net, link_alloc, e, name),
                 safe_lookup(cfg.link_attr_benchmarks, name)
             ));
-            acc[out][j] = value;
+            acc[e][j] = value;
             if (!net.directed) {
-                acc[out + 1][j] = value;
+                acc[net.num_edges + e][j] = value;
             }
         }
     }
@@ -535,6 +570,7 @@ torch::Tensor build_history_features_single(
 }
 
 StateView::TensorMap build_inputs_cached(
+    const std::shared_ptr<StateView>& state_view,
     const VNRState& state,
     const Network& physical,
     const Network& virtual_net,
@@ -549,9 +585,10 @@ StateView::TensorMap build_inputs_cached(
     torch::Device device
 ) {
     StateView::TensorMap inputs;
-    auto p_net_x = build_p_net_x(physical, virtual_net, state, vnr_config).to(device);
+    const int override_v_node_id = state_view ? static_cast<int>(state_view->curr_v_node_override) : -1;
+    auto p_net_x = build_p_net_x(physical, virtual_net, state, vnr_config, override_v_node_id).to(device);
     auto p_edge_attr = build_p_edge_attr(physical, state, vnr_config).to(device);
-    auto v_net_x = build_v_net_x(virtual_net, state, vnr_config, physical.num_nodes).unsqueeze(0).to(device);
+    auto v_net_x = build_v_net_x(virtual_net, state, vnr_config, physical.num_nodes, override_v_node_id).unsqueeze(0).to(device);
     inputs.emplace("p_net_x", p_net_x);
     inputs.emplace("p_net_edge_index", edge_index);
     inputs.emplace("p_net_edge_attr", p_edge_attr);
@@ -575,7 +612,12 @@ StateView::TensorMap build_inputs_cached(
 
     auto candidates = state.get_candidate_nodes();
     inputs.emplace("action_mask", build_action_mask_device(candidates, num_actions, allow_rejection, reject_idx, device));
-    inputs.emplace("candidate_features", state.build_candidate_feature_tensor().to(device));
+    inputs.emplace(
+        "candidate_features",
+        torch::zeros(
+            {1, num_actions, state.candidate_feature_dim()},
+            torch::TensorOptions().dtype(torch::kFloat32).device(device))
+    );
     return inputs;
 }
 
@@ -622,11 +664,12 @@ StateView::TensorMap build_inputs_batch(
     int64_t max_hist_len = 1;
     for (const auto& view : states) {
         auto& domain = *view->domain_state;
-        auto p_net_x = build_p_net_x(physical, virtual_net, domain, vnr_config).to(device);
+        const int override_v_node_id = view ? static_cast<int>(view->curr_v_node_override) : -1;
+        auto p_net_x = build_p_net_x(physical, virtual_net, domain, vnr_config, override_v_node_id).to(device);
         auto p_edge_attr = build_p_edge_attr(physical, domain, vnr_config).to(device);
         p_net_x_list.push_back(p_net_x);
         p_edge_attr_list.push_back(p_edge_attr);
-        v_net_x_list.push_back(build_v_net_x(virtual_net, domain, vnr_config, physical.num_nodes).to(device));
+        v_net_x_list.push_back(build_v_net_x(virtual_net, domain, vnr_config, physical.num_nodes, override_v_node_id).to(device));
 
         const auto& selected = domain.selected_physical_nodes();
         selected_nodes.emplace_back(selected.begin(), selected.end());
@@ -640,7 +683,11 @@ StateView::TensorMap build_inputs_batch(
 
         auto candidates = domain.get_candidate_nodes();
         masks.push_back(build_action_mask_device(candidates, num_actions, allow_rejection, reject_idx, device));
-        candidate_features.push_back(domain.build_candidate_feature_tensor().to(device));
+        candidate_features.push_back(
+            torch::zeros(
+                {1, num_actions, domain.candidate_feature_dim()},
+                torch::TensorOptions().dtype(torch::kFloat32).device(device))
+        );
     }
 
     auto p_net_x_batch = torch::cat(p_net_x_list, 0);
@@ -706,14 +753,15 @@ Observation build_observation(
     const torch::Tensor& start_embedding_cpu,
     int num_actions,
     bool allow_rejection,
-    int reject_idx
+    int reject_idx,
+    int override_v_node_id = -1
 ) {
     Observation obs;
-    obs.p_net_x = build_p_net_x(p_net, v_net, state, vnr_config);
+    obs.p_net_x = build_p_net_x(p_net, v_net, state, vnr_config, override_v_node_id);
     obs.p_net_edge_index = edge_index_cpu;
     obs.p_net_edge_attr = build_p_edge_attr(p_net, state, vnr_config);
     obs.p_net_num_nodes = p_net.num_nodes;
-    obs.v_net_x = build_v_net_x(v_net, state, vnr_config, p_net.num_nodes).unsqueeze(0);
+    obs.v_net_x = build_v_net_x(v_net, state, vnr_config, p_net.num_nodes, override_v_node_id).unsqueeze(0);
     if (policy != nullptr) {
         obs.encoder_outputs = policy->encode(obs.v_net_x);
     } else {
@@ -744,7 +792,10 @@ Observation build_observation(
     int remaining = std::max(0, static_cast<int>(state.virtual_order().size()) - (step_idx + 1));
     obs.vnfs_remaining = torch::tensor({remaining}, torch::kInt64);
     obs.action_mask = build_action_mask(state, num_actions, allow_rejection, reject_idx);
-    obs.candidate_features = state.build_candidate_feature_tensor();
+    obs.candidate_features = torch::zeros(
+        {1, num_actions, state.candidate_feature_dim()},
+        torch::kFloat32
+    );
     return obs;
 }
 
@@ -816,24 +867,9 @@ std::vector<float> build_policy_from_visits(
     const std::vector<float>& visit_counts,
     float temperature
 ) {
+    (void)temperature;
     std::vector<float> policy(static_cast<std::size_t>(num_actions), 0.0f);
     if (candidates.empty()) {
-        return policy;
-    }
-
-    if (temperature <= 0.0f) {
-        int best_action = candidates.front();
-        float best_visits = -1.0f;
-        for (int action : candidates) {
-            float visits = (action >= 0 && action < static_cast<int>(visit_counts.size())) ? visit_counts[action] : 0.0f;
-            if (visits > best_visits) {
-                best_visits = visits;
-                best_action = action;
-            }
-        }
-        if (best_action >= 0 && best_action < num_actions) {
-            policy[static_cast<std::size_t>(best_action)] = 1.0f;
-        }
         return policy;
     }
 
@@ -843,7 +879,7 @@ std::vector<float> build_policy_from_visits(
             continue;
         }
         double visits = (action < static_cast<int>(visit_counts.size())) ? visit_counts[action] : 0.0;
-        double weight = (temperature == 1.0f) ? visits : std::pow(visits, 1.0 / temperature);
+        double weight = visits;
         if (!std::isfinite(weight) || weight < 0.0) {
             weight = 0.0;
         }
@@ -972,9 +1008,7 @@ SolveResult solve_vnr(
     double policy_eval_ms = 0.0;
     double mcts_ms = 0.0;
     double postprocess_ms = 0.0;
-    torch::Tensor start_embedding = do_replay ? policy->start_embedding().to(torch_device)
-                                              : torch::zeros({compute_p_net_feature_dim(vnr_config)},
-                                                             torch::TensorOptions().dtype(torch::kFloat32).device(torch_device));
+    torch::Tensor start_embedding = policy->start_embedding().to(torch_device);
 
     std::unordered_map<int, torch::Tensor> edge_index_batch_cache;
     std::unordered_map<int, torch::Tensor> p_batch_cache;
@@ -1031,6 +1065,7 @@ SolveResult solve_vnr(
             auto& domain = *view->domain_state;
             auto build_start = std::chrono::high_resolution_clock::now();
             auto inputs = build_inputs_cached(
+                view,
                 domain,
                 physical,
                 virtual_net,
@@ -1146,21 +1181,75 @@ SolveResult solve_vnr(
     }
 
     VNRState current_state = root_state;
+    std::unique_ptr<TreeNode> current_root;
     std::vector<ReplayStep> replay_steps;
     replay_steps.reserve(static_cast<std::size_t>(virtual_net.num_nodes));
+    auto append_replay_step = [&](const VNRState& replay_state,
+                                  int replay_action,
+                                  const std::vector<int>& replay_candidates,
+                                  const std::vector<float>& replay_visit_counts,
+                                  float replay_value) {
+        if (!do_replay) {
+            return;
+        }
+
+        Observation obs = build_observation(
+            replay_state,
+            physical,
+            virtual_net,
+            vnr_config,
+            policy.get(),
+            edge_index_cpu,
+            start_embedding_cpu,
+            num_actions,
+            vnr_config.allow_rejection,
+            reject_idx,
+            replay_state.selected_physical_nodes().size() < replay_state.virtual_order().size()
+                ? replay_state.virtual_order()[replay_state.selected_physical_nodes().size()]
+                : -1
+        );
+
+        ReplayStep step;
+        step.observation = std::move(obs);
+        step.pi = build_policy_from_visits(
+            num_actions,
+            replay_candidates,
+            replay_visit_counts,
+            replay_policy_temperature
+        );
+        step.v_root = replay_value;
+        step.a_taken = replay_action;
+        step.mask.reserve(static_cast<std::size_t>(num_actions));
+        auto mask_cpu = step.observation.action_mask.to(torch::kCPU).contiguous();
+        if (mask_cpu.numel() > 0) {
+            auto acc = mask_cpu.accessor<bool, 2>();
+            for (int i = 0; i < num_actions; ++i) {
+                step.mask.push_back(acc[0][i]);
+            }
+        } else {
+            step.mask.assign(static_cast<std::size_t>(num_actions), false);
+        }
+        replay_steps.push_back(std::move(step));
+    };
 
     for (int step = 0; step < virtual_net.num_nodes; ++step) {
-        auto state_view = std::make_shared<StateView>();
-        state_view->id = static_cast<std::int64_t>(step + 1);
-        state_view->step_index = static_cast<std::int64_t>(current_state.selected_physical_nodes().size());
-        state_view->domain_state = std::make_shared<VNRState>(current_state);
+        if (!current_root) {
+            auto state_view = std::make_shared<StateView>();
+            state_view->id = static_cast<std::int64_t>(step + 1);
+            state_view->step_index = static_cast<std::int64_t>(current_state.selected_physical_nodes().size());
+            if (step < static_cast<int>(current_state.virtual_order().size())) {
+                state_view->curr_v_node_override = current_state.virtual_order()[static_cast<std::size_t>(step)];
+            }
+            state_view->domain_state = std::make_shared<VNRState>(current_state);
+            current_root = std::make_unique<TreeNode>(nullptr, std::move(state_view), std::nullopt);
+        }
 
         auto mcts_start = std::chrono::high_resolution_clock::now();
         std::optional<unsigned int> step_seed;
-        if (seed) {
-            step_seed = static_cast<unsigned int>(*seed + static_cast<unsigned int>(step));
+        if (seed && step == 0) {
+            step_seed = static_cast<unsigned int>(*seed);
         }
-        auto search_result = engine.run_search(state_view, step_seed);
+        auto search_result = engine.run_search(*current_root, step_seed);
         auto mcts_end = std::chrono::high_resolution_clock::now();
         mcts_ms += std::chrono::duration<double, std::milli>(mcts_end - mcts_start).count();
 
@@ -1210,12 +1299,14 @@ SolveResult solve_vnr(
         );
         int action = select_action(candidates, visit_counts_vec, step_temperature, rng);
         if (action == reject_idx && vnr_config.allow_rejection) {
+            append_replay_step(current_state, action, candidates, visit_counts_vec, search_result.value);
             result.rejected = true;
             result.place_result = false;
             current_state = current_state.create_child(reject_idx);
             break;
         }
         if (action < 0 || action >= num_actions) {
+            append_replay_step(current_state, action, candidates, visit_counts_vec, search_result.value);
             result.place_result = false;
             break;
         }
@@ -1223,45 +1314,11 @@ SolveResult solve_vnr(
         result.actions.push_back(action);
         result.policies.push_back(std::move(policy_vec));
         result.values.push_back(search_result.value);
-        if (do_replay) {
-            Observation obs = build_observation(
-                current_state,
-                physical,
-                virtual_net,
-                vnr_config,
-                policy.get(),
-                edge_index_cpu,
-                start_embedding_cpu,
-                num_actions,
-                vnr_config.allow_rejection,
-                reject_idx
-            );
-
-            ReplayStep step;
-            step.observation = std::move(obs);
-            step.pi = build_policy_from_visits(
-                num_actions,
-                candidates,
-                visit_counts_vec,
-                replay_policy_temperature
-            );
-            step.v_root = result.values.back();
-            step.a_taken = action;
-            step.mask.reserve(static_cast<std::size_t>(num_actions));
-            auto mask_cpu = step.observation.action_mask.to(torch::kCPU).contiguous();
-            if (mask_cpu.numel() > 0) {
-                auto acc = mask_cpu.accessor<bool, 2>();
-                for (int i = 0; i < num_actions; ++i) {
-                    step.mask.push_back(acc[0][i]);
-                }
-            } else {
-                step.mask.assign(static_cast<std::size_t>(num_actions), false);
-            }
-            replay_steps.push_back(std::move(step));
-        }
+        append_replay_step(current_state, action, candidates, visit_counts_vec, result.values.back());
         result.metrics.total_simulations += static_cast<int>(search_result.visit_counts.sum().item<float>());
 
         VNRState::PlacementInfo place_info;
+        std::unique_ptr<TreeNode> next_root = current_root->extract_child(action);
         current_state = current_state.create_child_with_info(action, &place_info);
         if (current_state.last_physical_node() == -1) {
             result.place_result = false;
@@ -1274,6 +1331,7 @@ SolveResult solve_vnr(
             postprocess_ms += std::chrono::duration<double, std::milli>(post_end - post_start).count();
             break;
         }
+        current_root = std::move(next_root);
         auto post_end = std::chrono::high_resolution_clock::now();
         postprocess_ms += std::chrono::duration<double, std::milli>(post_end - post_start).count();
     }
@@ -1356,6 +1414,296 @@ SolveResult solve_vnr(
     }
 
     return result;
+}
+
+Observation debug_build_observation(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::string& policy_path,
+    const std::string& device
+) {
+    VNRState root_state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
+
+    int num_actions = physical.num_nodes + (vnr_config.allow_rejection ? 1 : 0);
+    int reject_idx = physical.num_nodes;
+
+    torch::Device torch_device = torch::kCPU;
+    if (device == "cuda" || device == "cuda:0") {
+        torch_device = torch::kCUDA;
+    }
+
+    auto policy = get_cached_policy(policy_path, torch_device);
+    auto edge_index_cpu = build_edge_index(physical);
+    auto start_embedding_cpu = policy->start_embedding().to(torch::kCPU);
+    return build_observation(
+        root_state,
+        physical,
+        virtual_net,
+        vnr_config,
+        policy.get(),
+        edge_index_cpu,
+        start_embedding_cpu,
+        num_actions,
+        vnr_config.allow_rejection,
+        reject_idx,
+        !root_state.virtual_order().empty() ? root_state.virtual_order().front() : -1
+    );
+}
+
+Observation debug_build_observation_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::vector<int>& actions,
+    const std::string& policy_path,
+    const std::string& device
+) {
+    VNRState state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
+    for (int action : actions) {
+        state = state.create_child(action);
+    }
+
+    int num_actions = physical.num_nodes + (vnr_config.allow_rejection ? 1 : 0);
+    int reject_idx = physical.num_nodes;
+
+    torch::Device torch_device = torch::kCPU;
+    if (device == "cuda" || device == "cuda:0") {
+        torch_device = torch::kCUDA;
+    }
+
+    auto policy = get_cached_policy(policy_path, torch_device);
+    auto edge_index_cpu = build_edge_index(physical);
+    auto start_embedding_cpu = policy->start_embedding().to(torch::kCPU);
+    const auto& order = state.virtual_order();
+    const auto& selected = state.selected_physical_nodes();
+    const int override_v_node_id = selected.size() < order.size()
+        ? order[selected.size()]
+        : -1;
+    return build_observation(
+        state,
+        physical,
+        virtual_net,
+        vnr_config,
+        policy.get(),
+        edge_index_cpu,
+        start_embedding_cpu,
+        num_actions,
+        vnr_config.allow_rejection,
+        reject_idx,
+        override_v_node_id
+    );
+}
+
+EvaluationResult debug_evaluate_root(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::string& policy_path,
+    const std::string& device
+) {
+    VNRState root_state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
+
+    int num_actions = physical.num_nodes + (vnr_config.allow_rejection ? 1 : 0);
+    int reject_idx = physical.num_nodes;
+
+    torch::Device torch_device = torch::kCPU;
+    if (device == "cuda" || device == "cuda:0") {
+        torch_device = torch::kCUDA;
+    }
+
+    auto policy = get_cached_policy(policy_path, torch_device);
+    auto edge_index_cpu = build_edge_index(physical);
+    auto edge_index = edge_index_cpu.to(torch_device);
+    auto p_batch = torch::zeros({physical.num_nodes}, torch::TensorOptions().dtype(torch::kInt64).device(torch_device));
+    auto start_embedding = policy->start_embedding().to(torch_device);
+    auto inputs = build_inputs_cached(
+        nullptr,
+        root_state,
+        physical,
+        virtual_net,
+        vnr_config,
+        *policy,
+        edge_index,
+        p_batch,
+        num_actions,
+        vnr_config.allow_rejection,
+        reject_idx,
+        start_embedding,
+        torch_device
+    );
+    auto eval = policy->evaluate(inputs);
+    if (eval.policy_logits.defined() && eval.policy_logits.dim() > 1) {
+        eval.policy_logits = eval.policy_logits.squeeze();
+    }
+    if (eval.policy_logits.defined()) {
+        eval.policy_logits = eval.policy_logits.to(torch::kCPU);
+    }
+    if (eval.value.defined()) {
+        eval.value = eval.value.to(torch::kCPU);
+    }
+    return eval;
+}
+
+EvaluationResult debug_evaluate_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const std::vector<int>& actions,
+    const std::string& policy_path,
+    const std::string& device
+) {
+    VNRState state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
+    for (int action : actions) {
+        state = state.create_child(action);
+    }
+
+    int num_actions = physical.num_nodes + (vnr_config.allow_rejection ? 1 : 0);
+    int reject_idx = physical.num_nodes;
+
+    torch::Device torch_device = torch::kCPU;
+    if (device == "cuda" || device == "cuda:0") {
+        torch_device = torch::kCUDA;
+    }
+
+    auto policy = get_cached_policy(policy_path, torch_device);
+    auto edge_index_cpu = build_edge_index(physical);
+    auto edge_index = edge_index_cpu.to(torch_device);
+    auto p_batch = torch::zeros({physical.num_nodes}, torch::TensorOptions().dtype(torch::kInt64).device(torch_device));
+    auto start_embedding = policy->start_embedding().to(torch_device);
+    auto view = std::make_shared<StateView>();
+    const auto& order = state.virtual_order();
+    const auto& selected = state.selected_physical_nodes();
+    if (selected.size() < order.size()) {
+        view->curr_v_node_override = order[selected.size()];
+    }
+    auto inputs = build_inputs_cached(
+        view,
+        state,
+        physical,
+        virtual_net,
+        vnr_config,
+        *policy,
+        edge_index,
+        p_batch,
+        num_actions,
+        vnr_config.allow_rejection,
+        reject_idx,
+        start_embedding,
+        torch_device
+    );
+    auto eval = policy->evaluate(inputs);
+    if (eval.policy_logits.defined() && eval.policy_logits.dim() > 1) {
+        eval.policy_logits = eval.policy_logits.squeeze();
+    }
+    if (eval.policy_logits.defined()) {
+        eval.policy_logits = eval.policy_logits.to(torch::kCPU);
+    }
+    if (eval.value.defined()) {
+        eval.value = eval.value.to(torch::kCPU);
+    }
+    return eval;
+}
+
+SearchResult debug_search_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const SearchConfig& search_config,
+    const std::vector<int>& actions,
+    const std::string& policy_path,
+    const std::string& device
+) {
+    VNRState state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
+    for (int action : actions) {
+        state = state.create_child(action);
+    }
+
+    const int num_actions = physical.num_nodes + (vnr_config.allow_rejection ? 1 : 0);
+    const int reject_idx = physical.num_nodes;
+    torch::Device torch_device = torch::kCPU;
+    if (device == "cuda" || device == "cuda:0") {
+        torch_device = torch::kCUDA;
+    }
+
+    auto policy = get_cached_policy(policy_path, torch_device);
+    auto edge_index_cpu = build_edge_index(physical);
+    auto edge_index = edge_index_cpu.to(torch_device);
+    auto p_batch = torch::zeros({physical.num_nodes}, torch::TensorOptions().dtype(torch::kInt64).device(torch_device));
+    auto start_embedding = policy->start_embedding().to(torch_device);
+
+    MCTSEngine engine(search_config);
+    engine.set_expand_callback([&](const std::shared_ptr<StateView>& view) {
+        std::vector<std::pair<int64_t, std::shared_ptr<StateView>>> children;
+        const auto& domain = *view->domain_state;
+        const auto candidates = domain.get_candidate_nodes();
+        children.reserve(candidates.size());
+        for (int action : candidates) {
+            auto child_view = std::make_shared<StateView>();
+            child_view->id = action;
+            child_view->step_index = view->step_index + 1;
+            child_view->domain_state = std::make_shared<VNRState>(domain.create_child(action));
+            const auto& order = child_view->domain_state->virtual_order();
+            const auto& selected = child_view->domain_state->selected_physical_nodes();
+            if (selected.size() < order.size()) {
+                child_view->curr_v_node_override = order[selected.size()];
+            }
+            children.emplace_back(action, std::move(child_view));
+        }
+        return children;
+    });
+    engine.set_evaluate_callback([&](const std::shared_ptr<StateView>& view) {
+        auto& domain = *view->domain_state;
+        auto inputs = build_inputs_cached(
+            view,
+            domain,
+            physical,
+            virtual_net,
+            vnr_config,
+            *policy,
+            edge_index,
+            p_batch,
+            num_actions,
+            vnr_config.allow_rejection,
+            reject_idx,
+            start_embedding,
+            torch_device
+        );
+        auto eval = policy->evaluate(inputs);
+        if (eval.policy_logits.defined() && eval.policy_logits.dim() > 1) {
+            eval.policy_logits = eval.policy_logits.squeeze(0);
+        }
+        if (eval.policy_logits.defined()) {
+            eval.policy_logits = eval.policy_logits.to(torch::kCPU);
+        }
+        if (eval.value.defined()) {
+            eval.value = eval.value.to(torch::kCPU);
+        }
+        auto mask_it = inputs.find("action_mask");
+        if (mask_it != inputs.end()) {
+            view->action_mask = mask_it->second.squeeze(0).to(torch::kBool);
+        }
+        view->policy_logits = eval.policy_logits;
+        view->value = eval.value;
+        return eval;
+    });
+    engine.set_terminal_check_callback([](const std::shared_ptr<StateView>& view) {
+        return view->domain_state->is_terminal();
+    });
+    engine.set_terminal_value_callback([](const std::shared_ptr<StateView>& view) {
+        return view->domain_state->compute_final_reward();
+    });
+
+    auto root = std::make_shared<StateView>();
+    root->id = 0;
+    root->step_index = static_cast<std::int64_t>(state.selected_physical_nodes().size());
+    const auto& order = state.virtual_order();
+    const auto& selected = state.selected_physical_nodes();
+    if (selected.size() < order.size()) {
+        root->curr_v_node_override = order[selected.size()];
+    }
+    root->domain_state = std::make_shared<VNRState>(state);
+    return engine.run_search(root);
 }
 
 }  // namespace azsfc

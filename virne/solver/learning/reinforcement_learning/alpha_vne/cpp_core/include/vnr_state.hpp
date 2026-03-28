@@ -84,6 +84,7 @@ public:
     double get_available_link_resource(int u, int v, const std::string& attr) const;
     SparseResourceAllocations get_allocated_node_resources() const;
     SparseResourceAllocations get_allocated_link_resources() const;
+    std::vector<std::vector<int>> debug_find_paths(int p_src, int p_dst, const ResourceMap& demands) const;
 
     int current_virtual_index() const noexcept { return v_node_index_; }
     int last_physical_node() const noexcept { return p_node_id_; }
@@ -175,6 +176,7 @@ private:
                                           int item_id,
                                           const std::string& attr,
                                           bool node_resource);
+    void invalidate_allocation_totals_cache() noexcept;
     void rebuild_allocation_totals_cache() const;
     double get_allocated_node_resource(int node_id, const std::string& attr) const;
     double get_allocated_link_resource(int edge_id, const std::string& attr) const;

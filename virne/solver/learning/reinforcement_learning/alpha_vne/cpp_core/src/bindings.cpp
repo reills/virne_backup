@@ -45,6 +45,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         .def(py::init<std::int64_t>(), py::arg("id"))
         .def_readwrite("id", &az::StateView::id)
         .def_readwrite("step_index", &az::StateView::step_index)
+        .def_readwrite("curr_v_node_override", &az::StateView::curr_v_node_override)
         .def_property("features",
             [](az::StateView& self) { return azsfc::tensor_map_to_dict(self.features); },
             [](az::StateView& self, const py::dict& dict) { self.features = azsfc::dict_to_tensor_map(dict); })
@@ -111,6 +112,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
              py::overload_cast<int, int, const std::string&>(&az::VNRState::get_available_link_resource, py::const_))
         .def("get_allocated_node_resources", &az::VNRState::get_allocated_node_resources)
         .def("get_allocated_link_resources", &az::VNRState::get_allocated_link_resources)
+        .def("debug_find_paths", &az::VNRState::debug_find_paths)
         .def_property_readonly("selected_physical_nodes", &az::VNRState::selected_physical_nodes)
         .def_property_readonly("virtual_order", &az::VNRState::virtual_order)
         .def_property_readonly("current_virtual_index", &az::VNRState::current_virtual_index)
@@ -346,5 +348,265 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("write_replay") = false,
         py::arg("replay_dir") = "",
         py::arg("max_buffer_size") = 0
+    );
+
+    m.def(
+        "debug_build_observation",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           az::VNRConfig vnr_config,
+           const std::string& policy_path,
+           const std::string& device) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            auto obs = az::debug_build_observation(p_net, v_net, vnr_config, policy_path, device);
+            py::dict out;
+            out["p_net_x"] = obs.p_net_x;
+            out["p_net_edge_index"] = obs.p_net_edge_index;
+            out["p_net_edge_attr"] = obs.p_net_edge_attr;
+            out["history_features"] = obs.history_features;
+            out["encoder_outputs"] = obs.encoder_outputs;
+            out["curr_v_node_id"] = obs.curr_v_node_id;
+            out["vnfs_remaining"] = obs.vnfs_remaining;
+            out["action_mask"] = obs.action_mask;
+            out["candidate_features"] = obs.candidate_features;
+            out["v_net_x"] = obs.v_net_x;
+            return out;
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("vnr_config"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu"
+    );
+
+    m.def(
+        "debug_build_observation_after_actions",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           az::VNRConfig vnr_config,
+           const std::vector<int>& actions,
+           const std::string& policy_path,
+           const std::string& device) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            auto obs = az::debug_build_observation_after_actions(p_net, v_net, vnr_config, actions, policy_path, device);
+            py::dict out;
+            out["p_net_x"] = obs.p_net_x;
+            out["p_net_edge_index"] = obs.p_net_edge_index;
+            out["p_net_edge_attr"] = obs.p_net_edge_attr;
+            out["history_features"] = obs.history_features;
+            out["encoder_outputs"] = obs.encoder_outputs;
+            out["curr_v_node_id"] = obs.curr_v_node_id;
+            out["vnfs_remaining"] = obs.vnfs_remaining;
+            out["action_mask"] = obs.action_mask;
+            out["candidate_features"] = obs.candidate_features;
+            out["v_net_x"] = obs.v_net_x;
+            return out;
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("vnr_config"),
+        py::arg("actions"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu"
+    );
+
+    m.def(
+        "debug_evaluate_root",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           az::VNRConfig vnr_config,
+           const std::string& policy_path,
+           const std::string& device) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            auto eval = az::debug_evaluate_root(p_net, v_net, vnr_config, policy_path, device);
+            py::dict out;
+            out["policy_logits"] = eval.policy_logits;
+            out["value"] = eval.value;
+            return out;
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("vnr_config"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu"
+    );
+
+    m.def(
+        "debug_evaluate_after_actions",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           az::VNRConfig vnr_config,
+           const std::vector<int>& actions,
+           const std::string& policy_path,
+           const std::string& device) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            auto eval = az::debug_evaluate_after_actions(p_net, v_net, vnr_config, actions, policy_path, device);
+            py::dict out;
+            out["policy_logits"] = eval.policy_logits;
+            out["value"] = eval.value;
+            return out;
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("vnr_config"),
+        py::arg("actions"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu"
+    );
+
+    m.def(
+        "debug_search_after_actions",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           az::VNRConfig vnr_config,
+           az::SearchConfig search_config,
+           const std::vector<int>& actions,
+           const std::string& policy_path,
+           const std::string& device) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            return az::debug_search_after_actions(p_net, v_net, vnr_config, search_config, actions, policy_path, device);
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("vnr_config"),
+        py::arg("search_config"),
+        py::arg("actions"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu"
     );
 }

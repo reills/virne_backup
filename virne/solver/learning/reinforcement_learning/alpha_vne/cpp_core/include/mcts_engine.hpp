@@ -53,6 +53,7 @@ public:
     void set_terminal_check_callback(TerminalCheckFn fn) { terminal_check_fn_ = std::move(fn); }
 
     SearchResult run_search(const std::shared_ptr<StateView>& root_state, std::optional<unsigned int> seed = std::nullopt);
+    SearchResult run_search(TreeNode& root, std::optional<unsigned int> seed = std::nullopt);
 
 private:
     void apply_dirichlet_noise(TreeNode& root);

@@ -251,6 +251,12 @@ void VNRState::rebuild_allocation_totals_cache() const {
     allocation_totals_cache_valid_ = true;
 }
 
+void VNRState::invalidate_allocation_totals_cache() noexcept {
+    allocation_totals_cache_valid_ = false;
+    node_allocation_totals_cache_.clear();
+    link_allocation_totals_cache_.clear();
+}
+
 double VNRState::get_allocated_node_resource(int node_id, const std::string& attr) const {
     if (!allocation_totals_cache_valid_) {
         rebuild_allocation_totals_cache();
@@ -298,10 +304,52 @@ std::vector<int> VNRState::get_candidate_nodes() const {
             continue;
         }
         if (check_node_constraints_feasible(v_target, p)) {
-            if (check_link_constraints_feasible(v_target, p)) {
-                candidates.push_back(p);
+            candidates.push_back(p);
+        }
+    }
+
+    std::vector<std::pair<int, ResourceMap>> link_requirements;
+    if (!config_.link_resource_names.empty()) {
+        link_requirements.reserve(v_net_->adjacency[v_target].size());
+        for (const auto& [neighbor, edge_id] : v_net_->adjacency[v_target]) {
+            int neighbor_pos = v_pos_[neighbor];
+            if (neighbor_pos > v_node_index_) {
+                continue;
+            }
+            int mapped_neighbor = lookup_placement(neighbor);
+            if (mapped_neighbor < 0) {
+                continue;
+            }
+            ResourceMap demands;
+            const auto& edge_attrs = v_net_->edge_attrs[edge_id];
+            for (const auto& attr_name : config_.link_resource_names) {
+                const double demand = safe_lookup(edge_attrs, attr_name);
+                if (demand > 0.0) {
+                    demands.emplace(attr_name, demand);
+                }
+            }
+            if (!demands.empty()) {
+                link_requirements.emplace_back(mapped_neighbor, std::move(demands));
             }
         }
+    }
+
+    if (!link_requirements.empty() && !candidates.empty()) {
+        std::vector<int> reachable_candidates;
+        reachable_candidates.reserve(candidates.size());
+        for (int candidate : candidates) {
+            bool reachable = true;
+            for (const auto& [mapped_neighbor, demands] : link_requirements) {
+                if (!has_reachable_path(candidate, mapped_neighbor, demands)) {
+                    reachable = false;
+                    break;
+                }
+            }
+            if (reachable) {
+                reachable_candidates.push_back(candidate);
+            }
+        }
+        candidates = std::move(reachable_candidates);
     }
 
     if (config_.allow_rejection) {
@@ -647,7 +695,13 @@ float VNRState::compute_final_reward() const {
         return -1000.0f;
     }
 
-    double link_cost = sum_link_allocations();
+    auto slots = node_slots();
+    auto link_result = link_mapping(slots);
+    if (!link_result.success) {
+        return -1000.0f;
+    }
+
+    double link_cost = link_result.total_link_cost;
     double total_cost = total_node_demand_ + link_cost;
     double reward = 1000.0 + total_v_revenue_ - total_cost;
     return static_cast<float>(reward);
@@ -670,9 +724,7 @@ VNRState VNRState::create_child_internal(int p_node_id, PlacementInfo* info) con
     child.selected_p_nodes_cache_valid_ = false;
     child.node_slots_cache_valid_ = false;
     child.node_slots_cache_.clear();
-    child.allocation_totals_cache_valid_ = false;
-    child.node_allocation_totals_cache_.clear();
-    child.link_allocation_totals_cache_.clear();
+    child.invalidate_allocation_totals_cache();
     child.v_node_index_ = v_node_index_ + 1;
     child.p_node_id_ = p_node_id;
     child.last_place_info_ = PlacementInfo{};
@@ -727,6 +779,7 @@ VNRState VNRState::create_child_internal(int p_node_id, PlacementInfo* info) con
             return child;
         }
         child.update_node_allocations(p_node_id, v_target, *step_delta);
+        child.invalidate_allocation_totals_cache();
         auto placement_delta = std::make_shared<PlacementDelta>();
         placement_delta->parent = placement_deltas_;
         placement_delta->v_node_id = v_target;
@@ -926,17 +979,6 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         }
     }
 
-    // Fallback: if k-shortest produced no feasible path, try capacity-aware search
-    std::vector<int> fallback_path_storage;
-    if (selected_path == nullptr && method != "available_shortest") {
-        auto fallback_paths = path_finder_.find_paths(
-            *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
-        if (!fallback_paths.empty() && fallback_paths[0].nodes.size() >= 2) {
-            fallback_path_storage = std::move(fallback_paths[0].nodes);
-            selected_path = &fallback_path_storage;
-        }
-    }
-
     if (selected_path == nullptr) {
         return false;
     }
@@ -956,6 +998,7 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
             delta.link_allocation_total += demand;
         }
     }
+    target.invalidate_allocation_totals_cache();
 
     return true;
 }
@@ -984,6 +1027,24 @@ double VNRState::get_available_link_resource(int u, int v, const std::string& at
         return 0.0;
     }
     return get_available_link_resource(it->second, attr);
+}
+
+std::vector<std::vector<int>> VNRState::debug_find_paths(int p_src, int p_dst, const ResourceMap& demands) const {
+    int k = std::max(1, config_.k_shortest);
+    std::string method = config_.shortest_method.empty() ? "bfs_shortest" : config_.shortest_method;
+    if (method == "bfs_shortest" || method == "first_shortest" || method == "available_shortest") {
+        k = 1;
+    }
+    auto capacity_fn = [this](int edge_id, const std::string& attr) {
+        return get_available_link_resource(edge_id, attr);
+    };
+    auto paths = path_finder_.find_paths(*p_net_, p_src, p_dst, k, demands, method, capacity_fn);
+    std::vector<std::vector<int>> out;
+    out.reserve(paths.size());
+    for (auto& path : paths) {
+        out.push_back(std::move(path.nodes));
+    }
+    return out;
 }
 
 VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_slots) const {

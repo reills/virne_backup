@@ -193,6 +193,12 @@ MCTSEngine::MCTSEngine(SearchConfig config)
       rng_(std::random_device{}()) {}
 
 SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state, std::optional<unsigned int> seed) {
+    TreeNode root(nullptr, root_state, std::nullopt);
+    return run_search(root, seed);
+}
+
+SearchResult MCTSEngine::run_search(TreeNode& root, std::optional<unsigned int> seed) {
+    auto root_state = root.state();
     bool has_domain_state = root_state && root_state->domain_state;
     if (config_.use_neural_network && !evaluate_fn_) {
         throw std::runtime_error("MCTSEngine requires an evaluation callback when use_neural_network=true.");
@@ -208,8 +214,6 @@ SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state
     }
 
     root_noise_applied_ = false;
-
-    TreeNode root(nullptr, root_state, std::nullopt);
 
     // Ensure root evaluation is ready only when NN guidance is enabled
     if (config_.use_neural_network) {
@@ -400,22 +404,9 @@ float MCTSEngine::expand(TreeNode& node) {
     std::vector<std::pair<int64_t, std::shared_ptr<StateView>>> options;
     if (state->domain_state) {
         auto actions = state->domain_state->get_candidate_nodes();
-        if (config_.top_k_candidates > 0 && config_.use_neural_network && state->policy_logits.defined()) {
-            torch::Tensor logits = state->policy_logits.squeeze();
-            torch::Tensor mask;
-            if (state->action_mask.defined()) {
-                mask = state->action_mask.squeeze().to(torch::kBool);
-            } else {
-                mask = torch::ones_like(logits, torch::TensorOptions().dtype(torch::kBool));
-            }
-            actions = select_top_k_actions(
-                actions,
-                logits,
-                mask,
-                config_.top_k_candidates,
-                state->domain_state->action_space_size()
-            );
-        }
+        // Match the Python MCTS semantics: expand over the full legal action
+        // set and let the policy prior shape exploration, rather than pruning
+        // the tree with a top-k truncation step.
         options.reserve(actions.size());
         for (int64_t action : actions) {
             auto child_domain = std::make_shared<VNRState>(state->domain_state->create_child(static_cast<int>(action)));
@@ -427,8 +418,20 @@ float MCTSEngine::expand(TreeNode& node) {
             }
             auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
             child_state->step_index = state->step_index + 1;
+            const auto& order = child_domain->virtual_order();
+            const auto& selected = child_domain->selected_physical_nodes();
+            if (selected.size() < order.size()) {
+                child_state->curr_v_node_override = order[selected.size()];
+            }
             child_state->domain_state = std::move(child_domain);
             options.emplace_back(action, std::move(child_state));
+        }
+        if (options.empty()) {
+            auto invalid_child = std::make_shared<VNRState>(state->domain_state->create_child(-1));
+            auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
+            child_state->step_index = state->step_index + 1;
+            child_state->domain_state = std::move(invalid_child);
+            options.emplace_back(-1, std::move(child_state));
         }
     } else if (expand_fn_) {
         options = expand_fn_(state);
@@ -564,9 +567,7 @@ void MCTSEngine::apply_dirichlet_noise(TreeNode& root) {
 
     base_priors = normalize_nonnegative(base_priors);
 
-    const float alpha = (config_.dirichlet_alpha > 0.0f)
-        ? config_.dirichlet_alpha
-        : dynamic_root_dirichlet_alpha(valid_actions.size());
+    const float alpha = dynamic_root_dirichlet_alpha(valid_actions.size());
     std::gamma_distribution<float> gamma(alpha, 1.0f);
     std::vector<float> noise_vals;
     noise_vals.reserve(valid_actions.size());

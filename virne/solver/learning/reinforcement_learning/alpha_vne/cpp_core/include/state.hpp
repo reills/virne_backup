@@ -26,6 +26,7 @@ struct StateView {
 
     std::int64_t id = -1;
     std::int64_t step_index = 0;
+    std::int64_t curr_v_node_override = -1;
     TensorMap features;
     torch::Tensor action_mask;  // 1 x N boolean tensor
     torch::Tensor policy_logits;  // 1 x N float tensor

@@ -6,6 +6,7 @@
 #include <deque>
 #include <limits>
 #include <queue>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -38,6 +39,30 @@ inline std::uint64_t edge_key(int u, int v) {
         | static_cast<std::uint64_t>(static_cast<std::uint32_t>(v));
 }
 
+std::string path_signature(const std::vector<int>& path) {
+    std::string signature;
+    signature.reserve(path.size() * 8U);
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (i > 0) {
+            signature.push_back(',');
+        }
+        signature += std::to_string(path[i]);
+    }
+    return signature;
+}
+
+bool same_prefix(const std::vector<int>& lhs, const std::vector<int>& rhs, std::size_t prefix_len) {
+    if (lhs.size() < prefix_len || rhs.size() < prefix_len) {
+        return false;
+    }
+    for (std::size_t i = 0; i < prefix_len; ++i) {
+        if (lhs[i] != rhs[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool is_edge_ignored(int u,
                             int v,
                             bool directed,
@@ -56,16 +81,6 @@ inline bool is_edge_ignored(int u,
     return false;
 }
 
-struct VectorHash {
-    std::size_t operator()(const std::vector<int>& path) const noexcept {
-        std::size_t seed = 0;
-        for (int v : path) {
-            seed ^= std::hash<int>{}(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-        return seed;
-    }
-};
-
 struct PathBufferEntry {
     double cost{0.0};
     std::size_t order{0};
@@ -79,31 +94,6 @@ struct PathBufferCompare {
         }
         return a.cost > b.cost;
     }
-};
-
-class PathBuffer {
-public:
-    bool empty() const noexcept { return heap_.empty(); }
-
-    void push(double cost, const std::vector<int>& path) {
-        if (seen_.find(path) != seen_.end()) {
-            return;
-        }
-        seen_.insert(path);
-        heap_.push(PathBufferEntry{cost, counter_++, path});
-    }
-
-    std::vector<int> pop() {
-        auto entry = heap_.top();
-        heap_.pop();
-        seen_.erase(entry.path);
-        return entry.path;
-    }
-
-private:
-    std::unordered_set<std::vector<int>, VectorHash> seen_;
-    std::priority_queue<PathBufferEntry, std::vector<PathBufferEntry>, PathBufferCompare> heap_;
-    std::size_t counter_{0};
 };
 
 bool bidirectional_shortest_path(const Network& net,
@@ -546,66 +536,117 @@ std::vector<ShortestPathFinder::Path> ShortestPathFinder::find_paths(
     }
 
     const bool length_limited = (normalised_method == "k_shortest_length");
-    const int max_length = length_limited ? std::max(1, k) : std::numeric_limits<int>::max();
-    const int max_results = std::max(1, k);
+    const int max_length = length_limited ? std::max(2, k) : std::numeric_limits<int>::max();
+    const int max_results = length_limited ? std::numeric_limits<int>::max() : std::max(1, k);
 
-    PathBuffer buffer;
-    std::vector<std::vector<int>> listA;
-    std::vector<int> prev_path;
-    bool has_prev = false;
+    std::vector<char> initial_ignore_nodes;
+    std::unordered_set<std::uint64_t> initial_ignore_edges;
+    std::vector<int> first_path;
+    if (!bidirectional_shortest_path(
+            net,
+            source,
+            target,
+            initial_ignore_nodes,
+            initial_ignore_edges,
+            first_path)) {
+        return results;
+    }
 
-    while (true) {
-        if (!has_prev) {
-            std::vector<int> path;
-            std::vector<char> ignore_nodes;
-            std::unordered_set<std::uint64_t> ignore_edges;
-            if (!bidirectional_shortest_path(net, source, target, ignore_nodes, ignore_edges, path)) {
-                break;
-            }
-            buffer.push(static_cast<double>(path.size()), path);
-        } else {
+    if (static_cast<int>(first_path.size()) > max_length) {
+        return results;
+    }
+
+    results.push_back(Path{
+        first_path,
+        static_cast<double>(first_path.size() - 1),
+    });
+
+    std::priority_queue<PathBufferEntry, std::vector<PathBufferEntry>, PathBufferCompare> frontier;
+    std::unordered_set<std::string> candidate_signatures;
+    std::unordered_set<std::string> accepted_signatures;
+    accepted_signatures.emplace(path_signature(first_path));
+    std::size_t counter = 0;
+
+    while (static_cast<int>(results.size()) < max_results) {
+        const auto& previous_path = results.back().nodes;
+        if (previous_path.size() < 2) {
+            break;
+        }
+
+        for (std::size_t spur_idx = 0; spur_idx + 1 < previous_path.size(); ++spur_idx) {
+            const int spur_node = previous_path[spur_idx];
+            std::vector<int> root_path(previous_path.begin(), previous_path.begin() + static_cast<std::ptrdiff_t>(spur_idx + 1));
+
             std::vector<char> ignore_nodes(static_cast<std::size_t>(net.num_nodes), 0);
+            for (std::size_t i = 0; i < spur_idx; ++i) {
+                int node_id = root_path[i];
+                if (node_id >= 0 && node_id < net.num_nodes) {
+                    ignore_nodes[static_cast<std::size_t>(node_id)] = 1;
+                }
+            }
+
             std::unordered_set<std::uint64_t> ignore_edges;
-            for (std::size_t i = 1; i < prev_path.size(); ++i) {
-                std::vector<int> root(prev_path.begin(), prev_path.begin() + static_cast<std::ptrdiff_t>(i));
-                double root_length = static_cast<double>(root.size());
-                for (const auto& path : listA) {
-                    if (path.size() >= i && std::equal(path.begin(), path.begin() + static_cast<std::ptrdiff_t>(i), root.begin())) {
-                        ignore_edges.insert(edge_key(path[i - 1], path[i]));
-                    }
+            for (const auto& accepted : results) {
+                if (accepted.nodes.size() <= spur_idx + 1) {
+                    continue;
                 }
-                std::vector<int> spur;
-                if (bidirectional_shortest_path(net, root.back(), target, ignore_nodes, ignore_edges, spur)) {
-                    std::vector<int> total_path = root;
-                    total_path.pop_back();
-                    total_path.insert(total_path.end(), spur.begin(), spur.end());
-                    buffer.push(root_length + static_cast<double>(spur.size()), total_path);
+                if (!same_prefix(accepted.nodes, root_path, spur_idx + 1)) {
+                    continue;
                 }
-                ignore_nodes[static_cast<std::size_t>(root.back())] = 1;
+                ignore_edges.insert(edge_key(
+                    accepted.nodes[spur_idx],
+                    accepted.nodes[spur_idx + 1]
+                ));
+            }
+
+            std::vector<int> spur_path;
+            if (!bidirectional_shortest_path(
+                    net,
+                    spur_node,
+                    target,
+                    ignore_nodes,
+                    ignore_edges,
+                    spur_path)) {
+                continue;
+            }
+            if (spur_path.empty()) {
+                continue;
+            }
+
+            std::vector<int> total_path = root_path;
+            total_path.pop_back();
+            total_path.insert(total_path.end(), spur_path.begin(), spur_path.end());
+            if (static_cast<int>(total_path.size()) > max_length) {
+                continue;
+            }
+
+            const std::string signature = path_signature(total_path);
+            if (accepted_signatures.find(signature) != accepted_signatures.end()) {
+                continue;
+            }
+            if (candidate_signatures.insert(signature).second) {
+                frontier.push(PathBufferEntry{
+                    static_cast<double>(total_path.size() - 1),
+                    counter++,
+                    std::move(total_path),
+                });
             }
         }
 
-        if (buffer.empty()) {
+        if (frontier.empty()) {
             break;
         }
 
-        std::vector<int> path = buffer.pop();
-        has_prev = true;
-        prev_path = path;
-        listA.push_back(path);
-
-        if (length_limited && static_cast<int>(path.size()) > max_length) {
-            break;
-        }
-
-        Path out;
-        out.cost = static_cast<double>(path.size() - 1);
-        out.nodes = std::move(path);
-        results.push_back(std::move(out));
-
-        if (!length_limited && static_cast<int>(results.size()) >= max_results) {
-            break;
-        }
+        auto next = frontier.top();
+        frontier.pop();
+        const std::string next_signature = path_signature(next.path);
+        candidate_signatures.erase(next_signature);
+        accepted_signatures.emplace(next_signature);
+        const double next_cost = static_cast<double>(next.path.size() - 1);
+        results.push_back(Path{
+            std::move(next.path),
+            next_cost,
+        });
     }
 
     return results;

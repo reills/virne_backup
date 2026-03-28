@@ -121,6 +121,7 @@ class CppMCTSAdapter:
         self._cpp_v_network: cpp_core.Network | None = None
         self._root_cpp_config: cpp_core.VNRConfig | None = None
         self._edge_lookup: Dict[Tuple[int, int], int] = {}
+        self._edge_ids_to_links: Dict[int, Tuple[int, int]] = {}
         self._active_network_cache_key: Tuple[int, int, int, bool, float, str, int] | None = None
         self._request_generation: int = 0
         self._request_network_ids: Tuple[int, int] | None = None
@@ -131,9 +132,9 @@ class CppMCTSAdapter:
             getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "link_resource_attrs", [])
         ]
 
-    def build_obs_from_cpp_state(self, cpp_state: "cpp_core.VNRState") -> dict:
+    def build_obs_from_cpp_state(self, cpp_state: "cpp_core.VNRState", v_node_id: int | None = None) -> dict:
         """Public helper for actor hot paths that can consume C++ state directly."""
-        return self._build_obs_from_cpp_state(cpp_state)
+        return self._build_obs_from_cpp_state(cpp_state, v_node_id=v_node_id)
 
     @staticmethod
     def materialize_state(state):
@@ -188,6 +189,7 @@ class CppMCTSAdapter:
 
         state_view = cpp_core.StateView(root_state_id)
         state_view.step_index = len(root_state.selected_p_net_nodes)
+        state_view.curr_v_node_override = int(root_v_node_id)
         state_view.domain_state = cpp_state
 
         result = self._engine.run_search(state_view)
@@ -348,7 +350,13 @@ class CppMCTSAdapter:
         obs: dict
         domain_state = getattr(state_view, "domain_state", None)
         if domain_state is not None:
-            obs = self._build_obs_from_cpp_state(domain_state)
+            v_override = None
+            try:
+                if int(getattr(state_view, "curr_v_node_override", -1)) >= 0:
+                    v_override = int(state_view.curr_v_node_override)
+            except Exception:
+                v_override = None
+            obs = self._build_obs_from_cpp_state(domain_state, v_node_id=v_override)
             # Ensure we don't leak overrides for C++ driven states
             self._vnode_override.pop(state_view.id, None)
         else:
@@ -440,6 +448,7 @@ class CppMCTSAdapter:
         self._cpp_v_network = None
         self._root_cpp_config = None
         self._edge_lookup = {}
+        self._edge_ids_to_links = {}
         self._active_network_cache_key = None
 
     def _ensure_cpp_networks(self, root_state: State) -> None:
@@ -454,8 +463,11 @@ class CppMCTSAdapter:
             return
 
         self._invalidate_cpp_network_cache()
-        self._cpp_p_network, self._edge_lookup = self._build_cpp_network(root_state._original_p_net)
-        self._cpp_v_network, _ = self._build_cpp_network(root_state.v_net)
+        self._cpp_p_network, self._edge_lookup, self._edge_ids_to_links = self._build_cpp_network(
+            root_state._original_p_net,
+            preserve_link_orientation=True,
+        )
+        self._cpp_v_network, _, _ = self._build_cpp_network(root_state.v_net)
         config = cpp_core.VNRConfig()
         config.node_resource_names = list(self._node_resource_names)
         config.link_resource_names = list(self._link_resource_names)
@@ -512,7 +524,11 @@ class CppMCTSAdapter:
         root_state._cpp_network_cache_key = self._active_network_cache_key
         return cpp_state
 
-    def _build_cpp_network(self, net) -> Tuple[cpp_core.Network, Dict[Tuple[int, int], int]]:
+    def _build_cpp_network(
+        self,
+        net,
+        preserve_link_orientation: bool = False,
+    ) -> Tuple[cpp_core.Network, Dict[Tuple[int, int], int], Dict[int, Tuple[int, int]]]:
         """Convert a NetworkX-style graph into the light-weight C++ representation."""
         cpp_net = cpp_core.Network()
         num_nodes = int(getattr(net, "num_nodes", len(net.nodes)))
@@ -531,19 +547,46 @@ class CppMCTSAdapter:
         edges: List[Tuple[int, int]] = []
         edge_attrs: List[dict[str, float]] = []
         edge_lookup: Dict[Tuple[int, int], int] = {}
-        for u, v, data in net.edges(data=True):
-            edges.append((int(u), int(v)))
-            attrs = {}
-            for key, value in data.items():
-                if isinstance(value, (int, float, bool)):
-                    attrs[str(key)] = float(value)
-            edge_attrs.append(attrs)
-            edge_lookup[(int(u), int(v))] = len(edges) - 1
-            edge_lookup[(int(v), int(u))] = len(edges) - 1
-        cpp_net.set_edges(edges, is_directed=False)
+        edge_ids_to_links: Dict[int, Tuple[int, int]] = {}
+        directed = False
+
+        if preserve_link_orientation and hasattr(net, "links"):
+            directed = True
+            net_is_directed = False
+            try:
+                net_is_directed = bool(net.is_directed())
+            except Exception:
+                net_is_directed = False
+            for u, v, data in net.edges(data=True):
+                oriented_edges = [(int(u), int(v))]
+                if not net_is_directed and int(u) != int(v):
+                    oriented_edges.append((int(v), int(u)))
+                attrs = {}
+                for key, value in data.items():
+                    if isinstance(value, (int, float, bool)):
+                        attrs[str(key)] = float(value)
+                for src, dst in oriented_edges:
+                    edges.append((src, dst))
+                    edge_attrs.append(dict(attrs))
+                    edge_id = len(edges) - 1
+                    edge_lookup[(src, dst)] = edge_id
+                    edge_ids_to_links[edge_id] = (src, dst)
+        else:
+            for u, v, data in net.edges(data=True):
+                edges.append((int(u), int(v)))
+                attrs = {}
+                for key, value in data.items():
+                    if isinstance(value, (int, float, bool)):
+                        attrs[str(key)] = float(value)
+                edge_attrs.append(attrs)
+                edge_id = len(edges) - 1
+                edge_lookup[(int(u), int(v))] = edge_id
+                edge_lookup[(int(v), int(u))] = edge_id
+                edge_ids_to_links[edge_id] = (int(u), int(v))
+        cpp_net.set_edges(edges, is_directed=directed)
         if len(edge_attrs) == len(edges):
             cpp_net.set_edge_attrs(edge_attrs)
-        return cpp_net, edge_lookup
+        return cpp_net, edge_lookup, edge_ids_to_links
 
     def _python_state_from_cpp(self, parent: State, cpp_state: "cpp_core.VNRState") -> State:
         child = State.__new__(State)
@@ -584,10 +627,7 @@ class CppMCTSAdapter:
                 node_allocations[node_id] = alloc
 
         link_allocations: Dict[Tuple[int, int], Dict[str, float]] = {}
-        for (u, v) in child._original_p_net.links:
-            edge_id = self._get_cpp_edge_id(int(u), int(v))
-            if edge_id < 0:
-                continue
+        for edge_id, (u, v) in self._edge_ids_to_links.items():
             alloc = {}
             link_attrs = child._original_p_net.links[(u, v)]
             for attr_name in self._link_resource_names:
@@ -608,7 +648,7 @@ class CppMCTSAdapter:
 
         return child
 
-    def _build_obs_from_cpp_state(self, cpp_state: "cpp_core.VNRState") -> dict:
+    def _build_obs_from_cpp_state(self, cpp_state: "cpp_core.VNRState", v_node_id: int | None = None) -> dict:
         root_state = State(
             self.actor.obs_builder._episode_p_net,
             self.actor.obs_builder._episode_v_net,
@@ -621,7 +661,7 @@ class CppMCTSAdapter:
             },
         )
         python_state = self._python_state_from_cpp(root_state, cpp_state)
-        return self.actor.obs_builder.build(python_state, self.actor.policy)
+        return self.actor.obs_builder.build(python_state, self.actor.policy, v_node_id)
 
     def _num_actions(self) -> int:
         """Get number of actions using actor's public API."""
@@ -691,7 +731,14 @@ class CppFullSolver:
             getattr(attr, "name", str(attr)) for attr in getattr(actor.controller, "link_resource_attrs", [])
         ]
 
-    def _build_network_payload(self, net, node_resource_names: list, link_resource_names: list, topological_metrics: dict | None = None):
+    def _build_network_payload(
+        self,
+        net,
+        node_resource_names: list,
+        link_resource_names: list,
+        topological_metrics: dict | None = None,
+        preserve_link_orientation: bool = False,
+    ):
         node_attrs = []
         topological_metrics = topological_metrics or {}
         for node_id in net.nodes:
@@ -708,22 +755,42 @@ class CppFullSolver:
                     attrs[str(topo_name)] = 0.0
             node_attrs.append(attrs)
 
-        edges = list(net.links)
         edge_attrs = []
-        for (u, v) in edges:
-            attrs = {}
-            data = net.links[(u, v)]
-            for name in link_resource_names:
-                value = data.get(name, 0.0)
-                if isinstance(value, (int, float, bool)):
-                    attrs[str(name)] = float(value)
-            edge_attrs.append(attrs)
-
         directed = False
-        try:
-            directed = bool(net.is_directed())
-        except Exception:
-            directed = False
+        if preserve_link_orientation and hasattr(net, "links"):
+            directed = True
+            net_is_directed = False
+            try:
+                net_is_directed = bool(net.is_directed())
+            except Exception:
+                net_is_directed = False
+            edges = []
+            for u, v, data in net.edges(data=True):
+                oriented_edges = [(int(u), int(v))]
+                if not net_is_directed and int(u) != int(v):
+                    oriented_edges.append((int(v), int(u)))
+                attrs = {}
+                for name in link_resource_names:
+                    value = data.get(name, 0.0)
+                    if isinstance(value, (int, float, bool)):
+                        attrs[str(name)] = float(value)
+                for src, dst in oriented_edges:
+                    edges.append((src, dst))
+                    edge_attrs.append(dict(attrs))
+        else:
+            edges = list(net.links)
+            for (u, v) in edges:
+                attrs = {}
+                data = net.links[(u, v)]
+                for name in link_resource_names:
+                    value = data.get(name, 0.0)
+                    if isinstance(value, (int, float, bool)):
+                        attrs[str(name)] = float(value)
+                edge_attrs.append(attrs)
+            try:
+                directed = bool(net.is_directed())
+            except Exception:
+                directed = False
 
         return node_attrs, edges, edge_attrs, directed
 
@@ -738,16 +805,22 @@ class CppFullSolver:
         cfg.rollout_depth_limit = int(getattr(self.actor, "rollout_depth_limit", 100))
         if training is not None:
             cfg.add_root_noise = bool(training)
-        # Batch eval size (C++): default to training.gpu_batch_size if present.
+        # Batch eval size (C++): default to serial evaluation to match Python MCTS
+        # semantics. `gpu_batch_size` belongs to the Python batched inference worker
+        # and should not silently change C++ tree-search behavior.
         batch_size = 1
         cfg_obj = getattr(self.actor, "config", None)
         training_cfg = getattr(cfg_obj, "training", None) if cfg_obj is not None else None
         if isinstance(training_cfg, dict):
-            batch_size = int(training_cfg.get("gpu_batch_size", batch_size))
+            explicit_batch_size = training_cfg.get("cpp_eval_batch_size", None)
+            if explicit_batch_size is not None:
+                batch_size = int(explicit_batch_size)
             cfg.value_normalization = str(training_cfg.get("value_normalization", "tanh"))
             cfg.value_scale = float(training_cfg.get("value_scale", 1000.0))
         elif training_cfg is not None:
-            batch_size = int(getattr(training_cfg, "gpu_batch_size", batch_size))
+            explicit_batch_size = getattr(training_cfg, "cpp_eval_batch_size", None)
+            if explicit_batch_size is not None:
+                batch_size = int(explicit_batch_size)
             cfg.value_normalization = str(getattr(training_cfg, "value_normalization", "tanh"))
             cfg.value_scale = float(getattr(training_cfg, "value_scale", 1000.0))
         cfg.eval_batch_size = max(1, batch_size)
@@ -899,6 +972,7 @@ class CppFullSolver:
             self._node_resource_names,
             self._link_resource_names,
             topological_metrics=feature_metadata.get("p_topological_metrics"),
+            preserve_link_orientation=True,
         )
         v_node_attrs, v_edges, v_edge_attrs, v_directed = self._build_network_payload(
             v_net,

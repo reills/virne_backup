@@ -6,7 +6,7 @@
 
 #include <memory>
 #include <optional>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace azsfc {
@@ -40,8 +40,9 @@ public:
 
     TreeNode* best_child(float c_puct);
     TreeNode* child_for_action(int64_t action);
+    std::unique_ptr<TreeNode> extract_child(int64_t action);
     [[nodiscard]] bool has_children() const noexcept;
-    const std::unordered_map<int64_t, std::unique_ptr<TreeNode>>& children_ref() const noexcept { return children_; }
+    const std::vector<std::pair<int64_t, std::unique_ptr<TreeNode>>>& children_ref() const noexcept { return children_; }
 
     std::shared_ptr<StateView> state() const { return state_; }
     std::optional<int64_t> action_from_parent() const { return action_from_parent_; }
@@ -58,7 +59,7 @@ private:
     std::size_t visit_count_{0};
     bool terminal_{false};
 
-    std::unordered_map<int64_t, std::unique_ptr<TreeNode>> children_;
+    std::vector<std::pair<int64_t, std::unique_ptr<TreeNode>>> children_;
 };
 
 }  // namespace azsfc
