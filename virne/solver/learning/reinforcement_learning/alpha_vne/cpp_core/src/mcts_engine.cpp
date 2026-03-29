@@ -418,11 +418,9 @@ float MCTSEngine::expand(TreeNode& node) {
             }
             auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
             child_state->step_index = state->step_index + 1;
-            const auto& order = child_domain->virtual_order();
-            const auto& selected = child_domain->selected_physical_nodes();
-            if (selected.size() < order.size()) {
-                child_state->curr_v_node_override = order[selected.size()];
-            }
+            // Match Python MCTS semantics: non-root child expansion infers the
+            // next virtual-node index from the child state itself rather than
+            // carrying an explicit stable-order override into deeper plies.
             child_state->domain_state = std::move(child_domain);
             options.emplace_back(action, std::move(child_state));
         }

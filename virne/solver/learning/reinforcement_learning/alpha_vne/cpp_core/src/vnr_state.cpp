@@ -1071,6 +1071,26 @@ VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_
     used.assign(static_cast<std::size_t>(p_net_->num_edges),
                 std::vector<double>(resource_names.size(), 0.0));
 
+    auto canonical_edge_id = [&](int edge_id) -> int {
+        if (edge_id < 0 || edge_id >= p_net_->num_edges) {
+            return edge_id;
+        }
+        const auto& edge = p_net_->edges[static_cast<std::size_t>(edge_id)];
+        auto reverse_it = p_net_->edge_index.find({edge.second, edge.first});
+        if (reverse_it == p_net_->edge_index.end()) {
+            return edge_id;
+        }
+        int reverse_edge_id = reverse_it->second;
+        if (reverse_edge_id == edge_id || reverse_edge_id < 0 || reverse_edge_id >= p_net_->num_edges) {
+            return edge_id;
+        }
+        if (p_net_->edge_attrs[static_cast<std::size_t>(reverse_edge_id)]
+            != p_net_->edge_attrs[static_cast<std::size_t>(edge_id)]) {
+            return edge_id;
+        }
+        return std::min(edge_id, reverse_edge_id);
+    };
+
     auto capacity_fn = [&](int edge_id, const std::string& attr) -> double {
         auto idx_it = resource_index.find(attr);
         if (idx_it == resource_index.end()) {
@@ -1080,8 +1100,9 @@ VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_
             return 0.0;
         }
         std::size_t idx = idx_it->second;
+        int used_edge_id = canonical_edge_id(edge_id);
         double capacity = safe_lookup(p_net_->edge_attrs[edge_id], attr);
-        return capacity - used[static_cast<std::size_t>(edge_id)][idx];
+        return capacity - used[static_cast<std::size_t>(used_edge_id)][idx];
     };
 
     std::string method = config_.shortest_method.empty() ? "bfs_shortest" : config_.shortest_method;
@@ -1190,7 +1211,8 @@ VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_
                     if (demand > 0.0) {
                         auto idx_it = resource_index.find(name);
                         if (idx_it != resource_index.end()) {
-                            used[static_cast<std::size_t>(edge_id)][idx_it->second] += demand;
+                            int used_edge_id = canonical_edge_id(edge_id);
+                            used[static_cast<std::size_t>(used_edge_id)][idx_it->second] += demand;
                         }
                         result.total_link_cost += demand;
                     }
@@ -1261,13 +1283,14 @@ VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_
                         double demand = demands[name];
                         used_map[name] = demand;
                         if (demand > 0.0) {
-                            auto idx_it = resource_index.find(name);
-                            if (idx_it != resource_index.end()) {
-                                used[static_cast<std::size_t>(edge_id)][idx_it->second] += demand;
-                            }
-                            result.total_link_cost += demand;
+                        auto idx_it = resource_index.find(name);
+                        if (idx_it != resource_index.end()) {
+                            int used_edge_id = canonical_edge_id(edge_id);
+                            used[static_cast<std::size_t>(used_edge_id)][idx_it->second] += demand;
                         }
+                        result.total_link_cost += demand;
                     }
+                }
                     record.p_link_resources.push_back(std::move(used_map));
                 }
                 if (!feasible) {

@@ -981,6 +981,47 @@ class OptimizedAlphaZeroActor(Solver):
             "value_target_mode": self.value_target_mode,
         }
 
+    def _normalize_cpp_link_mapping_for_deploy(self, p_net, cpp_link_paths, cpp_link_paths_info):
+        if not isinstance(cpp_link_paths, dict) or not isinstance(cpp_link_paths_info, dict):
+            return cpp_link_paths, cpp_link_paths_info
+        try:
+            if bool(p_net.is_directed()):
+                return cpp_link_paths, cpp_link_paths_info
+        except Exception:
+            pass
+
+        normalized_paths = {}
+        normalized_info = {}
+        for v_key, p_links in cpp_link_paths.items():
+            canonical_links = []
+            for raw_link in p_links:
+                try:
+                    u, v = int(raw_link[0]), int(raw_link[1])
+                except Exception:
+                    canonical_links.append(raw_link)
+                    continue
+                canonical_link = (u, v) if u <= v else (v, u)
+                canonical_links.append(canonical_link)
+
+                raw_info_key = (v_key, raw_link)
+                canonical_info_key = (v_key, canonical_link)
+                used_resources = cpp_link_paths_info.get(raw_info_key)
+                if used_resources is None:
+                    used_resources = cpp_link_paths_info.get(canonical_info_key)
+                if used_resources is None:
+                    continue
+
+                if canonical_info_key not in normalized_info:
+                    normalized_info[canonical_info_key] = dict(used_resources)
+                else:
+                    merged = normalized_info[canonical_info_key]
+                    for attr_name, attr_value in dict(used_resources).items():
+                        merged[attr_name] = float(merged.get(attr_name, 0.0)) + float(attr_value)
+
+            normalized_paths[v_key] = canonical_links
+
+        return normalized_paths, normalized_info
+
     def _solve_with_cpp_full(self, instance, training: bool = None):
         """Solve a request using the full C++ backend and rebuild trajectory in Python."""
         v_net, p_net = instance["v_net"], instance["p_net"]
@@ -1057,6 +1098,11 @@ class OptimizedAlphaZeroActor(Solver):
         cpp_node_slots = cpp_result.get("node_slots", None)
         cpp_link_paths = cpp_result.get("link_paths", None)
         cpp_link_paths_info = cpp_result.get("link_paths_info", None)
+        cpp_link_paths, cpp_link_paths_info = self._normalize_cpp_link_mapping_for_deploy(
+            p_net,
+            cpp_link_paths,
+            cpp_link_paths_info,
+        )
         if cpp_place_info and cpp_place_info.get("incomplete_placement") and self.logger is not None:
             try:
                 self.logger.warning(
