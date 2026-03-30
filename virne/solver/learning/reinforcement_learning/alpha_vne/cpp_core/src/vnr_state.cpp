@@ -1336,6 +1336,13 @@ VNRState::SparseResourceAllocations VNRState::get_allocated_node_resources() con
     return merged;
 }
 
+const VNRState::SparseResourceAllocations& VNRState::allocated_node_resources_view() const {
+    if (!allocation_totals_cache_valid_) {
+        rebuild_allocation_totals_cache();
+    }
+    return node_allocation_totals_cache_;
+}
+
 VNRState::SparseResourceAllocations VNRState::get_allocated_link_resources() const {
     if (!allocation_totals_cache_valid_) {
         rebuild_allocation_totals_cache();
@@ -1358,6 +1365,13 @@ VNRState::SparseResourceAllocations VNRState::get_allocated_link_resources() con
         }
     }
     return merged;
+}
+
+const VNRState::SparseResourceAllocations& VNRState::allocated_link_resources_view() const {
+    if (!allocation_totals_cache_valid_) {
+        rebuild_allocation_totals_cache();
+    }
+    return link_allocation_totals_cache_;
 }
 
 float VNRState::run_random_rollout(std::mt19937& rng, int depth_limit) const {

@@ -84,6 +84,8 @@ public:
     double get_available_link_resource(int u, int v, const std::string& attr) const;
     SparseResourceAllocations get_allocated_node_resources() const;
     SparseResourceAllocations get_allocated_link_resources() const;
+    const SparseResourceAllocations& allocated_node_resources_view() const;
+    const SparseResourceAllocations& allocated_link_resources_view() const;
     std::vector<std::vector<int>> debug_find_paths(int p_src, int p_dst, const ResourceMap& demands) const;
 
     int current_virtual_index() const noexcept { return v_node_index_; }

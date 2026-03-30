@@ -106,6 +106,8 @@ constexpr const char* kVTopoCloseness = "__az_v_closeness__";
 constexpr const char* kVTopoEigenvector = "__az_v_eigenvector__";
 constexpr const char* kVTopoBetweenness = "__az_v_betweenness__";
 
+torch::Tensor build_edge_index(const Network& net);
+
 int compute_p_net_feature_dim(const VNRConfig& cfg) {
     int dim = static_cast<int>(cfg.node_resource_names.size()) + 1;
     if (cfg.feature_use_node_status_flags) {
@@ -140,66 +142,29 @@ int compute_v_net_feature_dim(const VNRConfig& cfg) {
     return dim;
 }
 
-double available_node_resource(
-    const Network& net,
-    const VNRState::SparseResourceAllocations& allocated,
-    int node_id,
-    const std::string& attr_name
-) {
-    double value = safe_lookup(net.node_attrs[node_id], attr_name);
-    auto node_it = allocated.find(node_id);
-    if (node_it == allocated.end()) {
-        return value;
-    }
-    auto attr_it = node_it->second.find(attr_name);
-    if (attr_it == node_it->second.end()) {
-        return value;
-    }
-    return value - attr_it->second;
-}
-
-double available_link_resource(
-    const Network& net,
-    const VNRState::SparseResourceAllocations& allocated,
-    int edge_id,
-    const std::string& attr_name
-) {
-    auto allocated_amount = [&](int id) {
-        auto edge_it = allocated.find(id);
-        if (edge_it == allocated.end()) {
-            return 0.0;
-        }
-        auto attr_it = edge_it->second.find(attr_name);
-        if (attr_it == edge_it->second.end()) {
-            return 0.0;
-        }
-        return attr_it->second;
-    };
-
-    double value = safe_lookup(net.edge_attrs[edge_id], attr_name);
-    double used = allocated_amount(edge_id);
-
-    // Python feature construction materializes the physical substrate as the
-    // original undirected graph, so mirrored arcs (u,v)/(v,u) share the same
-    // residual bandwidth. The pure-C++ solve path serializes those links as
-    // explicit directed arcs for routing/state reconstruction, so we need to
-    // merge reverse-direction allocations back together when reading
-    // observation features.
-    if (net.directed && edge_id >= 0 && edge_id < static_cast<int>(net.edges.size())) {
-        const auto& [u, v] = net.edges[edge_id];
-        auto reverse_it = net.edge_index.find({v, u});
-        if (reverse_it != net.edge_index.end()) {
-            int reverse_edge_id = reverse_it->second;
-            if (reverse_edge_id != edge_id &&
-                reverse_edge_id >= 0 &&
-                reverse_edge_id < static_cast<int>(net.edge_attrs.size()) &&
-                net.edge_attrs[reverse_edge_id] == net.edge_attrs[edge_id]) {
-                used += allocated_amount(reverse_edge_id);
-            }
-        }
-    }
-    return value - used;
-}
+struct PhysicalEncodingCache {
+    int num_nodes{0};
+    int num_edges{0};
+    int out_edges{0};
+    int p_feature_dim{0};
+    int node_resource_dim{0};
+    int link_resource_dim{0};
+    int selected_flag_index{-1};
+    int selected_neighbor_flag_index{-1};
+    int aggregated_link_feature_offset{-1};
+    int avg_distance_feature_index{-1};
+    torch::Tensor edge_index_cpu;
+    torch::Tensor p_batch_cpu;
+    torch::Tensor base_p_net_x;
+    torch::Tensor base_p_edge_attr;
+    std::vector<double> node_attr_benchmarks;
+    std::vector<double> link_attr_benchmarks;
+    std::vector<double> link_sum_attr_benchmarks;
+    std::unordered_map<std::string, int> node_resource_index;
+    std::unordered_map<std::string, int> link_resource_index;
+    std::vector<int> hop_distance_matrix;
+    std::vector<int> reverse_edge_ids;
+};
 
 int current_virtual_node_id(const VNRState& state, int override_v_node_id = -1) {
     if (override_v_node_id >= 0) {
@@ -229,55 +194,84 @@ std::unordered_map<int, int> build_node_slots(const VNRState& state) {
     return node_slots;
 }
 
-std::vector<int> build_selected_p_neighbors(
+std::vector<char> build_selected_neighbor_mask(
     const Network& virtual_net,
     const VNRState& state,
+    int num_physical_nodes,
     int override_v_node_id = -1
 ) {
-    std::vector<int> neighbors;
+    std::vector<char> neighbors(static_cast<std::size_t>(std::max(0, num_physical_nodes)), 0);
     int curr_v_node = current_virtual_node_id(state, override_v_node_id);
     if (curr_v_node < 0 || curr_v_node >= virtual_net.num_nodes) {
         return neighbors;
     }
-    const auto node_slots = build_node_slots(state);
+    const auto node_slots = state.node_slots();
     for (const auto& [v_neighbor, _edge_id] : virtual_net.adjacency[curr_v_node]) {
-        auto it = node_slots.find(v_neighbor);
-        if (it != node_slots.end()) {
-            neighbors.push_back(it->second);
+        if (v_neighbor < 0 || v_neighbor >= static_cast<int>(node_slots.size())) {
+            continue;
+        }
+        int p_node_id = node_slots[static_cast<std::size_t>(v_neighbor)];
+        if (p_node_id >= 0 && p_node_id < num_physical_nodes) {
+            neighbors[static_cast<std::size_t>(p_node_id)] = 1;
         }
     }
     return neighbors;
 }
 
-std::vector<double> compute_average_distance(const Network& net, const std::vector<int>& selected) {
-    std::vector<double> avg(net.num_nodes, 0.0);
+std::vector<int> compute_hop_distance_matrix(const Network& net) {
+    const int num_nodes = std::max(0, net.num_nodes);
+    std::vector<int> matrix(static_cast<std::size_t>(num_nodes) * static_cast<std::size_t>(num_nodes), -1);
+    if (num_nodes == 0) {
+        return matrix;
+    }
+
+    std::vector<int> queue(static_cast<std::size_t>(num_nodes), 0);
+    std::vector<int> dist(static_cast<std::size_t>(num_nodes), -1);
+    for (int src = 0; src < num_nodes; ++src) {
+        std::fill(dist.begin(), dist.end(), -1);
+        int head = 0;
+        int tail = 0;
+        dist[static_cast<std::size_t>(src)] = 0;
+        queue[static_cast<std::size_t>(tail++)] = src;
+        while (head < tail) {
+            int u = queue[static_cast<std::size_t>(head++)];
+            for (const auto& [v, _edge_id] : net.adjacency[u]) {
+                if (dist[static_cast<std::size_t>(v)] >= 0) {
+                    continue;
+                }
+                dist[static_cast<std::size_t>(v)] = dist[static_cast<std::size_t>(u)] + 1;
+                queue[static_cast<std::size_t>(tail++)] = v;
+            }
+        }
+        const std::size_t row_offset = static_cast<std::size_t>(src) * static_cast<std::size_t>(num_nodes);
+        for (int dst = 0; dst < num_nodes; ++dst) {
+            matrix[row_offset + static_cast<std::size_t>(dst)] = dist[static_cast<std::size_t>(dst)];
+        }
+    }
+    return matrix;
+}
+
+std::vector<double> compute_average_distance(
+    const PhysicalEncodingCache& cache,
+    const std::vector<int>& selected
+) {
+    std::vector<double> avg(static_cast<std::size_t>(cache.num_nodes), 0.0);
     if (selected.empty()) {
         return avg;
     }
-    std::vector<int> queue(net.num_nodes, 0);
-    for (int src = 0; src < net.num_nodes; ++src) {
-        std::vector<int> dist(net.num_nodes, -1);
-        int head = 0;
-        int tail = 0;
-        dist[src] = 0;
-        queue[tail++] = src;
-        while (head < tail) {
-            int u = queue[head++];
-            for (const auto& [v, _edge_id] : net.adjacency[u]) {
-                if (dist[v] >= 0) {
-                    continue;
-                }
-                dist[v] = dist[u] + 1;
-                queue[tail++] = v;
-            }
-        }
+
+    for (int src = 0; src < cache.num_nodes; ++src) {
         double sum = 0.0;
+        const std::size_t row_offset = static_cast<std::size_t>(src) * static_cast<std::size_t>(cache.num_nodes);
         for (int dst : selected) {
-            if (dst >= 0 && dst < net.num_nodes && dist[dst] >= 0) {
-                sum += static_cast<double>(dist[dst]);
+            if (dst >= 0 && dst < cache.num_nodes) {
+                int distance = cache.hop_distance_matrix[row_offset + static_cast<std::size_t>(dst)];
+                if (distance >= 0) {
+                    sum += static_cast<double>(distance);
+                }
             }
         }
-        avg[src] = sum / static_cast<double>(selected.size() + 1);
+        avg[static_cast<std::size_t>(src)] = sum / static_cast<double>(selected.size() + 1);
     }
     double min_val = *std::min_element(avg.begin(), avg.end());
     double max_val = *std::max_element(avg.begin(), avg.end());
@@ -288,6 +282,148 @@ std::vector<double> compute_average_distance(const Network& net, const std::vect
         value = (value - min_val) / (max_val - min_val);
     }
     return avg;
+}
+
+void fill_base_link_aggregates(
+    const Network& net,
+    const VNRConfig& cfg,
+    const PhysicalEncodingCache& cache,
+    torch::Tensor& x
+) {
+    if (!cfg.feature_use_aggregated_link_attrs || cache.aggregated_link_feature_offset < 0) {
+        return;
+    }
+
+    auto x_acc = x.accessor<float, 2>();
+    for (int n = 0; n < net.num_nodes; ++n) {
+        int feat_idx = cache.aggregated_link_feature_offset;
+        for (int j = 0; j < cache.link_resource_dim; ++j) {
+            const auto& name = cfg.link_resource_names[static_cast<std::size_t>(j)];
+            double min_v = 0.0;
+            double mean_v = 0.0;
+            double max_v = 0.0;
+            double sum_v = 0.0;
+            for (const auto& [_neighbor, edge_id] : net.adjacency[n]) {
+                double value = safe_lookup(net.edge_attrs[edge_id], name);
+                min_v = std::min(min_v, value);
+                max_v = std::max(max_v, value);
+                sum_v += value;
+            }
+            mean_v = sum_v / static_cast<double>(std::max(1, net.num_nodes));
+            x_acc[n][feat_idx++] = static_cast<float>(safe_div(min_v, cache.link_attr_benchmarks[static_cast<std::size_t>(j)]));
+            x_acc[n][feat_idx++] = static_cast<float>(mean_v);
+            x_acc[n][feat_idx++] = static_cast<float>(safe_div(max_v, cache.link_attr_benchmarks[static_cast<std::size_t>(j)]));
+            x_acc[n][feat_idx++] = static_cast<float>(safe_div(sum_v, cache.link_sum_attr_benchmarks[static_cast<std::size_t>(j)]));
+        }
+    }
+}
+
+PhysicalEncodingCache build_physical_encoding_cache(const Network& net, const VNRConfig& cfg) {
+    PhysicalEncodingCache cache;
+    cache.num_nodes = net.num_nodes;
+    cache.num_edges = net.num_edges;
+    cache.out_edges = net.directed ? net.num_edges : net.num_edges * 2;
+    cache.node_resource_dim = static_cast<int>(cfg.node_resource_names.size());
+    cache.link_resource_dim = static_cast<int>(cfg.link_resource_names.size());
+    cache.p_feature_dim = compute_p_net_feature_dim(cfg);
+    cache.edge_index_cpu = build_edge_index(net);
+    cache.p_batch_cpu = torch::zeros({net.num_nodes}, torch::kInt64);
+    cache.base_p_net_x = torch::zeros({net.num_nodes, cache.p_feature_dim}, torch::kFloat32);
+    cache.base_p_edge_attr = torch::zeros({cache.out_edges, cache.link_resource_dim}, torch::kFloat32);
+    cache.hop_distance_matrix = compute_hop_distance_matrix(net);
+    cache.reverse_edge_ids.assign(static_cast<std::size_t>(net.num_edges), -1);
+
+    cache.node_attr_benchmarks.reserve(cfg.node_resource_names.size());
+    for (std::size_t i = 0; i < cfg.node_resource_names.size(); ++i) {
+        const auto& name = cfg.node_resource_names[i];
+        cache.node_resource_index.emplace(name, static_cast<int>(i));
+        cache.node_attr_benchmarks.push_back(safe_lookup(cfg.node_attr_benchmarks, name));
+    }
+    cache.link_attr_benchmarks.reserve(cfg.link_resource_names.size());
+    cache.link_sum_attr_benchmarks.reserve(cfg.link_resource_names.size());
+    for (std::size_t i = 0; i < cfg.link_resource_names.size(); ++i) {
+        const auto& name = cfg.link_resource_names[i];
+        cache.link_resource_index.emplace(name, static_cast<int>(i));
+        cache.link_attr_benchmarks.push_back(safe_lookup(cfg.link_attr_benchmarks, name));
+        cache.link_sum_attr_benchmarks.push_back(safe_lookup(cfg.link_sum_attr_benchmarks, name));
+    }
+
+    auto x_acc = cache.base_p_net_x.accessor<float, 2>();
+    cache.selected_flag_index = cache.node_resource_dim;
+    cache.selected_neighbor_flag_index = cache.node_resource_dim + (cfg.feature_use_node_status_flags ? 1 : 0);
+    int feat_offset = cache.node_resource_dim;
+    if (cfg.feature_use_node_status_flags) {
+        feat_offset += 2;
+    } else {
+        cache.selected_flag_index = -1;
+        cache.selected_neighbor_flag_index = -1;
+    }
+    cache.aggregated_link_feature_offset = feat_offset;
+    if (cfg.feature_use_aggregated_link_attrs) {
+        feat_offset += cache.link_resource_dim * 4;
+    } else {
+        cache.aggregated_link_feature_offset = -1;
+    }
+    cache.avg_distance_feature_index = feat_offset;
+
+    for (int n = 0; n < net.num_nodes; ++n) {
+        int feat_idx = 0;
+        for (int j = 0; j < cache.node_resource_dim; ++j) {
+            const auto& name = cfg.node_resource_names[static_cast<std::size_t>(j)];
+            x_acc[n][feat_idx++] = static_cast<float>(safe_div(
+                safe_lookup(net.node_attrs[n], name),
+                cache.node_attr_benchmarks[static_cast<std::size_t>(j)]
+            ));
+        }
+        if (cfg.feature_use_node_status_flags) {
+            feat_idx += 2;
+        }
+        if (cfg.feature_use_aggregated_link_attrs) {
+            feat_idx += cache.link_resource_dim * 4;
+        }
+        x_acc[n][feat_idx++] = 0.0f;
+        if (cfg.feature_use_degree_metric) {
+            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoDegree));
+        }
+        if (cfg.feature_use_more_topological_metrics) {
+            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoCloseness));
+            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoEigenvector));
+            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoBetweenness));
+        }
+    }
+    fill_base_link_aggregates(net, cfg, cache, cache.base_p_net_x);
+
+    auto edge_acc = cache.base_p_edge_attr.accessor<float, 2>();
+    for (int e = 0; e < net.num_edges; ++e) {
+        for (int j = 0; j < cache.link_resource_dim; ++j) {
+            const auto& name = cfg.link_resource_names[static_cast<std::size_t>(j)];
+            float value = static_cast<float>(safe_div(
+                safe_lookup(net.edge_attrs[e], name),
+                cache.link_attr_benchmarks[static_cast<std::size_t>(j)]
+            ));
+            edge_acc[e][j] = value;
+            if (!net.directed) {
+                edge_acc[net.num_edges + e][j] = value;
+            }
+        }
+
+        if (!net.directed) {
+            continue;
+        }
+        const auto& [u, v] = net.edges[e];
+        auto reverse_it = net.edge_index.find({v, u});
+        if (reverse_it != net.edge_index.end()) {
+            int reverse_edge_id = reverse_it->second;
+            if (reverse_edge_id != e &&
+                reverse_edge_id >= 0 &&
+                reverse_edge_id < static_cast<int>(net.edge_attrs.size()) &&
+                net.edge_attrs[reverse_edge_id] == net.edge_attrs[e]) {
+                cache.reverse_edge_ids[static_cast<std::size_t>(e)] = reverse_edge_id;
+            }
+        }
+    }
+
+    return cache;
 }
 
 double sum_node_demand(const Network& net, const std::vector<std::string>& node_resource_names) {
@@ -401,85 +537,140 @@ torch::Tensor build_v_net_x(
     return x;
 }
 
+torch::Tensor build_p_edge_attr(
+    const PhysicalEncodingCache& cache,
+    const Network& net,
+    const VNRState& state,
+    const VNRConfig& cfg
+) {
+    (void)cfg;
+    auto attr = cache.base_p_edge_attr.clone();
+    const auto& link_alloc = state.allocated_link_resources_view();
+    if (link_alloc.empty()) {
+        return attr;
+    }
+
+    auto acc = attr.accessor<float, 2>();
+    for (const auto& [edge_id, resources] : link_alloc) {
+        if (edge_id < 0 || edge_id >= net.num_edges) {
+            continue;
+        }
+        int reverse_edge_id = -1;
+        if (net.directed) {
+            reverse_edge_id = cache.reverse_edge_ids[static_cast<std::size_t>(edge_id)];
+        }
+        for (const auto& [name, used] : resources) {
+            if (used <= 0.0) {
+                continue;
+            }
+            auto idx_it = cache.link_resource_index.find(name);
+            if (idx_it == cache.link_resource_index.end()) {
+                continue;
+            }
+            const int j = idx_it->second;
+            const float delta = static_cast<float>(safe_div(
+                used,
+                cache.link_attr_benchmarks[static_cast<std::size_t>(j)]
+            ));
+            acc[edge_id][j] -= delta;
+            if (!net.directed) {
+                acc[net.num_edges + edge_id][j] -= delta;
+            } else if (reverse_edge_id >= 0) {
+                acc[reverse_edge_id][j] -= delta;
+            }
+        }
+    }
+    return attr;
+}
+
 torch::Tensor build_p_net_x(
+    const PhysicalEncodingCache& cache,
     const Network& net,
     const Network& virtual_net,
     const VNRState& state,
     const VNRConfig& cfg,
+    const torch::Tensor& p_edge_attr,
     int override_v_node_id = -1
 ) {
-    auto x = torch::zeros({net.num_nodes, compute_p_net_feature_dim(cfg)}, torch::kFloat32);
+    auto x = cache.base_p_net_x.clone();
     auto x_acc = x.accessor<float, 2>();
-    const auto node_alloc = state.get_allocated_node_resources();
-    const auto link_alloc = state.get_allocated_link_resources();
+    const auto& node_alloc = state.allocated_node_resources_view();
+    const auto& link_alloc = state.allocated_link_resources_view();
     const auto& selected = state.selected_physical_nodes();
-    const auto selected_neighbors = build_selected_p_neighbors(virtual_net, state, override_v_node_id);
-    const auto avg_distance = compute_average_distance(net, selected);
-    for (int n = 0; n < net.num_nodes; ++n) {
-        int feat_idx = 0;
-        for (const auto& name : cfg.node_resource_names) {
-            x_acc[n][feat_idx++] = static_cast<float>(safe_div(
-                available_node_resource(net, node_alloc, n, name),
-                safe_lookup(cfg.node_attr_benchmarks, name)
+    const auto avg_distance = compute_average_distance(cache, selected);
+
+    for (const auto& [node_id, resources] : node_alloc) {
+        if (node_id < 0 || node_id >= net.num_nodes) {
+            continue;
+        }
+        for (const auto& [name, used] : resources) {
+            if (used <= 0.0) {
+                continue;
+            }
+            auto idx_it = cache.node_resource_index.find(name);
+            if (idx_it == cache.node_resource_index.end()) {
+                continue;
+            }
+            const int feat_idx = idx_it->second;
+            x_acc[node_id][feat_idx] -= static_cast<float>(safe_div(
+                used,
+                cache.node_attr_benchmarks[static_cast<std::size_t>(feat_idx)]
             ));
         }
-        if (cfg.feature_use_node_status_flags) {
-            x_acc[n][feat_idx++] = std::find(selected.begin(), selected.end(), n) != selected.end() ? 1.0f : 0.0f;
-            x_acc[n][feat_idx++] = std::find(selected_neighbors.begin(), selected_neighbors.end(), n) != selected_neighbors.end() ? 1.0f : 0.0f;
-        }
-        if (cfg.feature_use_aggregated_link_attrs) {
-            for (const auto& name : cfg.link_resource_names) {
-                // Match Python's full-adjacency-matrix aggregation semantics.
-                double min_v = 0.0, mean_v = 0.0, max_v = 0.0, sum_v = 0.0;
+    }
+
+    if (cfg.feature_use_aggregated_link_attrs && !link_alloc.empty()) {
+        auto edge_acc = p_edge_attr.accessor<float, 2>();
+        for (int n = 0; n < net.num_nodes; ++n) {
+            int feat_idx = cache.aggregated_link_feature_offset;
+            for (int j = 0; j < cache.link_resource_dim; ++j) {
+                const double link_benchmark = cache.link_attr_benchmarks[static_cast<std::size_t>(j)];
+                const double link_sum_benchmark = cache.link_sum_attr_benchmarks[static_cast<std::size_t>(j)];
+                double min_v = 0.0;
+                double mean_v = 0.0;
+                double max_v = 0.0;
+                double sum_v = 0.0;
                 for (const auto& [_neighbor, edge_id] : net.adjacency[n]) {
-                    double value = available_link_resource(net, link_alloc, edge_id, name);
+                    double value = static_cast<double>(edge_acc[edge_id][j]);
+                    if (std::abs(link_benchmark) > 1e-12) {
+                        value *= link_benchmark;
+                    }
                     min_v = std::min(min_v, value);
                     max_v = std::max(max_v, value);
                     sum_v += value;
                 }
                 mean_v = sum_v / static_cast<double>(std::max(1, net.num_nodes));
-                x_acc[n][feat_idx++] = static_cast<float>(safe_div(min_v, safe_lookup(cfg.link_attr_benchmarks, name)));
+                x_acc[n][feat_idx++] = static_cast<float>(safe_div(min_v, link_benchmark));
                 x_acc[n][feat_idx++] = static_cast<float>(mean_v);
-                x_acc[n][feat_idx++] = static_cast<float>(safe_div(max_v, safe_lookup(cfg.link_attr_benchmarks, name)));
-                x_acc[n][feat_idx++] = static_cast<float>(safe_div(sum_v, safe_lookup(cfg.link_sum_attr_benchmarks, name)));
+                x_acc[n][feat_idx++] = static_cast<float>(safe_div(max_v, link_benchmark));
+                x_acc[n][feat_idx++] = static_cast<float>(safe_div(sum_v, link_sum_benchmark));
             }
         }
-        x_acc[n][feat_idx++] = static_cast<float>(avg_distance[n]);
-        if (cfg.feature_use_degree_metric) {
-            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoDegree));
+    }
+
+    if (cfg.feature_use_node_status_flags) {
+        std::vector<char> selected_mask(static_cast<std::size_t>(net.num_nodes), 0);
+        for (int p_node_id : selected) {
+            if (p_node_id >= 0 && p_node_id < net.num_nodes) {
+                selected_mask[static_cast<std::size_t>(p_node_id)] = 1;
+            }
         }
-        if (cfg.feature_use_more_topological_metrics) {
-            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoCloseness));
-            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoEigenvector));
-            x_acc[n][feat_idx++] = static_cast<float>(safe_lookup(net.node_attrs[n], kPTopoBetweenness));
+        const auto selected_neighbors = build_selected_neighbor_mask(
+            virtual_net,
+            state,
+            net.num_nodes,
+            override_v_node_id
+        );
+        for (int n = 0; n < net.num_nodes; ++n) {
+            x_acc[n][cache.selected_flag_index] = selected_mask[static_cast<std::size_t>(n)] ? 1.0f : 0.0f;
+            x_acc[n][cache.selected_neighbor_flag_index] = selected_neighbors[static_cast<std::size_t>(n)] ? 1.0f : 0.0f;
         }
+    }
+
+    for (int n = 0; n < net.num_nodes; ++n) {
+        x_acc[n][cache.avg_distance_feature_index] = static_cast<float>(avg_distance[static_cast<std::size_t>(n)]);
     }
     return x;
-}
-
-torch::Tensor build_p_edge_attr(
-    const Network& net,
-    const VNRState& state,
-    const VNRConfig& cfg
-) {
-    const auto link_alloc = state.get_allocated_link_resources();
-    const int out_edges = net.directed ? net.num_edges : net.num_edges * 2;
-    auto attr = torch::zeros({out_edges, static_cast<long>(cfg.link_resource_names.size())}, torch::kFloat32);
-    auto acc = attr.accessor<float, 2>();
-    for (int e = 0; e < net.num_edges; ++e) {
-        for (std::size_t j = 0; j < cfg.link_resource_names.size(); ++j) {
-            const auto& name = cfg.link_resource_names[j];
-            float value = static_cast<float>(safe_div(
-                available_link_resource(net, link_alloc, e, name),
-                safe_lookup(cfg.link_attr_benchmarks, name)
-            ));
-            acc[e][j] = value;
-            if (!net.directed) {
-                acc[net.num_edges + e][j] = value;
-            }
-        }
-    }
-    return attr;
 }
 
 torch::Tensor build_selected_tensor(const std::vector<int>& selected) {
@@ -570,6 +761,7 @@ torch::Tensor build_history_features_single(
 }
 
 StateView::TensorMap build_inputs_cached(
+    const PhysicalEncodingCache& encoding_cache,
     const std::shared_ptr<StateView>& state_view,
     const VNRState& state,
     const Network& physical,
@@ -586,8 +778,17 @@ StateView::TensorMap build_inputs_cached(
 ) {
     StateView::TensorMap inputs;
     const int override_v_node_id = state_view ? static_cast<int>(state_view->curr_v_node_override) : -1;
-    auto p_net_x = build_p_net_x(physical, virtual_net, state, vnr_config, override_v_node_id).to(device);
-    auto p_edge_attr = build_p_edge_attr(physical, state, vnr_config).to(device);
+    auto p_edge_attr_cpu = build_p_edge_attr(encoding_cache, physical, state, vnr_config);
+    auto p_net_x = build_p_net_x(
+        encoding_cache,
+        physical,
+        virtual_net,
+        state,
+        vnr_config,
+        p_edge_attr_cpu,
+        override_v_node_id
+    ).to(device);
+    auto p_edge_attr = p_edge_attr_cpu.to(device);
     auto v_net_x = build_v_net_x(virtual_net, state, vnr_config, physical.num_nodes, override_v_node_id).unsqueeze(0).to(device);
     inputs.emplace("p_net_x", p_net_x);
     inputs.emplace("p_net_edge_index", edge_index);
@@ -622,6 +823,7 @@ StateView::TensorMap build_inputs_cached(
 }
 
 StateView::TensorMap build_inputs_batch(
+    const PhysicalEncodingCache& encoding_cache,
     const std::vector<std::shared_ptr<StateView>>& states,
     const Network& physical,
     const Network& virtual_net,
@@ -665,8 +867,17 @@ StateView::TensorMap build_inputs_batch(
     for (const auto& view : states) {
         auto& domain = *view->domain_state;
         const int override_v_node_id = view ? static_cast<int>(view->curr_v_node_override) : -1;
-        auto p_net_x = build_p_net_x(physical, virtual_net, domain, vnr_config, override_v_node_id).to(device);
-        auto p_edge_attr = build_p_edge_attr(physical, domain, vnr_config).to(device);
+        auto p_edge_attr_cpu = build_p_edge_attr(encoding_cache, physical, domain, vnr_config);
+        auto p_net_x = build_p_net_x(
+            encoding_cache,
+            physical,
+            virtual_net,
+            domain,
+            vnr_config,
+            p_edge_attr_cpu,
+            override_v_node_id
+        ).to(device);
+        auto p_edge_attr = p_edge_attr_cpu.to(device);
         p_net_x_list.push_back(p_net_x);
         p_edge_attr_list.push_back(p_edge_attr);
         v_net_x_list.push_back(build_v_net_x(virtual_net, domain, vnr_config, physical.num_nodes, override_v_node_id).to(device));
@@ -744,6 +955,7 @@ StateView::TensorMap build_inputs_batch(
 }
 
 Observation build_observation(
+    const PhysicalEncodingCache& encoding_cache,
     const VNRState& state,
     const Network& p_net,
     const Network& v_net,
@@ -757,9 +969,17 @@ Observation build_observation(
     int override_v_node_id = -1
 ) {
     Observation obs;
-    obs.p_net_x = build_p_net_x(p_net, v_net, state, vnr_config, override_v_node_id);
+    obs.p_net_edge_attr = build_p_edge_attr(encoding_cache, p_net, state, vnr_config);
+    obs.p_net_x = build_p_net_x(
+        encoding_cache,
+        p_net,
+        v_net,
+        state,
+        vnr_config,
+        obs.p_net_edge_attr,
+        override_v_node_id
+    );
     obs.p_net_edge_index = edge_index_cpu;
-    obs.p_net_edge_attr = build_p_edge_attr(p_net, state, vnr_config);
     obs.p_net_num_nodes = p_net.num_nodes;
     obs.v_net_x = build_v_net_x(v_net, state, vnr_config, p_net.num_nodes, override_v_node_id).unsqueeze(0);
     if (policy != nullptr) {
@@ -988,8 +1208,9 @@ SolveResult solve_vnr(
         policy = get_cached_policy(policy_path, torch_device);
     }
 
-    auto edge_index_cpu = build_edge_index(physical);
-    auto p_batch_cpu = torch::zeros({physical.num_nodes}, torch::kInt64);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
+    auto p_batch_cpu = encoding_cache.p_batch_cpu;
     auto edge_index = edge_index_cpu;
     auto p_batch = p_batch_cpu;
     if (torch_device.type() == torch::kCUDA) {
@@ -1065,6 +1286,7 @@ SolveResult solve_vnr(
             auto& domain = *view->domain_state;
             auto build_start = std::chrono::high_resolution_clock::now();
             auto inputs = build_inputs_cached(
+                encoding_cache,
                 view,
                 domain,
                 physical,
@@ -1113,6 +1335,7 @@ SolveResult solve_vnr(
                 auto edge_index_batched = get_edge_index_batched(batch_size);
                 auto p_batch_batched = get_p_batch_batched(batch_size);
                 auto inputs = build_inputs_batch(
+                    encoding_cache,
                     states,
                     physical,
                     virtual_net,
@@ -1194,6 +1417,7 @@ SolveResult solve_vnr(
         }
 
         Observation obs = build_observation(
+            encoding_cache,
             replay_state,
             physical,
             virtual_net,
@@ -1434,9 +1658,11 @@ Observation debug_build_observation(
     }
 
     auto policy = get_cached_policy(policy_path, torch_device);
-    auto edge_index_cpu = build_edge_index(physical);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
     auto start_embedding_cpu = policy->start_embedding().to(torch::kCPU);
     return build_observation(
+        encoding_cache,
         root_state,
         physical,
         virtual_net,
@@ -1473,7 +1699,8 @@ Observation debug_build_observation_after_actions(
     }
 
     auto policy = get_cached_policy(policy_path, torch_device);
-    auto edge_index_cpu = build_edge_index(physical);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
     auto start_embedding_cpu = policy->start_embedding().to(torch::kCPU);
     const auto& order = state.virtual_order();
     const auto& selected = state.selected_physical_nodes();
@@ -1481,6 +1708,7 @@ Observation debug_build_observation_after_actions(
         ? order[selected.size()]
         : -1;
     return build_observation(
+        encoding_cache,
         state,
         physical,
         virtual_net,
@@ -1513,11 +1741,13 @@ EvaluationResult debug_evaluate_root(
     }
 
     auto policy = get_cached_policy(policy_path, torch_device);
-    auto edge_index_cpu = build_edge_index(physical);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
     auto edge_index = edge_index_cpu.to(torch_device);
-    auto p_batch = torch::zeros({physical.num_nodes}, torch::TensorOptions().dtype(torch::kInt64).device(torch_device));
+    auto p_batch = encoding_cache.p_batch_cpu.to(torch_device);
     auto start_embedding = policy->start_embedding().to(torch_device);
     auto inputs = build_inputs_cached(
+        encoding_cache,
         nullptr,
         root_state,
         physical,
@@ -1567,9 +1797,10 @@ EvaluationResult debug_evaluate_after_actions(
     }
 
     auto policy = get_cached_policy(policy_path, torch_device);
-    auto edge_index_cpu = build_edge_index(physical);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
     auto edge_index = edge_index_cpu.to(torch_device);
-    auto p_batch = torch::zeros({physical.num_nodes}, torch::TensorOptions().dtype(torch::kInt64).device(torch_device));
+    auto p_batch = encoding_cache.p_batch_cpu.to(torch_device);
     auto start_embedding = policy->start_embedding().to(torch_device);
     auto view = std::make_shared<StateView>();
     const auto& order = state.virtual_order();
@@ -1578,6 +1809,7 @@ EvaluationResult debug_evaluate_after_actions(
         view->curr_v_node_override = order[selected.size()];
     }
     auto inputs = build_inputs_cached(
+        encoding_cache,
         view,
         state,
         physical,
@@ -1627,9 +1859,10 @@ SearchResult debug_search_after_actions(
     }
 
     auto policy = get_cached_policy(policy_path, torch_device);
-    auto edge_index_cpu = build_edge_index(physical);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
     auto edge_index = edge_index_cpu.to(torch_device);
-    auto p_batch = torch::zeros({physical.num_nodes}, torch::TensorOptions().dtype(torch::kInt64).device(torch_device));
+    auto p_batch = encoding_cache.p_batch_cpu.to(torch_device);
     auto start_embedding = policy->start_embedding().to(torch_device);
 
     MCTSEngine engine(search_config);
@@ -1655,6 +1888,7 @@ SearchResult debug_search_after_actions(
     engine.set_evaluate_callback([&](const std::shared_ptr<StateView>& view) {
         auto& domain = *view->domain_state;
         auto inputs = build_inputs_cached(
+            encoding_cache,
             view,
             domain,
             physical,
