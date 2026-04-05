@@ -150,8 +150,11 @@ def test_preflight_k_semantics_parity_smoke_profile() -> None:
 
     assert result['enabled'] is True
     assert result['status'] == 'enforced'
-    assert result['method_count'] == 3
-    for method_key in ('alpha_zero_sfc', 'mcts', 'grc_rank'):
+    # grc_rank is excluded from k_semantics_parity because its link_mapper fallback
+    # (available_shortest) always finds a feasible path regardless of k, so the
+    # fail-at-k=1 property does not hold for it.
+    assert result['method_count'] == 2
+    for method_key in ('alpha_zero_sfc', 'mcts'):
         method_result = result['results'][method_key]
         assert method_result['k_fail_result'] is False
         assert method_result['k_success_result'] is True

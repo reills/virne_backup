@@ -941,11 +941,8 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         return target.get_available_link_resource(edge_id, attr);
     };
     auto paths = path_finder_.find_paths(*p_net_, p_src, p_dst, k, demands, method, capacity_fn);
-    if (paths.empty()) {
-        return false;
-    }
-
-    const std::vector<int>* selected_path = nullptr;
+    std::vector<int> selected_path;
+    bool have_selected_path = false;
     for (const auto& candidate : paths) {
         if (candidate.nodes.size() < 2) {
             continue;
@@ -974,16 +971,55 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
             }
         }
         if (feasible) {
-            selected_path = &candidate.nodes;
+            selected_path = candidate.nodes;
+            have_selected_path = true;
             break;
         }
     }
 
-    if (selected_path == nullptr) {
+    if (!have_selected_path && method != "available_shortest") {
+        auto fallback_paths = path_finder_.find_paths(
+            *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
+        for (const auto& candidate : fallback_paths) {
+            if (candidate.nodes.size() < 2) {
+                continue;
+            }
+            bool feasible = true;
+            auto links = path_to_links(candidate.nodes);
+            for (const auto& [u, v] : links) {
+                auto edge_lookup = p_net_->edge_index.find({u, v});
+                if (edge_lookup == p_net_->edge_index.end()) {
+                    feasible = false;
+                    break;
+                }
+                int edge_id = edge_lookup->second;
+                for (const auto& [attr, demand] : demands) {
+                    if (demand <= 0.0) {
+                        continue;
+                    }
+                    double available = target.get_available_link_resource(edge_id, attr);
+                    if (available + kEpsilon < demand) {
+                        feasible = false;
+                        break;
+                    }
+                }
+                if (!feasible) {
+                    break;
+                }
+            }
+            if (feasible) {
+                selected_path = candidate.nodes;
+                have_selected_path = true;
+                break;
+            }
+        }
+    }
+
+    if (!have_selected_path) {
         return false;
     }
 
-    auto links = path_to_links(*selected_path);
+    auto links = path_to_links(selected_path);
     for (const auto& [u, v] : links) {
         auto edge_lookup = p_net_->edge_index.find({u, v});
         if (edge_lookup == p_net_->edge_index.end()) {

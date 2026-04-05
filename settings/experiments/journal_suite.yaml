@@ -63,7 +63,9 @@ journal_suite:
 
   k_semantics_parity:
     enabled: true
-    method_keys: [alpha_zero_sfc, mcts, grc_rank]
+    # grc_rank excluded: its link_mapper fallback (available_shortest) always finds a
+    # feasible path regardless of k, so the fail-at-k=1 property does not hold for it.
+    method_keys: [alpha_zero_sfc, mcts]
     fail_k_value: 1
     success_k_value: 2
 

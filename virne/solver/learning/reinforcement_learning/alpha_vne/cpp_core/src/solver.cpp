@@ -175,11 +175,11 @@ int current_virtual_node_id(const VNRState& state, int override_v_node_id = -1) 
     if (selected.size() >= total_v_nodes) {
         return -1;
     }
-    int step_idx = static_cast<int>(selected.size());
-    if (step_idx >= static_cast<int>(total_v_nodes)) {
+    const int step_idx = static_cast<int>(selected.size());
+    if (step_idx < 0 || step_idx >= static_cast<int>(total_v_nodes)) {
         return -1;
     }
-    return step_idx;
+    return state.virtual_order()[static_cast<std::size_t>(step_idx)];
 }
 
 std::unordered_map<int, int> build_node_slots(const VNRState& state) {

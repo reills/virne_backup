@@ -66,6 +66,25 @@ def test_available_k_shortest_keeps_feasible_directed_route():
     assert state_after_second.last_physical_node != -1
 
 
+# Regression guard: incremental C++ feasibility checks must mirror Python's
+# fallback from first_shortest to available_shortest instead of pruning a
+# feasible longer route.
+def test_first_shortest_falls_back_to_available_shortest_in_child_expansion():
+    p_net = _build_network(
+        num_nodes=5,
+        edges=[(0, 1), (1, 2), (0, 3), (3, 4), (4, 2)],
+        edge_bw=[0.0, 1.0, 1.0, 1.0, 1.0],
+        directed=True,
+    )
+    v_net = _build_two_node_vnr(demand=1.0)
+
+    state = _make_vnr_state(p_net, v_net, shortest_method="first_shortest", allow_rejection=False, k=8)
+    state_after_first = state.create_child(2)   # place first virtual node
+    state_after_second = state_after_first.create_child(0)  # must use 0 -> 3 -> 2 fallback route
+
+    assert state_after_second.last_physical_node != -1
+
+
 # Regression guard: expansion must never emit out-of-bounds visits when only invalid action -1 exists.
 def test_mcts_expansion_handles_only_invalid_candidate_within_action_bounds():
     p_net = cpp_core.Network()

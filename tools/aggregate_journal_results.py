@@ -540,6 +540,7 @@ def build_run_metrics(summary_rows: pd.DataFrame) -> pd.DataFrame:
                 'run_id': run_id,
                 'run_key': run_key,
                 'summary_path': str(summary_path),
+                'start_run_time': start_run_time,
                 'stage': stage,
                 'topology': topology,
                 'scenario': scenario,
@@ -566,6 +567,7 @@ def build_run_metrics(summary_rows: pd.DataFrame) -> pd.DataFrame:
                 'run_id',
                 'run_key',
                 'summary_path',
+                'start_run_time',
                 'stage',
                 'topology',
                 'scenario',
@@ -586,6 +588,49 @@ def build_run_metrics(summary_rows: pd.DataFrame) -> pd.DataFrame:
         )
 
     return pd.DataFrame(run_rows)
+
+
+def select_latest_runs_per_cell(run_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the latest run for each train/eval experiment cell."""
+    if run_metrics.empty:
+        return run_metrics.copy()
+
+    filtered = run_metrics.copy()
+    filtered['start_run_dt'] = pd.to_datetime(
+        filtered['start_run_time'],
+        format='%Y%m%dT%H%M%S',
+        errors='coerce',
+    )
+
+    stage_groups = {
+        'train': ['method', 'topology', 'scenario', 'seed', 'k_train'],
+        'eval': ['method', 'topology', 'scenario', 'seed', 'k_eval'],
+    }
+
+    keep_frames: list[pd.DataFrame] = []
+    for stage, group_cols in stage_groups.items():
+        stage_rows = filtered[filtered['stage'] == stage].copy()
+        if stage_rows.empty:
+            continue
+        stage_rows = stage_rows.sort_values(
+            ['start_run_dt', 'start_run_time', 'run_id', 'summary_path', 'run_key'],
+            na_position='first',
+        )
+        keep_frames.append(stage_rows.groupby(group_cols, dropna=False).tail(1))
+
+    other_rows = filtered[~filtered['stage'].isin(stage_groups)].copy()
+    if not other_rows.empty:
+        keep_frames.append(other_rows)
+
+    if not keep_frames:
+        return filtered.iloc[0:0].drop(columns=['start_run_dt'], errors='ignore')
+
+    deduped = pd.concat(keep_frames, ignore_index=True)
+    deduped = deduped.sort_values(
+        ['stage', 'method', 'topology', 'scenario', 'seed', 'k_train', 'k_eval', 'start_run_dt', 'run_id'],
+        na_position='first',
+    ).reset_index(drop=True)
+    return deduped.drop(columns=['start_run_dt'], errors='ignore')
 
 
 def attach_training_cost(eval_runs: pd.DataFrame, train_runs: pd.DataFrame) -> pd.DataFrame:
@@ -927,6 +972,7 @@ def aggregate(
     tables_dir: Optional[Path],
     confidence_level: float,
     bootstrap_samples: int,
+    latest_per_cell: bool,
 ) -> dict[str, pd.DataFrame]:
     resolved_results_root = results_root if results_root is not None else suite_root / 'results'
     resolved_tables_dir = tables_dir if tables_dir is not None else suite_root / 'tables'
@@ -936,6 +982,8 @@ def aggregate(
         raise FileNotFoundError(f'No summary.csv files found under {resolved_results_root}')
 
     run_metrics = build_run_metrics(summary_rows)
+    if latest_per_cell:
+        run_metrics = select_latest_runs_per_cell(run_metrics)
     train_runs = run_metrics[run_metrics['stage'] == 'train'].copy()
     eval_runs = run_metrics[run_metrics['stage'] == 'eval'].copy()
     eval_runs = attach_training_cost(eval_runs=eval_runs, train_runs=train_runs)
@@ -997,6 +1045,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=2000,
         help='Number of bootstrap resamples for significance intervals.',
     )
+    parser.add_argument(
+        '--latest-per-cell',
+        action='store_true',
+        help='Keep only the latest train/eval run per (method, topology, scenario, seed, k) cell.',
+    )
     return parser
 
 
@@ -1012,6 +1065,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tables_dir=tables_dir,
         confidence_level=float(args.confidence_level),
         bootstrap_samples=int(args.bootstrap_samples),
+        latest_per_cell=bool(args.latest_per_cell),
     )
     return 0
 

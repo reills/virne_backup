@@ -343,7 +343,12 @@ SearchResult MCTSEngine::run_search(TreeNode& root, std::optional<unsigned int> 
         }
     }
 
-    float root_value = root_state->value.defined() ? root_state->value.item<float>() : 0.0f;
+    float root_value = 0.0f;
+    if (root.visit_count() > 0) {
+        root_value = root.value_sum() / static_cast<float>(root.visit_count());
+    } else if (root_state->value.defined()) {
+        root_value = root_state->value.item<float>();
+    }
 
     return {visit_counts, policy, root_priors, root_value};
 }

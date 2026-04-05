@@ -31,16 +31,19 @@ def _write_run(
         pd.DataFrame(record_rows).to_csv(records_dir / record_name, index=False)
 
 
-def _run_aggregator(suite_root: Path) -> None:
+def _run_aggregator(suite_root: Path, *, latest_per_cell: bool = False) -> None:
+    cmd = [
+        sys.executable,
+        str(AGGREGATOR),
+        '--suite-root',
+        str(suite_root),
+        '--bootstrap-samples',
+        '200',
+    ]
+    if latest_per_cell:
+        cmd.append('--latest-per-cell')
     subprocess.run(
-        [
-            sys.executable,
-            str(AGGREGATOR),
-            '--suite-root',
-            str(suite_root),
-            '--bootstrap-samples',
-            '200',
-        ],
+        cmd,
         check=True,
         cwd=str(REPO_ROOT),
     )
@@ -205,3 +208,76 @@ def test_runtime_falls_back_to_ast_req_when_record_runtime_missing(tmp_path: Pat
     assert abs(row['time_req_mean'] - 2.0) < 1e-9
     assert abs(row['time_req_p95'] - 2.0) < 1e-9
     assert abs(row['timeout_rate'] - 0.0) < 1e-9
+
+
+def test_latest_per_cell_prefers_newest_eval_and_train_runs(tmp_path: Path) -> None:
+    suite_root = tmp_path / 'journal_suite'
+    results_root = suite_root / 'results'
+
+    old_train = 'journal_suite__alpha_zero_sfc__wx100__nominal__seed0__train__ktrain10'
+    new_train = 'journal_suite__alpha_zero_sfc__wx100__nominal__seed0__train__ktrain10__attempt1'
+    for run_id, train_time, start_run_time in (
+        (old_train, 100.0, '20260101T000000'),
+        (new_train, 250.0, '20260102T000000'),
+    ):
+        _write_run(
+            results_root=results_root,
+            solver_name='alpha_zero_sfc',
+            run_id=run_id,
+            summary_row={
+                'solver_name': 'alpha_zero_sfc',
+                'seed': 0,
+                'run_id': run_id,
+                'acceptance_rate': 0.0,
+                'long_term_r2c_ratio': 0.0,
+                'clock_running_time': train_time,
+                'success_count': 0,
+                'early_rejection_count': 0,
+                'place_failure_count': 0,
+                'route_failure_count': 0,
+                'start_run_time': start_run_time,
+            },
+            record_rows=[{'event_type': 1}],
+        )
+
+    old_eval = 'journal_suite__alpha_zero_sfc__wx100__nominal__seed0__eval__keval10__ckptold'
+    new_eval = 'journal_suite__alpha_zero_sfc__wx100__nominal__seed0__eval__keval10__ckptnew'
+    for run_id, acceptance, runtime, start_run_time in (
+        (old_eval, 0.25, 9.0, '20260103T000000'),
+        (new_eval, 0.95, 5.0, '20260104T000000'),
+    ):
+        _write_run(
+            results_root=results_root,
+            solver_name='alpha_zero_sfc',
+            run_id=run_id,
+            summary_row={
+                'solver_name': 'alpha_zero_sfc',
+                'seed': 0,
+                'run_id': run_id,
+                'acceptance_rate': acceptance,
+                'long_term_r2c_ratio': 1.5,
+                'clock_running_time': runtime,
+                'success_count': 2,
+                'early_rejection_count': 0,
+                'place_failure_count': 1,
+                'route_failure_count': 0,
+                'start_run_time': start_run_time,
+            },
+            record_rows=[
+                {'event_type': 1, 'solve_time_sec': runtime / 3.0},
+                {'event_type': 0},
+                {'event_type': 1, 'solve_time_sec': runtime / 3.0},
+                {'event_type': 0},
+                {'event_type': 1, 'solve_time_sec': runtime / 3.0},
+                {'event_type': 0},
+            ],
+        )
+
+    _run_aggregator(suite_root=suite_root, latest_per_cell=True)
+
+    main_metrics = pd.read_csv(suite_root / 'tables' / 'main_metrics.csv')
+    row = main_metrics[(main_metrics['method'] == 'alpha_zero_sfc') & (main_metrics['k_eval'] == 10)].iloc[0]
+    assert row['runs_n'] == 1
+    assert row['seeds_n'] == 1
+    assert abs(row['rac_mean'] - 0.95) < 1e-9
+    assert abs(row['training_cost'] - 250.0) < 1e-9
