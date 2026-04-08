@@ -26,6 +26,8 @@ NUM_V_NETS="${NUM_V_NETS:-1000}"
 TRAIN_NUM_WORKERS="${TRAIN_NUM_WORKERS:-4}"
 EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:-1}"
 TOP_K_CANDIDATES="${TOP_K_CANDIDATES:-24}"
+USE_CPP_MCTS="${USE_CPP_MCTS:-true}"
+PURE_CPP="${PURE_CPP:-true}"
 
 TRAIN_RUN_ID="journal_suite__alpha_zero_sfc__wx100__nominal_cppfix__seed${SEED}__train__ktrain10__${RUN_TAG}"
 EVAL_RUN_ID="journal_suite__alpha_zero_sfc__wx100__nominal_cppfix__seed${SEED}__eval__keval10__${RUN_TAG}"
@@ -51,6 +53,8 @@ echo "Run tag:         $RUN_TAG"
 echo "Stages:          $STAGES"
 echo "Train steps:     $MAX_TRAINING_STEPS"
 echo "Num requests:    $NUM_V_NETS"
+echo "use_cpp_mcts:    $USE_CPP_MCTS"
+echo "pure_cpp:        $PURE_CPP"
 echo
 
 run_train() {
@@ -75,8 +79,8 @@ run_train() {
     training.num_train_steps_per_epoch="$NUM_TRAIN_STEPS_PER_EPOCH" \
     training.max_empty_batches="$MAX_EMPTY_BATCHES" \
     training.save_interval="$SAVE_INTERVAL" \
-    training.pure_cpp=true \
-    training.use_cpp_mcts=true \
+    training.pure_cpp="$PURE_CPP" \
+    training.use_cpp_mcts="$USE_CPP_MCTS" \
     training.use_cuda=true \
     training.use_batched_gpu=false \
     training.distributed_training=true \
@@ -89,6 +93,7 @@ run_train() {
     use_fixed_dataset=true \
     experiment.if_load_p_net=true \
     experiment.if_load_v_nets=true \
+    experiment.num_simulations=0 \
     experiment.seed="$SEED" \
     experiment.run_id="$TRAIN_RUN_ID" \
     experiment.save_root_dir="$RESULTS_ROOT" \
@@ -131,8 +136,8 @@ run_eval() {
     training.enable_async_learner=false \
     training.disable_trajectory_writing=true \
     training.computation_budget="$COMPUTATION_BUDGET" \
-    training.pure_cpp=true \
-    training.use_cpp_mcts=true \
+    training.pure_cpp="$PURE_CPP" \
+    training.use_cpp_mcts="$USE_CPP_MCTS" \
     training.use_cuda=true \
     training.use_batched_gpu=false \
     training.distributed_training=false \
@@ -146,6 +151,7 @@ run_eval() {
     use_fixed_dataset=true \
     experiment.if_load_p_net=true \
     experiment.if_load_v_nets=true \
+    experiment.num_simulations=1 \
     experiment.seed="$SEED" \
     experiment.run_id="$EVAL_RUN_ID" \
     experiment.save_root_dir="$RESULTS_ROOT" \

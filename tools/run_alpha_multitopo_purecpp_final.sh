@@ -46,6 +46,7 @@ common_overrides = [
 
 train_overrides = [
     'training.num_train_epochs=12',
+    'experiment.num_simulations=0',
     'training.c_puct=1.4',
     'training.max_training_steps=1000',
     'training.min_buffer_size=128',

@@ -1030,6 +1030,16 @@ std::vector<float> tensor_to_vector(const torch::Tensor& tensor) {
     return out;
 }
 
+unsigned int derive_step_seed(unsigned int base_seed, int step_idx) {
+    std::uint64_t z = static_cast<std::uint64_t>(base_seed)
+        + 0x9e3779b97f4a7c15ULL
+        + static_cast<std::uint64_t>(std::max(step_idx, 0));
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    z ^= (z >> 31);
+    return static_cast<unsigned int>(z & 0xffffffffULL);
+}
+
 int select_action(
     const std::vector<int>& candidates,
     const std::vector<float>& visit_counts,
@@ -1470,8 +1480,8 @@ SolveResult solve_vnr(
 
         auto mcts_start = std::chrono::high_resolution_clock::now();
         std::optional<unsigned int> step_seed;
-        if (seed && step == 0) {
-            step_seed = static_cast<unsigned int>(*seed);
+        if (seed) {
+            step_seed = derive_step_seed(static_cast<unsigned int>(*seed), step);
         }
         auto search_result = engine.run_search(*current_root, step_seed);
         auto mcts_end = std::chrono::high_resolution_clock::now();

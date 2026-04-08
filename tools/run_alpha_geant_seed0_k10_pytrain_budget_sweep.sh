@@ -79,6 +79,7 @@ for profile_name, spec in profile_specs.items():
             ],
             'train': [
                 'training.num_train_epochs=12',
+                'experiment.num_simulations=0',
                 'training.c_puct=1.4',
                 f'training.max_training_steps={spec[\"steps\"]}',
                 'training.min_buffer_size=128',

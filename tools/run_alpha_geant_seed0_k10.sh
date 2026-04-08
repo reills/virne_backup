@@ -18,6 +18,8 @@ cfg.journal_suite.default_profile = '$PROFILE'
 train_overrides = list(cfg.journal_suite.methods.alpha_zero_sfc.overrides.train)
 if 'training.signal_stop_event_on_learner_complete=true' not in train_overrides:
     train_overrides.append('training.signal_stop_event_on_learner_complete=true')  # Keep enabled: once the learner stops, more actor rollouts do not improve the model.
+if 'experiment.num_simulations=0' not in train_overrides:
+    train_overrides.append('experiment.num_simulations=0')
 cfg.journal_suite.methods.alpha_zero_sfc.overrides.train = train_overrides
 cfg.journal_suite.profiles.$PROFILE = OmegaConf.create({
     'seeds': [0],

@@ -50,6 +50,7 @@ run_train() {
     training.num_workers=4 \
     training.inference_only=false \
     training.num_train_epochs=12 \
+    experiment.num_simulations=0 \
     training.enable_async_learner=true \
     training.disable_trajectory_writing=false \
     training.computation_budget=96 \
@@ -130,6 +131,7 @@ run_eval() {
     use_fixed_dataset=true \
     experiment.if_load_p_net=true \
     experiment.if_load_v_nets=true \
+    experiment.num_simulations=1 \
     experiment.seed=1 \
     experiment.run_id="$EVAL_RUN_ID" \
     experiment.save_root_dir="$RESULTS_ROOT" \

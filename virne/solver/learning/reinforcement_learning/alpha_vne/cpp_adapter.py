@@ -149,6 +149,32 @@ class CppMCTSAdapter:
         self._request_network_ids = (id(p_net), id(v_net))
 
     @staticmethod
+    def _mix_request_seed(base_seed: int, step_idx: int) -> int:
+        z = (int(base_seed) + 0x9E3779B97F4A7C15 + max(int(step_idx), 0)) & ((1 << 64) - 1)
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & ((1 << 64) - 1)
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & ((1 << 64) - 1)
+        z ^= z >> 31
+        return int(z & 0xFFFFFFFF)
+
+    def _search_seed_for_step(self, step_idx: int) -> int | None:
+        base_seed = None
+        try:
+            explicit_request_seed = getattr(self.actor, "_cpp_request_seed", None)
+            if explicit_request_seed is not None:
+                base_seed = int(explicit_request_seed)
+            else:
+                worker_seed = getattr(self.actor, "_cpp_worker_seed", None)
+                if worker_seed is not None:
+                    base_seed = int(worker_seed)
+                else:
+                    base_seed = int(getattr(getattr(self.actor, "config", None).experiment, "seed", None))
+        except Exception:
+            base_seed = None
+        if base_seed is None:
+            return None
+        return self._mix_request_seed(base_seed, step_idx)
+
+    @staticmethod
     def _build_config(
         computation_budget: int,
         c_puct: float,
@@ -192,7 +218,8 @@ class CppMCTSAdapter:
         state_view.curr_v_node_override = int(root_v_node_id)
         state_view.domain_state = cpp_state
 
-        result = self._engine.run_search(state_view)
+        search_seed = self._search_seed_for_step(state_view.step_index)
+        result = self._engine.run_search(state_view, search_seed)
         if result is None:
             return None
 

@@ -61,6 +61,7 @@ conda run -n virne python main.py \
   use_fixed_dataset=true \
   experiment.if_load_p_net=true \
   experiment.if_load_v_nets=true \
+    experiment.num_simulations=1 \
   experiment.seed=0 \
   experiment.run_id="$PY_RUN_ID" \
   experiment.save_root_dir="$RESULTS_ROOT" \
@@ -106,6 +107,7 @@ conda run -n virne python main.py \
   use_fixed_dataset=true \
   experiment.if_load_p_net=true \
   experiment.if_load_v_nets=true \
+    experiment.num_simulations=1 \
   experiment.seed=0 \
   experiment.run_id="$CPP_RUN_ID" \
   experiment.save_root_dir="$RESULTS_ROOT" \

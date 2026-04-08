@@ -605,6 +605,28 @@ def _learner_process_entry(config_path: str, replay_dir: str, models_dir: str, b
     config = OmegaConf.load(config_path)
     logger = Logger(config=config)
     logger.info(f"Learner spawned with config: {config_path}")
+
+    # Seed the learner process explicitly so model init, replay sampling, and
+    # minibatch order are reproducible across reruns with the same config seed.
+    try:
+        import random
+        import numpy as np
+        import torch
+
+        learner_seed = getattr(config.training, 'seed', None)
+        if learner_seed is None:
+            learner_seed = getattr(config.experiment, 'seed', None)
+        if learner_seed is not None:
+            learner_seed = int(learner_seed)
+            random.seed(learner_seed)
+            np.random.seed(learner_seed)
+            torch.manual_seed(learner_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(learner_seed)
+            logger.info(f"Learner RNG seeded with seed={learner_seed}")
+    except Exception as exc:
+        logger.warning(f"Learner RNG seeding failed: {exc}")
+
     try:
         if stop_event is not None:
             stop_event.clear()

@@ -189,3 +189,18 @@ def test_compute_value_prefers_cpp_root_value_without_extra_policy_call():
 
     assert value == pytest.approx(0.25)
     assert policy_network.calls == 0
+
+
+# Regression guard: C++ search seeding must stay tied to the request seed at every placement step.
+def test_cpp_adapter_step_seed_is_deterministic_and_step_specific():
+    from virne.solver.learning.reinforcement_learning.alpha_vne.cpp_adapter import CppMCTSAdapter
+
+    adapter = object.__new__(CppMCTSAdapter)
+    adapter.actor = SimpleNamespace(_cpp_request_seed=12345, _cpp_worker_seed=None, config=None)
+
+    seed_step0_a = adapter._search_seed_for_step(0)
+    seed_step0_b = adapter._search_seed_for_step(0)
+    seed_step1 = adapter._search_seed_for_step(1)
+
+    assert seed_step0_a == seed_step0_b
+    assert seed_step0_a != seed_step1

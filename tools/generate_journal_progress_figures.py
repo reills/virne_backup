@@ -70,7 +70,7 @@ METHOD_ORDER = [
 ]
 TOPOLOGY_ORDER = ["brain", "geant", "wx100"]
 METHOD_LABEL = {
-    "alpha_zero_sfc": "AlphaZero-SFC",
+    "alpha_zero_sfc": "AlphaVne",
     "ppo_dual_gcn+": "PPO-Dual-GCN+",
     "ppo_mlp+": "PPO-MLP+",
     "mcts": "MCTS",
@@ -220,7 +220,7 @@ def plot_nominal_k10_acceptance(rows: list[dict[str, str]], out_path: Path) -> N
     ax.set_xticklabels([t.upper() for t in TOPOLOGY_ORDER], fontsize=11)
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Acceptance Rate", fontsize=12)
-    ax.set_title("Nominal k=10 Acceptance: AlphaZero-SFC vs Benchmarks", fontsize=15, weight="bold")
+    ax.set_title("Nominal k=10 Acceptance: AlphaVne vs Benchmarks", fontsize=15, weight="bold")
     ax.grid(axis="y", alpha=0.2)
     ax.legend(ncol=3, frameon=False, fontsize=10, loc="upper center", bbox_to_anchor=(0.5, -0.08))
     fig.tight_layout()
@@ -269,7 +269,7 @@ def plot_alpha_k_ablation(rows: list[dict[str, str]], out_path: Path) -> None:
 
     ax.set_xlabel("k evaluation budget", fontsize=12)
     ax.set_ylabel("Acceptance Rate", fontsize=12)
-    ax.set_title("AlphaZero-SFC k-Ablation on Nominal Scenarios", fontsize=15, weight="bold")
+    ax.set_title("AlphaVne k-Ablation on Nominal Scenarios", fontsize=15, weight="bold")
     ax.set_xticks([1, 3, 5, 10, 15])
     ax.set_ylim(0, 1.05)
     ax.grid(alpha=0.2)
@@ -293,7 +293,7 @@ def plot_wx500_progress_card(row: dict[str, str], out_path: Path) -> None:
     ax.text(
         0.04,
         0.84,
-        "Manual AlphaZero-SFC eval on nominal wx500 seed0 test set (current available large-scale snapshot)",
+        "Manual AlphaVne eval on nominal wx500 seed0 test set (current available large-scale snapshot)",
         fontsize=10.5,
         color="#374151",
         transform=ax.transAxes,
