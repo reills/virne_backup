@@ -112,4 +112,15 @@ SearchResult debug_search_after_actions(
     const std::string& device
 );
 
+SearchResult debug_search_child_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const SearchConfig& search_config,
+    const std::vector<int>& actions,
+    int focus_action,
+    const std::string& policy_path,
+    const std::string& device
+);
+
 }  // namespace azsfc

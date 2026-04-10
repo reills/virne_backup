@@ -230,6 +230,11 @@ bool MCTSEngine::advance_tree(std::int64_t action) {
     auto child_domain = std::make_shared<VNRState>(state->domain_state->create_child(static_cast<int>(action)));
     auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
     child_state->step_index = state->step_index + 1;
+    // Match Python ObservationBuilder.build(..., v_node_id=None), which passes
+    // `state.v_node_id + 1` through as an explicit v-node id for non-root tree
+    // states. In this codebase that value is the stable-order position, not the
+    // actual virtual-node id, so keep the legacy behavior for parity.
+    child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
     child_state->domain_state = std::move(child_domain);
     tree_root_ = std::make_unique<TreeNode>(nullptr, std::move(child_state), std::nullopt);
     return true;
@@ -466,9 +471,10 @@ float MCTSEngine::expand(TreeNode& node) {
             }
             auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
             child_state->step_index = state->step_index + 1;
-            // Match Python MCTS semantics: non-root child expansion infers the
-            // next virtual-node index from the child state itself rather than
-            // carrying an explicit stable-order override into deeper plies.
+            // Match Python ObservationBuilder.build(..., v_node_id=None), which
+            // forwards `state.v_node_id + 1` as an explicit id for non-root
+            // states. That value is the stable-order position.
+            child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
             child_state->domain_state = std::move(child_domain);
             options.emplace_back(action, std::move(child_state));
         }
@@ -476,6 +482,7 @@ float MCTSEngine::expand(TreeNode& node) {
             auto invalid_child = std::make_shared<VNRState>(state->domain_state->create_child(-1));
             auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
             child_state->step_index = state->step_index + 1;
+            child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
             child_state->domain_state = std::move(invalid_child);
             options.emplace_back(-1, std::move(child_state));
         }

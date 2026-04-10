@@ -32,7 +32,7 @@ from virne.core import Controller, Counter, Recorder
 from virne.core.environment import SolutionStepEnvironment
 from virne.system.base_system import BaseSystem
 from virne.solver.learning.reinforcement_learning.alpha_vne.actor_optimized import OptimizedAlphaZeroActor
-from virne.solver.learning.reinforcement_learning.alpha_vne.node import State
+from virne.solver.learning.reinforcement_learning.alpha_vne.node import Node, State
 from virne.solver.learning.reinforcement_learning.alpha_vne.feature_constructor import AlphaZeroFeatureAdapter
 from tools.compare_alpha_py_cpp_parity import _trace_python_like
 
@@ -446,6 +446,66 @@ def main() -> int:
     visit_top = sorted([(i, int(v)) for i, v in enumerate(visits) if int(v) > 0], key=lambda kv: kv[1], reverse=True)
     visit_top = visit_top[: int(args.topk)]
 
+    py_parent_branch_top: List[Tuple[int, int]] = []
+    cpp_parent_branch_top: List[Tuple[int, int]] = []
+    if prefix_actions:
+        parent_prefix = [int(a) for a in prefix_actions[:-1]]
+        focus_action = int(prefix_actions[-1])
+
+        parent_state = State(
+            p_net,
+            v_net,
+            controller,
+            recorder,
+            counter,
+            link_params={"shortest_method": py_actor.shortest_method, "k": int(py_actor.k_shortest)},
+        )
+        for action in parent_prefix:
+            parent_state = parent_state.next_state(int(action))
+        parent_next_pos = int(getattr(parent_state, "v_node_id", -1)) + 1
+        parent_target_v_node_id = (
+            int(parent_state.v_order[parent_next_pos]) if 0 <= parent_next_pos < len(parent_state.v_order) else parent_next_pos
+        )
+        py_parent_root = Node(None, parent_state)
+        py_actor.search(py_parent_root, parent_target_v_node_id, add_root_noise=False)
+        py_focus_child = next(
+            (child for child in py_parent_root.children if int(getattr(child.state, "p_node_id", -1)) == focus_action),
+            None,
+        )
+        if py_focus_child is not None:
+            py_parent_branch_top = sorted(
+                [
+                    (int(getattr(child.state, "p_node_id", -1)), int(child.visit_times))
+                    for child in py_focus_child.children
+                    if int(child.visit_times) > 0
+                ],
+                key=lambda kv: (-kv[1], kv[0]),
+            )[: int(args.topk)]
+
+        cpp_parent_branch = cpp_core.debug_search_child_after_actions(
+            p_node_attrs,
+            p_edges,
+            p_edge_attrs,
+            bool(p_directed),
+            bool(p_rev_share),
+            v_node_attrs,
+            v_edges,
+            v_edge_attrs,
+            bool(v_directed),
+            bool(v_rev_share),
+            vnr_cfg,
+            search_cfg,
+            parent_prefix,
+            focus_action,
+            policy_ts_path,
+            device,
+        )
+        cpp_parent_branch_visits = list(getattr(cpp_parent_branch, "visit_counts", []))
+        cpp_parent_branch_top = sorted(
+            [(i, int(v)) for i, v in enumerate(cpp_parent_branch_visits) if int(v) > 0],
+            key=lambda kv: (-kv[1], kv[0]),
+        )[: int(args.topk)]
+
     # Full pure-C++ solver (tree reuse) for the same request to extract the
     # exact visit-count distribution at this step.
     with _quiet_stdio(not args.internal_logs):
@@ -521,6 +581,9 @@ def main() -> int:
     print(f"python top probs ={result.python_top_probs}")
     print(f"cpp    top probs ={result.cpp_top_probs}")
     print(f"cpp    top visits={result.cpp_top_visits}")
+    if prefix_actions:
+        print(f"python parent-branch visits after action {prefix_actions[-1]}={py_parent_branch_top}")
+        print(f"cpp    parent-branch visits after action {prefix_actions[-1]}={cpp_parent_branch_top}")
     print(f"cpp    full.solve action@step={result.cpp_full_solve_action} top visits={result.cpp_full_solve_top_visits}")
     print(
         "final_reward "

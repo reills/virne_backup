@@ -661,4 +661,69 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("policy_path"),
         py::arg("device") = "cpu"
     );
+
+    m.def(
+        "debug_search_child_after_actions",
+        [](const std::vector<std::unordered_map<std::string, double>>& p_node_attrs,
+           const std::vector<std::pair<int, int>>& p_edges,
+           const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
+           bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
+           const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
+           const std::vector<std::pair<int, int>>& v_edges,
+           const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
+           bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
+           az::VNRConfig vnr_config,
+           az::SearchConfig search_config,
+           const std::vector<int>& actions,
+           int focus_action,
+           const std::string& policy_path,
+           const std::string& device) {
+            az::Network p_net;
+            p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
+            p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
+            p_net.set_node_attrs(p_node_attrs);
+            if (!p_edge_attrs.empty()) {
+                p_net.set_edge_attrs(p_edge_attrs);
+            }
+
+            az::Network v_net;
+            v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
+            v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
+            v_net.set_node_attrs(v_node_attrs);
+            if (!v_edge_attrs.empty()) {
+                v_net.set_edge_attrs(v_edge_attrs);
+            }
+
+            return az::debug_search_child_after_actions(
+                p_net,
+                v_net,
+                vnr_config,
+                search_config,
+                actions,
+                focus_action,
+                policy_path,
+                device
+            );
+        },
+        py::arg("p_node_attrs"),
+        py::arg("p_edges"),
+        py::arg("p_edge_attrs"),
+        py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
+        py::arg("v_node_attrs"),
+        py::arg("v_edges"),
+        py::arg("v_edge_attrs"),
+        py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
+        py::arg("vnr_config"),
+        py::arg("search_config"),
+        py::arg("actions"),
+        py::arg("focus_action"),
+        py::arg("policy_path"),
+        py::arg("device") = "cpu"
+    );
 }

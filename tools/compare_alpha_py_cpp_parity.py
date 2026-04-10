@@ -308,11 +308,12 @@ def _trace_python_like(actor: OptimizedAlphaZeroActor, v_net, p_net, *, mode: st
 def _trace_cpp_full(actor: OptimizedAlphaZeroActor, v_net, p_net) -> tuple[Solution, SolveTrace]:
     if actor.cpp_full_solver is None:
         raise RuntimeError("Full C++ solver is unavailable for this actor.")
-    cpp_result = actor.cpp_full_solver.solve(p_net, v_net, training=False, pure_cpp=False)
+    cpp_result = actor.cpp_full_solver.solve(p_net, v_net, training=False, pure_cpp=True)
     actions = [int(a) for a in cpp_result.get("actions", [])]
     policies = list(cpp_result.get("policies", []))
+    visit_steps = list(cpp_result.get("visit_counts", []))
     values = list(cpp_result.get("values", []))
-    order_state = State(
+    trace_state = State(
         p_net,
         v_net,
         actor.controller,
@@ -323,7 +324,7 @@ def _trace_cpp_full(actor: OptimizedAlphaZeroActor, v_net, p_net) -> tuple[Solut
             "k": actor.k_shortest,
         },
     )
-    v_order = list(order_state.v_order)
+    v_order = list(trace_state.v_order)
 
     solution = Solution.from_v_net(v_net)
     for step_idx, action in enumerate(actions):
@@ -338,27 +339,35 @@ def _trace_cpp_full(actor: OptimizedAlphaZeroActor, v_net, p_net) -> tuple[Solut
 
     steps: List[StepTrace] = []
     for step_idx, action in enumerate(actions):
+        curr_v_id = int(v_order[step_idx]) if step_idx < len(v_order) else step_idx
+        candidate_actions = [int(x) for x in trace_state.get_candidate_node_ids(v_target=curr_v_id)]
         policy = policies[step_idx] if step_idx < len(policies) else []
+        visits = visit_steps[step_idx] if step_idx < len(visit_steps) else []
+        visit_map = {
+            idx: int(float(count))
+            for idx, count in enumerate(visits)
+            if float(count) > 0.0
+        }
         policy_map = {
             idx: float(prob)
             for idx, prob in enumerate(policy)
             if float(prob) > 0.0
         }
-        v_node_id = int(v_order[step_idx]) if step_idx < len(v_order) else step_idx
         steps.append(
             StepTrace(
                 step_idx=step_idx,
-                v_node_id=v_node_id,
+                v_node_id=curr_v_id,
                 chosen_action=int(action),
-                candidate_actions=[],
-                child_visit_counts={},
+                candidate_actions=candidate_actions,
+                child_visit_counts=visit_map,
                 child_priors=policy_map,
                 root_value=float(values[step_idx]) if step_idx < len(values) else None,
-                effective_sims=None,
+                effective_sims=sum(visit_map.values()) if visit_map else None,
                 place_result=None,
                 place_info=None,
             )
         )
+        trace_state = trace_state.next_state(int(action))
 
     return solution, SolveTrace(
         mode="cpp_full",

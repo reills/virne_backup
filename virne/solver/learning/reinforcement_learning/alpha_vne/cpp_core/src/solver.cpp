@@ -1025,6 +1025,53 @@ std::vector<float> tensor_to_vector(const torch::Tensor& tensor) {
     return out;
 }
 
+SearchResult build_search_result_from_tree_node(const TreeNode& node) {
+    auto state = node.state();
+    int64_t num_actions = 0;
+    if (state) {
+        num_actions = state->num_actions();
+        if (num_actions <= 0 && state->domain_state) {
+            num_actions = state->domain_state->action_space_size();
+        }
+    }
+
+    int64_t max_action = -1;
+    for (const auto& [action, _child] : node.children_ref()) {
+        max_action = std::max<int64_t>(max_action, action);
+    }
+    if (max_action >= 0) {
+        num_actions = std::max<int64_t>(num_actions, max_action + 1);
+    }
+    if (num_actions <= 0) {
+        num_actions = 1;
+    }
+
+    auto visit_counts = torch::zeros({num_actions}, torch::kFloat32);
+    auto root_priors = torch::zeros({num_actions}, torch::kFloat32);
+    for (const auto& [action, child] : node.children_ref()) {
+        if (!child || action < 0 || action >= num_actions) {
+            continue;
+        }
+        visit_counts[action] = static_cast<float>(child->visit_count());
+        root_priors[action] = child->prior();
+    }
+
+    auto policy = visit_counts.clone();
+    float total_visits = policy.sum().item<float>();
+    if (total_visits > 0.0f) {
+        policy /= total_visits;
+    }
+
+    float root_value = 0.0f;
+    if (node.visit_count() > 0) {
+        root_value = static_cast<float>(node.value_sum() / static_cast<double>(node.visit_count()));
+    } else if (state && state->value.defined()) {
+        root_value = state->value.item<float>();
+    }
+
+    return {visit_counts, policy, root_priors, root_value};
+}
+
 unsigned int derive_step_seed(unsigned int base_seed, int step_idx) {
     std::uint64_t z = static_cast<std::uint64_t>(base_seed)
         + 0x9e3779b97f4a7c15ULL
@@ -1882,11 +1929,7 @@ SearchResult debug_search_after_actions(
             child_view->id = action;
             child_view->step_index = view->step_index + 1;
             child_view->domain_state = std::make_shared<VNRState>(domain.create_child(action));
-            const auto& order = child_view->domain_state->virtual_order();
-            const auto& selected = child_view->domain_state->selected_physical_nodes();
-            if (selected.size() < order.size()) {
-                child_view->curr_v_node_override = order[selected.size()];
-            }
+            child_view->curr_v_node_override = static_cast<std::int64_t>(child_view->step_index);
             children.emplace_back(action, std::move(child_view));
         }
         return children;
@@ -1944,6 +1987,108 @@ SearchResult debug_search_after_actions(
     }
     root->domain_state = std::make_shared<VNRState>(state);
     return engine.run_search(root);
+}
+
+SearchResult debug_search_child_after_actions(
+    const Network& physical,
+    const Network& virtual_net,
+    const VNRConfig& vnr_config,
+    const SearchConfig& search_config,
+    const std::vector<int>& actions,
+    int focus_action,
+    const std::string& policy_path,
+    const std::string& device
+) {
+    VNRState state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
+    for (int action : actions) {
+        state = state.create_child(action);
+    }
+
+    const int num_actions = physical.num_nodes + (vnr_config.allow_rejection ? 1 : 0);
+    const int reject_idx = physical.num_nodes;
+    torch::Device torch_device = torch::kCPU;
+    if (device == "cuda" || device == "cuda:0") {
+        torch_device = torch::kCUDA;
+    }
+
+    auto policy = get_cached_policy(policy_path, torch_device);
+    auto encoding_cache = build_physical_encoding_cache(physical, vnr_config);
+    auto edge_index_cpu = encoding_cache.edge_index_cpu;
+    auto edge_index = edge_index_cpu.to(torch_device);
+    auto p_batch = encoding_cache.p_batch_cpu.to(torch_device);
+    auto start_embedding = policy->start_embedding().to(torch_device);
+
+    MCTSEngine engine(search_config);
+    engine.set_expand_callback([&](const std::shared_ptr<StateView>& view) {
+        std::vector<std::pair<int64_t, std::shared_ptr<StateView>>> children;
+        const auto& domain = *view->domain_state;
+        const auto candidates = domain.get_candidate_nodes();
+        children.reserve(candidates.size());
+        for (int action : candidates) {
+            auto child_view = std::make_shared<StateView>();
+            child_view->id = action;
+            child_view->step_index = view->step_index + 1;
+            child_view->domain_state = std::make_shared<VNRState>(domain.create_child(action));
+            child_view->curr_v_node_override = static_cast<std::int64_t>(child_view->step_index);
+            children.emplace_back(action, std::move(child_view));
+        }
+        return children;
+    });
+    engine.set_evaluate_callback([&](const std::shared_ptr<StateView>& view) {
+        auto& domain = *view->domain_state;
+        auto inputs = build_inputs_cached(
+            encoding_cache,
+            view,
+            domain,
+            physical,
+            virtual_net,
+            vnr_config,
+            *policy,
+            edge_index,
+            p_batch,
+            num_actions,
+            vnr_config.allow_rejection,
+            reject_idx,
+            start_embedding,
+            torch_device
+        );
+        auto eval = policy->evaluate(inputs);
+        if (eval.policy_logits.defined() && eval.policy_logits.dim() > 1) {
+            eval.policy_logits = eval.policy_logits.squeeze(0);
+        }
+        if (eval.policy_logits.defined()) {
+            eval.policy_logits = eval.policy_logits.to(torch::kCPU);
+        }
+        if (eval.value.defined()) {
+            eval.value = eval.value.to(torch::kCPU);
+        }
+        auto mask_it = inputs.find("action_mask");
+        if (mask_it != inputs.end()) {
+            view->action_mask = mask_it->second.squeeze(0).to(torch::kBool);
+        }
+        view->policy_logits = eval.policy_logits;
+        view->value = eval.value;
+        return eval;
+    });
+    engine.set_terminal_check_callback([](const std::shared_ptr<StateView>& view) {
+        return view->domain_state->is_terminal();
+    });
+    engine.set_terminal_value_callback([](const std::shared_ptr<StateView>& view) {
+        return view->domain_state->compute_final_reward();
+    });
+
+    auto root = std::make_shared<StateView>();
+    root->id = 0;
+    root->step_index = static_cast<std::int64_t>(state.selected_physical_nodes().size());
+    root->domain_state = std::make_shared<VNRState>(state);
+    TreeNode root_node(nullptr, root, std::nullopt);
+    (void)engine.run_search(root_node);
+
+    TreeNode* child = root_node.child_for_action(focus_action);
+    if (child == nullptr) {
+        return build_search_result_from_tree_node(root_node);
+    }
+    return build_search_result_from_tree_node(*child);
 }
 
 }  // namespace azsfc
