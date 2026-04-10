@@ -183,6 +183,7 @@ private:
     double get_allocated_node_resource(int node_id, const std::string& attr) const;
     double get_allocated_link_resource(int edge_id, const std::string& attr) const;
     void update_node_allocations(int p_node_id, int v_node_id, AllocationDelta& delta) const;
+    int canonical_link_edge_id(int edge_id) const;
     bool reserve_link_resources(int new_virtual_node, int new_physical_node, VNRState& target, AllocationDelta& delta) const;
     bool reserve_path_for_virtual_edge(int v_src,
                                        int v_dst,

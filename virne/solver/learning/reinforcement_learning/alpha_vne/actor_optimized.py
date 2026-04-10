@@ -331,7 +331,7 @@ class OptimizedAlphaZeroActor(Solver):
             next_pos = current_node.state.v_node_id + 1
             curr_v_id = current_node.state.v_order[next_pos]
             t_mcts = time.perf_counter()
-            self.search(current_node, curr_v_id)
+            self.search(current_node, curr_v_id, add_root_noise=training)
             timers["mcts_ms"] += (time.perf_counter() - t_mcts) * 1000.0
             try:
                 timers["total_simulations"] += sum(child.visit_times for child in current_node.children)
@@ -463,17 +463,18 @@ class OptimizedAlphaZeroActor(Solver):
     # AlphaZero MCTS Implementation (Optimized)
     # ------------------------------------------------------------------
     
-    def search(self, root_node: Node, v_node_id: int) -> None:
+    def search(self, root_node: Node, v_node_id: int, add_root_noise: bool = True) -> None:
         """Dispatch to C++ engine when available, otherwise use Python MCTSEngine."""
         if getattr(self, "cpp_adapter", None) is not None:
             try:
-                result = self.cpp_adapter.run_search(root_node, v_node_id)
+                result = self.cpp_adapter.run_search(root_node, v_node_id, add_root_noise=add_root_noise)
                 if result is not None:
+                    root_node._cpp_search_pending_advance = True
                     return
             except Exception as exc:
                 self.logger.warning(f"C++ MCTS search failed, falling back to Python: {exc}")
         # Delegate to MCTSEngine
-        self.mcts_engine.search(root_node, v_node_id)
+        self.mcts_engine.search(root_node, v_node_id, add_root_dirichlet_noise=add_root_noise)
 
     def get_action_selection_temperature(self, training: bool, move_index: int | None = None) -> float:
         """Return action-selection temperature for current episode."""
@@ -532,7 +533,17 @@ class OptimizedAlphaZeroActor(Solver):
                 logger.error(msg)
             raise ValueError(msg)
 
-        return self.mcts_engine.select_best_child(node, temperature)
+        best = self.mcts_engine.select_best_child(node, temperature)
+        if best is None:
+            return None
+        if bool(getattr(node, "_cpp_search_pending_advance", False)) and getattr(self, "cpp_adapter", None) is not None:
+            try:
+                self.cpp_adapter.advance_root(int(best.state.p_node_id))
+            except Exception:
+                # Best-effort: keep Python path running even if adapter state drifts.
+                pass
+            node._cpp_search_pending_advance = False
+        return best
 
     def get_num_actions(self) -> int:
         """Get the number of actions in the action space (for cpp_adapter).
@@ -1335,7 +1346,7 @@ class OptimizedAlphaZeroActor(Solver):
             # Use actual virtual node id under stable ordering
             next_pos = current_node.state.v_node_id + 1
             curr_v_id = current_node.state.v_order[next_pos]
-            self.search(current_node, curr_v_id)
+            self.search(current_node, curr_v_id, add_root_noise=training)
 
             try:
                 best_child = self._select_best_child(current_node, temperature=temperature)

@@ -58,20 +58,20 @@ void TreeNode::update_stats(float leaf_value) {
 
 TreeNode* TreeNode::best_child(float c_puct) {
     TreeNode* best = nullptr;
-    float best_score = -std::numeric_limits<float>::infinity();
-    float total_visits = 0.0f;
+    double best_score = -std::numeric_limits<double>::infinity();
+    double total_visits = 0.0;
     for (const auto& [action, child_ptr] : children_) {
         (void)action;
-        total_visits += static_cast<float>(child_ptr->visit_count());
+        total_visits += static_cast<double>(child_ptr->visit_count());
     }
-    float sqrt_total = std::sqrt(total_visits + 1.0f);
+    double sqrt_total = std::sqrt(total_visits + 1.0);
 
     for (auto& [action, child_ptr] : children_) {
         TreeNode* child = child_ptr.get();
-        float child_visits = static_cast<float>(child->visit_count_);
-        float mean_value = child->visit_count_ > 0 ? child->value_sum_ / child_visits : 0.0f;
-        float exploration = c_puct * child->prior_ * sqrt_total / (1.0f + child_visits);
-        float score = mean_value + exploration - child->virtual_loss_;
+        double child_visits = static_cast<double>(child->visit_count_);
+        double mean_value = child->visit_count_ > 0 ? child->value_sum_ / child_visits : 0.0;
+        double exploration = static_cast<double>(c_puct) * static_cast<double>(child->prior_) * sqrt_total / (1.0 + child_visits);
+        double score = mean_value + exploration - child->virtual_loss_;
 
         if (score > best_score) {
             best_score = score;

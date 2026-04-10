@@ -66,6 +66,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         .def_readwrite("num_nodes", &az::Network::num_nodes)
         .def_readwrite("num_edges", &az::Network::num_edges)
         .def_readwrite("directed", &az::Network::directed)
+        .def_readwrite("reverse_edge_pairs_share_capacity", &az::Network::reverse_edge_pairs_share_capacity)
         .def("set_num_nodes", &az::Network::set_num_nodes, py::arg("num_nodes"))
         .def("set_edges", &az::Network::set_edges, py::arg("edges"), py::arg("is_directed") = false)
         .def("set_node_attrs", &az::Network::set_node_attrs, py::arg("attrs"))
@@ -193,6 +194,20 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
                 return engine.run_search(root_state, seed);
             },
             py::arg("root_state"),
+            py::arg("seed") = py::none())
+        .def("reset_tree", &az::MCTSEngine::reset_tree, py::arg("root_state"))
+        .def("clear_tree", &az::MCTSEngine::clear_tree)
+        .def("advance_tree", &az::MCTSEngine::advance_tree, py::arg("action"))
+        .def("tree_root_state", &az::MCTSEngine::tree_root_state)
+        .def("run_search_tree",
+            [](az::MCTSEngine& engine, py::object seed_obj) {
+                std::optional<unsigned int> seed;
+                if (!seed_obj.is_none()) {
+                    seed = seed_obj.cast<unsigned int>();
+                }
+                py::gil_scoped_release release;
+                return engine.run_search_tree(seed);
+            },
             py::arg("seed") = py::none());
 
     py::class_<az::PolicyNetwork>(m, "PolicyNetwork")
@@ -217,10 +232,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::vector<std::pair<int, int>>& p_edges,
            const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
            bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
            const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
            const std::vector<std::pair<int, int>>& v_edges,
            const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
            bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
            az::VNRConfig vnr_config,
            az::SearchConfig search_config,
            const std::string& policy_path,
@@ -239,6 +256,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
             p_net.set_node_attrs(p_node_attrs);
             if (!p_edge_attrs.empty()) {
                 p_net.set_edge_attrs(p_edge_attrs);
@@ -247,6 +265,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network v_net;
             v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
             v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
             v_net.set_node_attrs(v_node_attrs);
             if (!v_edge_attrs.empty()) {
                 v_net.set_edge_attrs(v_edge_attrs);
@@ -280,6 +299,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             py::dict out;
             out["actions"] = result.actions;
             out["policies"] = result.policies;
+            out["visit_counts"] = result.visit_counts;
             out["values"] = result.values;
             out["rejected"] = result.rejected;
             out["place_result"] = result.place_result;
@@ -329,10 +349,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("p_edges"),
         py::arg("p_edge_attrs"),
         py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
         py::arg("v_node_attrs"),
         py::arg("v_edges"),
         py::arg("v_edge_attrs"),
         py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
         py::arg("vnr_config"),
         py::arg("search_config"),
         py::arg("policy_path"),
@@ -356,16 +378,19 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::vector<std::pair<int, int>>& p_edges,
            const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
            bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
            const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
            const std::vector<std::pair<int, int>>& v_edges,
            const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
            bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
            az::VNRConfig vnr_config,
            const std::string& policy_path,
            const std::string& device) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
             p_net.set_node_attrs(p_node_attrs);
             if (!p_edge_attrs.empty()) {
                 p_net.set_edge_attrs(p_edge_attrs);
@@ -374,6 +399,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network v_net;
             v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
             v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
             v_net.set_node_attrs(v_node_attrs);
             if (!v_edge_attrs.empty()) {
                 v_net.set_edge_attrs(v_edge_attrs);
@@ -397,10 +423,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("p_edges"),
         py::arg("p_edge_attrs"),
         py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
         py::arg("v_node_attrs"),
         py::arg("v_edges"),
         py::arg("v_edge_attrs"),
         py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
         py::arg("vnr_config"),
         py::arg("policy_path"),
         py::arg("device") = "cpu"
@@ -412,10 +440,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::vector<std::pair<int, int>>& p_edges,
            const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
            bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
            const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
            const std::vector<std::pair<int, int>>& v_edges,
            const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
            bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
            az::VNRConfig vnr_config,
            const std::vector<int>& actions,
            const std::string& policy_path,
@@ -423,6 +453,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
             p_net.set_node_attrs(p_node_attrs);
             if (!p_edge_attrs.empty()) {
                 p_net.set_edge_attrs(p_edge_attrs);
@@ -431,6 +462,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network v_net;
             v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
             v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
             v_net.set_node_attrs(v_node_attrs);
             if (!v_edge_attrs.empty()) {
                 v_net.set_edge_attrs(v_edge_attrs);
@@ -454,10 +486,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("p_edges"),
         py::arg("p_edge_attrs"),
         py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
         py::arg("v_node_attrs"),
         py::arg("v_edges"),
         py::arg("v_edge_attrs"),
         py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
         py::arg("vnr_config"),
         py::arg("actions"),
         py::arg("policy_path"),
@@ -470,16 +504,19 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::vector<std::pair<int, int>>& p_edges,
            const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
            bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
            const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
            const std::vector<std::pair<int, int>>& v_edges,
            const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
            bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
            az::VNRConfig vnr_config,
            const std::string& policy_path,
            const std::string& device) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
             p_net.set_node_attrs(p_node_attrs);
             if (!p_edge_attrs.empty()) {
                 p_net.set_edge_attrs(p_edge_attrs);
@@ -488,6 +525,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network v_net;
             v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
             v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
             v_net.set_node_attrs(v_node_attrs);
             if (!v_edge_attrs.empty()) {
                 v_net.set_edge_attrs(v_edge_attrs);
@@ -503,10 +541,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("p_edges"),
         py::arg("p_edge_attrs"),
         py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
         py::arg("v_node_attrs"),
         py::arg("v_edges"),
         py::arg("v_edge_attrs"),
         py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
         py::arg("vnr_config"),
         py::arg("policy_path"),
         py::arg("device") = "cpu"
@@ -518,10 +558,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::vector<std::pair<int, int>>& p_edges,
            const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
            bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
            const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
            const std::vector<std::pair<int, int>>& v_edges,
            const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
            bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
            az::VNRConfig vnr_config,
            const std::vector<int>& actions,
            const std::string& policy_path,
@@ -529,6 +571,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
             p_net.set_node_attrs(p_node_attrs);
             if (!p_edge_attrs.empty()) {
                 p_net.set_edge_attrs(p_edge_attrs);
@@ -537,6 +580,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network v_net;
             v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
             v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
             v_net.set_node_attrs(v_node_attrs);
             if (!v_edge_attrs.empty()) {
                 v_net.set_edge_attrs(v_edge_attrs);
@@ -552,10 +596,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("p_edges"),
         py::arg("p_edge_attrs"),
         py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
         py::arg("v_node_attrs"),
         py::arg("v_edges"),
         py::arg("v_edge_attrs"),
         py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
         py::arg("vnr_config"),
         py::arg("actions"),
         py::arg("policy_path"),
@@ -568,10 +614,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
            const std::vector<std::pair<int, int>>& p_edges,
            const std::vector<std::unordered_map<std::string, double>>& p_edge_attrs,
            bool p_directed,
+           bool p_reverse_edge_pairs_share_capacity,
            const std::vector<std::unordered_map<std::string, double>>& v_node_attrs,
            const std::vector<std::pair<int, int>>& v_edges,
            const std::vector<std::unordered_map<std::string, double>>& v_edge_attrs,
            bool v_directed,
+           bool v_reverse_edge_pairs_share_capacity,
            az::VNRConfig vnr_config,
            az::SearchConfig search_config,
            const std::vector<int>& actions,
@@ -580,6 +628,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network p_net;
             p_net.set_num_nodes(static_cast<int>(p_node_attrs.size()));
             p_net.set_edges(p_edges, p_directed);
+            p_net.reverse_edge_pairs_share_capacity = p_reverse_edge_pairs_share_capacity;
             p_net.set_node_attrs(p_node_attrs);
             if (!p_edge_attrs.empty()) {
                 p_net.set_edge_attrs(p_edge_attrs);
@@ -588,6 +637,7 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
             az::Network v_net;
             v_net.set_num_nodes(static_cast<int>(v_node_attrs.size()));
             v_net.set_edges(v_edges, v_directed);
+            v_net.reverse_edge_pairs_share_capacity = v_reverse_edge_pairs_share_capacity;
             v_net.set_node_attrs(v_node_attrs);
             if (!v_edge_attrs.empty()) {
                 v_net.set_edge_attrs(v_edge_attrs);
@@ -599,10 +649,12 @@ PYBIND11_MODULE(alpha_zero_cpp_core, m) {
         py::arg("p_edges"),
         py::arg("p_edge_attrs"),
         py::arg("p_directed"),
+        py::arg("p_reverse_edge_pairs_share_capacity") = false,
         py::arg("v_node_attrs"),
         py::arg("v_edges"),
         py::arg("v_edge_attrs"),
         py::arg("v_directed"),
+        py::arg("v_reverse_edge_pairs_share_capacity") = false,
         py::arg("vnr_config"),
         py::arg("search_config"),
         py::arg("actions"),

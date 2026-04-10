@@ -34,7 +34,7 @@ public:
     float prior() const noexcept { return prior_; }
     void set_prior(float p) noexcept { prior_ = p; }
 
-    float value_sum() const noexcept { return value_sum_; }
+    double value_sum() const noexcept { return value_sum_; }
 
     void update_stats(float leaf_value);
 
@@ -54,8 +54,8 @@ private:
     std::optional<int64_t> action_from_parent_;
 
     float prior_{0.0f};
-    float value_sum_{0.0f};
-    float virtual_loss_{0.0f};
+    double value_sum_{0.0};
+    double virtual_loss_{0.0};
     std::size_t visit_count_{0};
     bool terminal_{false};
 

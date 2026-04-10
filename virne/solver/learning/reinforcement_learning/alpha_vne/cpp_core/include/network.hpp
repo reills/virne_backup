@@ -30,6 +30,7 @@ struct Network {
     int num_nodes{0};
     int num_edges{0};
     bool directed{false};
+    bool reverse_edge_pairs_share_capacity{false};
 
     // Node adjacency: node -> [(neighbor, edge_id)]
     std::vector<std::vector<std::pair<int, int>>> adjacency;

@@ -238,7 +238,8 @@ void VNRState::rebuild_allocation_totals_cache() const {
             }
         }
         for (const auto& [edge_id, resources] : cursor->link_allocations) {
-            auto& out = link_allocation_totals_cache_[edge_id];
+            int canonical_edge_id = canonical_link_edge_id(edge_id);
+            auto& out = link_allocation_totals_cache_[canonical_edge_id];
             for (const auto& [attr, value] : resources) {
                 if (value <= 0.0) {
                     continue;
@@ -272,10 +273,30 @@ double VNRState::get_allocated_node_resource(int node_id, const std::string& att
     return attr_it->second;
 }
 
+int VNRState::canonical_link_edge_id(int edge_id) const {
+    if (!p_net_ || edge_id < 0 || edge_id >= p_net_->num_edges) {
+        return edge_id;
+    }
+    if (!p_net_->reverse_edge_pairs_share_capacity) {
+        return edge_id;
+    }
+    const auto& edge = p_net_->edges[static_cast<std::size_t>(edge_id)];
+    auto reverse_it = p_net_->edge_index.find({edge.second, edge.first});
+    if (reverse_it == p_net_->edge_index.end()) {
+        return edge_id;
+    }
+    int reverse_edge_id = reverse_it->second;
+    if (reverse_edge_id < 0 || reverse_edge_id >= p_net_->num_edges) {
+        return edge_id;
+    }
+    return std::min(edge_id, reverse_edge_id);
+}
+
 double VNRState::get_allocated_link_resource(int edge_id, const std::string& attr) const {
     if (!allocation_totals_cache_valid_) {
         rebuild_allocation_totals_cache();
     }
+    edge_id = canonical_link_edge_id(edge_id);
     auto edge_it = link_allocation_totals_cache_.find(edge_id);
     if (edge_it == link_allocation_totals_cache_.end()) {
         return 0.0;
@@ -1025,7 +1046,7 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         if (edge_lookup == p_net_->edge_index.end()) {
             return false;
         }
-        int edge_id = edge_lookup->second;
+        int edge_id = canonical_link_edge_id(edge_lookup->second);
         for (const auto& [attr, demand] : demands) {
             if (demand <= 0.0) {
                 continue;

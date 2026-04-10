@@ -28,6 +28,7 @@ struct SolveMetrics {
 struct SolveResult {
     std::vector<int> actions;
     std::vector<std::vector<float>> policies;
+    std::vector<std::vector<float>> visit_counts;
     std::vector<float> values;
     bool rejected{false};
     bool place_result{true};

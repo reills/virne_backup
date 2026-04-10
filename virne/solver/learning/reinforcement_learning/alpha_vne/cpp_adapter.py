@@ -98,23 +98,15 @@ class CppMCTSAdapter:
 
         self.actor = actor
         self.use_neural_network = bool(use_neural_network)
-        self._engine = cpp_core.MCTSEngine(
-            self._build_config(
-                computation_budget,
-                c_puct,
-                dirichlet_alpha,
-                dirichlet_epsilon,
-                int(getattr(actor, "top_k_candidates", 0)),
-                self.use_neural_network,
-                rollout_depth_limit,
-            )
-        )
-        self._engine.set_callbacks(
-            self._expand_callback,
-            self._evaluate_callback if self.use_neural_network else self._evaluate_callback_plain,
-            self._terminal_value_callback,
-            self._terminal_check_callback,
-        )
+        self._computation_budget = int(computation_budget)
+        self._c_puct = float(c_puct)
+        self._dirichlet_alpha = float(dirichlet_alpha)
+        self._dirichlet_epsilon = float(dirichlet_epsilon)
+        self._top_k_candidates = int(getattr(actor, "top_k_candidates", 0))
+        self._rollout_depth_limit = int(rollout_depth_limit)
+        self._engine_add_root_noise = True
+        self._engine = self._make_engine(add_root_noise=self._engine_add_root_noise)
+        self._tree_pending_reset = True
         self._state_registry: Dict[int, State] = {}
         self._vnode_override: Dict[int, int] = {}
         self._cpp_p_network: cpp_core.Network | None = None
@@ -147,6 +139,25 @@ class CppMCTSAdapter:
         """Mark a request boundary for per-request network snapshot caching."""
         self._request_generation += 1
         self._request_network_ids = (id(p_net), id(v_net))
+        self._tree_pending_reset = True
+        try:
+            if hasattr(self._engine, "clear_tree"):
+                self._engine.clear_tree()
+        except Exception:
+            pass
+
+    def advance_root(self, action: int) -> bool:
+        """Advance the persistent C++ tree root after an action is selected."""
+        try:
+            if not hasattr(self._engine, "advance_tree"):
+                return False
+            ok = bool(self._engine.advance_tree(int(action)))
+            if not ok:
+                self._tree_pending_reset = True
+            return ok
+        except Exception:
+            self._tree_pending_reset = True
+            return False
 
     @staticmethod
     def _mix_request_seed(base_seed: int, step_idx: int) -> int:
@@ -181,6 +192,7 @@ class CppMCTSAdapter:
         dirichlet_alpha: float,
         dirichlet_epsilon: float,
         top_k_candidates: int,
+        add_root_noise: bool = True,
         use_neural_network: bool = True,
         rollout_depth_limit: int = 100,
     ) -> cpp_core.SearchConfig:
@@ -190,16 +202,42 @@ class CppMCTSAdapter:
         cfg.dirichlet_alpha = float(dirichlet_alpha)
         cfg.dirichlet_epsilon = float(dirichlet_epsilon)
         cfg.top_k_candidates = int(top_k_candidates)
+        cfg.add_root_noise = bool(add_root_noise)
         cfg.use_neural_network = bool(use_neural_network)
         cfg.rollout_depth_limit = int(rollout_depth_limit)
         return cfg
 
+    def _make_engine(self, add_root_noise: bool) -> cpp_core.MCTSEngine:
+        engine = cpp_core.MCTSEngine(
+            self._build_config(
+                self._computation_budget,
+                self._c_puct,
+                self._dirichlet_alpha,
+                self._dirichlet_epsilon,
+                self._top_k_candidates,
+                add_root_noise=add_root_noise,
+                use_neural_network=self.use_neural_network,
+                rollout_depth_limit=self._rollout_depth_limit,
+            )
+        )
+        engine.set_callbacks(
+            self._expand_callback,
+            self._evaluate_callback if self.use_neural_network else self._evaluate_callback_plain,
+            self._terminal_value_callback,
+            self._terminal_check_callback,
+        )
+        return engine
+
     # ------------------------------------------------------------------ API ------------------------------------------------------------------
 
-    def run_search(self, root_node: Node, root_v_node_id: int) -> Optional[cpp_core.SearchResult]:
+    def run_search(self, root_node: Node, root_v_node_id: int, add_root_noise: bool = True) -> Optional[cpp_core.SearchResult]:
         """Run the C++ search and project the result back to the Python tree."""
         if cpp_core is None:
             return None
+        if bool(add_root_noise) != self._engine_add_root_noise:
+            self._engine = self._make_engine(add_root_noise=bool(add_root_noise))
+            self._engine_add_root_noise = bool(add_root_noise)
+            self._tree_pending_reset = True
 
         self._state_registry.clear()
         self._vnode_override.clear()
@@ -209,17 +247,41 @@ class CppMCTSAdapter:
         self._vnode_override[root_state_id] = root_v_node_id
         self._ensure_cpp_networks(root_state)
 
-        cpp_state = self._initialize_cpp_state(root_state)
-        root_state._cpp_state = cpp_state
-        root_state._cpp_network_cache_key = self._active_network_cache_key
+        use_persistent = bool(hasattr(self._engine, "reset_tree") and hasattr(self._engine, "run_search_tree"))
+        cpp_state = None
+        state_view = None
+        if use_persistent:
+            # Keep a persistent search tree so subtree statistics carry over across steps.
+            if self._tree_pending_reset or self._engine.tree_root_state() is None:
+                cpp_state = self._initialize_cpp_state(root_state)
+                root_state._cpp_state = cpp_state
+                root_state._cpp_network_cache_key = self._active_network_cache_key
+                state_view = cpp_core.StateView(root_state_id)
+                state_view.step_index = len(root_state.selected_p_net_nodes)
+                state_view.curr_v_node_override = int(root_v_node_id)
+                state_view.domain_state = cpp_state
+                self._engine.reset_tree(state_view)
+                self._tree_pending_reset = False
+            else:
+                state_view = self._engine.tree_root_state()
+                # Keep step index / v-node override aligned with the Python actor.
+                state_view.step_index = len(root_state.selected_p_net_nodes)
+                state_view.curr_v_node_override = int(root_v_node_id)
+                cpp_state = getattr(state_view, "domain_state", None)
+            search_seed = self._search_seed_for_step(int(state_view.step_index))
+            result = self._engine.run_search_tree(search_seed)
+        else:
+            cpp_state = self._initialize_cpp_state(root_state)
+            root_state._cpp_state = cpp_state
+            root_state._cpp_network_cache_key = self._active_network_cache_key
 
-        state_view = cpp_core.StateView(root_state_id)
-        state_view.step_index = len(root_state.selected_p_net_nodes)
-        state_view.curr_v_node_override = int(root_v_node_id)
-        state_view.domain_state = cpp_state
+            state_view = cpp_core.StateView(root_state_id)
+            state_view.step_index = len(root_state.selected_p_net_nodes)
+            state_view.curr_v_node_override = int(root_v_node_id)
+            state_view.domain_state = cpp_state
 
-        search_seed = self._search_seed_for_step(state_view.step_index)
-        result = self._engine.run_search(state_view, search_seed)
+            search_seed = self._search_seed_for_step(state_view.step_index)
+            result = self._engine.run_search(state_view, search_seed)
         if result is None:
             return None
 
@@ -576,6 +638,7 @@ class CppMCTSAdapter:
         edge_lookup: Dict[Tuple[int, int], int] = {}
         edge_ids_to_links: Dict[int, Tuple[int, int]] = {}
         directed = False
+        net_is_directed = False
 
         if preserve_link_orientation and hasattr(net, "links"):
             directed = True
@@ -611,6 +674,10 @@ class CppMCTSAdapter:
                 edge_lookup[(int(v), int(u))] = edge_id
                 edge_ids_to_links[edge_id] = (int(u), int(v))
         cpp_net.set_edges(edges, is_directed=directed)
+        try:
+            cpp_net.reverse_edge_pairs_share_capacity = bool(preserve_link_orientation and not net_is_directed)
+        except Exception:
+            pass
         if len(edge_attrs) == len(edges):
             cpp_net.set_edge_attrs(edge_attrs)
         return cpp_net, edge_lookup, edge_ids_to_links
@@ -654,9 +721,26 @@ class CppMCTSAdapter:
                 node_allocations[node_id] = alloc
 
         link_allocations: Dict[Tuple[int, int], Dict[str, float]] = {}
+        try:
+            p_net_is_directed = bool(child._original_p_net.is_directed())
+        except Exception:
+            p_net_is_directed = False
+        seen_undirected_links: set[Tuple[int, int]] = set()
         for edge_id, (u, v) in self._edge_ids_to_links.items():
+            link_key = (u, v)
+            if not p_net_is_directed:
+                canonical = (u, v) if u <= v else (v, u)
+                if canonical in seen_undirected_links:
+                    continue
+                seen_undirected_links.add(canonical)
+                if canonical in child._original_p_net.links:
+                    link_key = canonical
+                elif (canonical[1], canonical[0]) in child._original_p_net.links:
+                    link_key = (canonical[1], canonical[0])
+                else:
+                    link_key = canonical
             alloc = {}
-            link_attrs = child._original_p_net.links[(u, v)]
+            link_attrs = child._original_p_net.links[link_key]
             for attr_name in self._link_resource_names:
                 capacity = float(link_attrs.get(attr_name, 0.0))
                 available = float(cpp_state.get_available_link_resource(edge_id, attr_name))
@@ -664,7 +748,7 @@ class CppMCTSAdapter:
                 if used > 1e-6:
                     alloc[attr_name] = used
             if alloc:
-                link_allocations[(u, v)] = alloc
+                link_allocations[link_key] = alloc
 
         child._resource_allocations = {
             "node": node_allocations,
@@ -784,6 +868,7 @@ class CppFullSolver:
 
         edge_attrs = []
         directed = False
+        net_is_directed = False
         if preserve_link_orientation and hasattr(net, "links"):
             directed = True
             net_is_directed = False
@@ -819,7 +904,8 @@ class CppFullSolver:
             except Exception:
                 directed = False
 
-        return node_attrs, edges, edge_attrs, directed
+        reverse_edge_pairs_share_capacity = bool(preserve_link_orientation and not net_is_directed)
+        return node_attrs, edges, edge_attrs, directed, reverse_edge_pairs_share_capacity
 
     def _build_search_config(self, training: bool | None = None) -> "cpp_core.SearchConfig":
         cfg = cpp_core.SearchConfig()
@@ -994,14 +1080,14 @@ class CppFullSolver:
 
         feature_adapter = AlphaZeroFeatureAdapter(self.actor.config, p_net, v_net)
         feature_metadata = feature_adapter.build_cpp_feature_metadata()
-        p_node_attrs, p_edges, p_edge_attrs, p_directed = self._build_network_payload(
+        p_node_attrs, p_edges, p_edge_attrs, p_directed, p_reverse_edge_pairs_share_capacity = self._build_network_payload(
             p_net,
             self._node_resource_names,
             self._link_resource_names,
             topological_metrics=feature_metadata.get("p_topological_metrics"),
             preserve_link_orientation=True,
         )
-        v_node_attrs, v_edges, v_edge_attrs, v_directed = self._build_network_payload(
+        v_node_attrs, v_edges, v_edge_attrs, v_directed, v_reverse_edge_pairs_share_capacity = self._build_network_payload(
             v_net,
             self._node_resource_names,
             self._link_resource_names,
@@ -1081,10 +1167,12 @@ class CppFullSolver:
                 p_edges,
                 p_edge_attrs,
                 p_directed,
+                bool(p_reverse_edge_pairs_share_capacity),
                 v_node_attrs,
                 v_edges,
                 v_edge_attrs,
                 v_directed,
+                bool(v_reverse_edge_pairs_share_capacity),
                 vnr_cfg,
                 search_cfg,
                 policy_ts_path,

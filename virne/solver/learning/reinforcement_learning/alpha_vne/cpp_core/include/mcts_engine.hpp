@@ -55,6 +55,14 @@ public:
     SearchResult run_search(const std::shared_ptr<StateView>& root_state, std::optional<unsigned int> seed = std::nullopt);
     SearchResult run_search(TreeNode& root, std::optional<unsigned int> seed = std::nullopt);
 
+    // Optional persistent tree API used by the Python adapter to match the
+    // Python MCTS semantics (subtree reuse across steps).
+    void reset_tree(const std::shared_ptr<StateView>& root_state);
+    void clear_tree();
+    bool advance_tree(std::int64_t action);
+    std::shared_ptr<StateView> tree_root_state() const;
+    SearchResult run_search_tree(std::optional<unsigned int> seed = std::nullopt);
+
 private:
     void apply_dirichlet_noise(TreeNode& root);
     TreeNode* select(TreeNode& root);
@@ -75,6 +83,7 @@ private:
     mutable bool acceptance_stats_ready_{false};
     mutable float accepted_cost_min_{0.0f};
     mutable float accepted_cost_max_{0.0f};
+    std::unique_ptr<TreeNode> tree_root_;
 };
 
 }  // namespace azsfc

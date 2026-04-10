@@ -191,7 +191,25 @@ def test_compute_value_prefers_cpp_root_value_without_extra_policy_call():
     assert policy_network.calls == 0
 
 
-# Regression guard: C++ search seeding must stay tied to the request seed at every placement step.
+# Regression guard: reverse-oriented copies of an undirected physical link must share one capacity bucket.
+def test_reverse_oriented_physical_edges_share_capacity_when_configured():
+    p_net = cpp_core.Network()
+    p_net.set_num_nodes(2)
+    p_net.set_edges([(0, 1), (1, 0)], is_directed=True)
+    p_net.reverse_edge_pairs_share_capacity = True
+    p_net.set_node_attrs([{"cpu": 10.0}, {"cpu": 10.0}])
+    p_net.set_edge_attrs([{"bw": 1.0}, {"bw": 1.0}])
+
+    v_net = _build_two_node_vnr(demand=1.0)
+    state = _make_vnr_state(p_net, v_net, shortest_method="available_shortest", allow_rejection=False, k=1)
+    state_after_first = state.create_child(1)
+    state_after_second = state_after_first.create_child(0)
+
+    assert state_after_second.last_physical_node != -1
+    assert state_after_second.get_available_link_resource(0, "bw") == pytest.approx(0.0)
+    assert state_after_second.get_available_link_resource(1, "bw") == pytest.approx(0.0)
+
+
 def test_cpp_adapter_step_seed_is_deterministic_and_step_specific():
     from virne.solver.learning.reinforcement_learning.alpha_vne.cpp_adapter import CppMCTSAdapter
 

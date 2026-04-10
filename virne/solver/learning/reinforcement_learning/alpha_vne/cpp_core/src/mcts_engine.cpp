@@ -192,6 +192,49 @@ MCTSEngine::MCTSEngine(SearchConfig config)
     : config_(config),
       rng_(std::random_device{}()) {}
 
+void MCTSEngine::reset_tree(const std::shared_ptr<StateView>& root_state) {
+    tree_root_ = std::make_unique<TreeNode>(nullptr, root_state, std::nullopt);
+}
+
+void MCTSEngine::clear_tree() {
+    tree_root_.reset();
+}
+
+std::shared_ptr<StateView> MCTSEngine::tree_root_state() const {
+    if (!tree_root_) {
+        return nullptr;
+    }
+    return tree_root_->state();
+}
+
+SearchResult MCTSEngine::run_search_tree(std::optional<unsigned int> seed) {
+    if (!tree_root_) {
+        throw std::runtime_error("run_search_tree called before reset_tree.");
+    }
+    return run_search(*tree_root_, seed);
+}
+
+bool MCTSEngine::advance_tree(std::int64_t action) {
+    if (!tree_root_) {
+        return false;
+    }
+    auto child = tree_root_->extract_child(action);
+    if (child) {
+        tree_root_ = std::move(child);
+        return true;
+    }
+    auto state = tree_root_->state();
+    if (!state || !state->domain_state) {
+        return false;
+    }
+    auto child_domain = std::make_shared<VNRState>(state->domain_state->create_child(static_cast<int>(action)));
+    auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
+    child_state->step_index = state->step_index + 1;
+    child_state->domain_state = std::move(child_domain);
+    tree_root_ = std::make_unique<TreeNode>(nullptr, std::move(child_state), std::nullopt);
+    return true;
+}
+
 SearchResult MCTSEngine::run_search(const std::shared_ptr<StateView>& root_state, std::optional<unsigned int> seed) {
     TreeNode root(nullptr, root_state, std::nullopt);
     return run_search(root, seed);
@@ -345,7 +388,7 @@ SearchResult MCTSEngine::run_search(TreeNode& root, std::optional<unsigned int> 
 
     float root_value = 0.0f;
     if (root.visit_count() > 0) {
-        root_value = root.value_sum() / static_cast<float>(root.visit_count());
+        root_value = static_cast<float>(root.value_sum() / static_cast<double>(root.visit_count()));
     } else if (root_state->value.defined()) {
         root_value = root_state->value.item<float>();
     }

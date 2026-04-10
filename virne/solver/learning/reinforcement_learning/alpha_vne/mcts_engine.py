@@ -89,7 +89,7 @@ class MCTSEngine:
         # Raw mode keeps terminal rewards in their original scale.
         return float(value)
 
-    def search(self, root_node: Node, v_node_id: int) -> None:
+    def search(self, root_node: Node, v_node_id: int, add_root_dirichlet_noise: bool = True) -> None:
         """Run MCTS search from root node.
 
         Args:
@@ -98,7 +98,11 @@ class MCTSEngine:
         """
         # If this is the first call, expand the root node with Dirichlet noise
         if not root_node.children and not root_node.state.is_terminal():
-            self.node_expander.expand_node(root_node, v_node_id, add_dirichlet_noise=True)
+            self.node_expander.expand_node(
+                root_node,
+                v_node_id,
+                add_dirichlet_noise=bool(add_root_dirichlet_noise),
+            )
 
         # Run MCTS simulations
         effective_expansions = 0
