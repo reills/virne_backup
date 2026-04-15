@@ -8,6 +8,11 @@ from omegaconf import OmegaConf
 
 
 HARD_SCENARIO_KEY = "wx500_hard_compare"
+DEFAULT_NUM_VNETS = 1000
+DEFAULT_VNET_SIZE_LOW = 3
+DEFAULT_VNET_SIZE_HIGH = 13
+DEFAULT_NODE_DEMAND_HIGH = 26
+DEFAULT_LINK_DEMAND_HIGH = 65
 
 
 def _parse_seed_list(raw: str) -> list[int]:
@@ -21,8 +26,8 @@ def _profile_common_overrides(method_key: str) -> list[str]:
     if method_key != "alpha_zero_sfc":
         return ["training.resume_training=false"]
     return [
-        "training.pure_cpp=false",
-        "training.use_cpp_mcts=false",
+        "training.pure_cpp=true",
+        "training.use_cpp_mcts=true",
         "training.use_cuda=true",
         "training.use_batched_gpu=false",
         "training.distributed_training=true",
@@ -44,13 +49,14 @@ def _train_overrides(method_key: str) -> list[str]:
     if method_key != "alpha_zero_sfc":
         return []
     return [
-        "training.num_train_epochs=12",
+        "training.num_train_epochs=16",
+        "experiment.num_simulations=0",
         "training.c_puct=1.4",
-        "training.max_training_steps=1000",
+        "training.max_training_steps=3000",
         "training.min_buffer_size=128",
         "training.num_train_steps_per_epoch=128",
-        "training.max_empty_batches=1800",
-        "training.save_interval=256",
+        "training.max_empty_batches=5400",
+        "training.save_interval=2000",
     ]
 
 
@@ -68,27 +74,57 @@ def build_config(
     eval_profile: str,
     train_seeds: list[int],
     eval_seeds: list[int],
+    num_v_nets: int,
+    v_net_size_low: int,
+    v_net_size_high: int,
+    node_demand_high: int,
+    link_demand_high: int,
 ) -> None:
     cfg = OmegaConf.load(str(base_config_path))
     cfg.journal_suite.default_profile = eval_profile
+    cfg.journal_suite.offline_slice = OmegaConf.create({"enabled": False})
+    cfg.journal_suite.paired_matching_policy = OmegaConf.create(
+        {
+            "enabled": False,
+            "method_keys": [method_key],
+            "match_fields": ["topology", "scenario", "seed", "k_value"],
+        }
+    )
+    cfg.journal_suite.k_semantics_parity = OmegaConf.create({"enabled": False})
     cfg.journal_suite.scenarios[HARD_SCENARIO_KEY] = OmegaConf.create(
         {
             "train_split": "train",
             "eval_split": "test",
             "v_sim_setting_overrides": {
-                "num_v_nets": 1000,
+                "num_v_nets": num_v_nets,
                 "v_net_size": {
-                    "low": 3,
-                    "high": 15,
+                    "low": v_net_size_low,
+                    "high": v_net_size_high,
                 },
+            },
+            "dataset_generation_v_sim_setting_overrides": {
                 "node_attrs_setting": [
                     {
-                        "high": 30,
+                        "name": "cpu",
+                        "distribution": "uniform",
+                        "dtype": "int",
+                        "generative": True,
+                        "low": 0,
+                        "high": node_demand_high,
+                        "owner": "node",
+                        "type": "resource",
                     }
                 ],
                 "link_attrs_setting": [
                     {
-                        "high": 75,
+                        "name": "bw",
+                        "distribution": "uniform",
+                        "dtype": "int",
+                        "generative": True,
+                        "low": 0,
+                        "high": link_demand_high,
+                        "owner": "link",
+                        "type": "resource",
                     }
                 ],
             },
@@ -151,6 +187,11 @@ def main() -> int:
     parser.add_argument("--eval-profile", required=True)
     parser.add_argument("--train-seeds", default="")
     parser.add_argument("--eval-seeds", default="0,1,2")
+    parser.add_argument("--num-v-nets", type=int, default=DEFAULT_NUM_VNETS)
+    parser.add_argument("--v-net-size-low", type=int, default=DEFAULT_VNET_SIZE_LOW)
+    parser.add_argument("--v-net-size-high", type=int, default=DEFAULT_VNET_SIZE_HIGH)
+    parser.add_argument("--node-demand-high", type=int, default=DEFAULT_NODE_DEMAND_HIGH)
+    parser.add_argument("--link-demand-high", type=int, default=DEFAULT_LINK_DEMAND_HIGH)
     parser.add_argument(
         "--base-config",
         default="settings/experiments/journal_suite.yaml",
@@ -165,6 +206,11 @@ def main() -> int:
         eval_profile=args.eval_profile,
         train_seeds=_parse_seed_list(args.train_seeds),
         eval_seeds=_parse_seed_list(args.eval_seeds),
+        num_v_nets=args.num_v_nets,
+        v_net_size_low=args.v_net_size_low,
+        v_net_size_high=args.v_net_size_high,
+        node_demand_high=args.node_demand_high,
+        link_demand_high=args.link_demand_high,
     )
     print(f"wrote {args.config_path}")
     return 0

@@ -50,7 +50,7 @@ cfg.journal_suite.profiles.$PROFILE = OmegaConf.create({
             'training.min_buffer_size=128',
             'training.num_train_steps_per_epoch=128',
             'training.max_empty_batches=1800',
-            'training.save_interval=256',
+            'training.save_interval=2000',
         ],
         'eval': [
             'training.computation_budget=96',

@@ -32,7 +32,7 @@ common_overrides = [
     'training.use_batched_gpu=false',
     'training.distributed_training=true',
     'training.enable_async_learner=true',
-    'training.num_workers=4',
+    'training.num_workers=8',
     'training.resume_training=false',
     'training.alpha_zero_backbone=transformer',
     'training.signal_stop_event_on_learner_complete=true',
@@ -45,14 +45,14 @@ common_overrides = [
 ]
 
 train_overrides = [
-    'training.num_train_epochs=12',
+    'training.num_train_epochs=16',
     'experiment.num_simulations=0',
     'training.c_puct=1.4',
-    'training.max_training_steps=1000',
+    'training.max_training_steps=3000',
     'training.min_buffer_size=128',
     'training.num_train_steps_per_epoch=128',
-    'training.max_empty_batches=1800',
-    'training.save_interval=256',
+    'training.max_empty_batches=5400',
+    'training.save_interval=2000',
 ]
 
 eval_overrides = [

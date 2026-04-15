@@ -1156,6 +1156,12 @@ def _build_dataset_generation_config(
                 cfg.v_sim_setting,
                 OmegaConf.create(_as_dict(v_sim_overrides)),
             )
+        dataset_only_v_sim_overrides = scenario_cfg.get('dataset_generation_v_sim_setting_overrides')
+        if dataset_only_v_sim_overrides is not None:
+            cfg.v_sim_setting = OmegaConf.merge(
+                cfg.v_sim_setting,
+                OmegaConf.create(_as_dict(dataset_only_v_sim_overrides)),
+            )
 
     add_simulation_into_config(cfg)
     return cfg

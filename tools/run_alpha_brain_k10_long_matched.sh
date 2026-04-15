@@ -8,7 +8,7 @@ CONFIG_PATH="results/journal_suite/alpha_brain_k10_long_matched.yaml"
 PROFILE="alpha_brain_k10_long_matched"
 
 STAGES="${STAGES:-preflight generate-datasets train eval}"
-SEEDS_CSV="${SEEDS_CSV:-0,1}"
+SEEDS_CSV="${SEEDS_CSV:-0,1,2}"
 FORCE_DATASETS="${FORCE_DATASETS:-0}"
 RUN_AGGREGATE="${RUN_AGGREGATE:-0}"
 BOOTSTRAP_SAMPLES="${BOOTSTRAP_SAMPLES:-200}"
@@ -57,7 +57,7 @@ cfg.journal_suite.profiles['$PROFILE'] = OmegaConf.create({
             'training.min_buffer_size=128',
             'training.num_train_steps_per_epoch=128',
             'training.max_empty_batches=5400',
-            'training.save_interval=256',
+            'training.save_interval=2000',
         ],
         'eval': [
             'training.computation_budget=96',

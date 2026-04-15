@@ -8,6 +8,11 @@ METHOD_KEY="ppo_dual_gcn_plus"
 CONFIG_PATH="results/journal_suite/wx500_hard_compare_ppo_dual_gcn_plus.yaml"
 TRAIN_PROFILE="wx500_hard_compare_ppo_dual_gcn_plus_train"
 EVAL_PROFILE="wx500_hard_compare_ppo_dual_gcn_plus_eval"
+WX500_NUM_VNETS="${WX500_NUM_VNETS:-1000}"
+WX500_VNET_SIZE_LOW="${WX500_VNET_SIZE_LOW:-3}"
+WX500_VNET_SIZE_HIGH="${WX500_VNET_SIZE_HIGH:-13}"
+WX500_NODE_DEMAND_HIGH="${WX500_NODE_DEMAND_HIGH:-26}"
+WX500_LINK_DEMAND_HIGH="${WX500_LINK_DEMAND_HIGH:-65}"
 
 mkdir -p results/journal_suite
 
@@ -16,7 +21,12 @@ conda run -n virne python tools/build_wx500_hard_compare_config.py \
   --method-key "$METHOD_KEY" \
   --train-profile "$TRAIN_PROFILE" \
   --eval-profile "$EVAL_PROFILE" \
-  --train-seeds "0,1,2"
+  --train-seeds "0,1,2" \
+  --num-v-nets "$WX500_NUM_VNETS" \
+  --v-net-size-low "$WX500_VNET_SIZE_LOW" \
+  --v-net-size-high "$WX500_VNET_SIZE_HIGH" \
+  --node-demand-high "$WX500_NODE_DEMAND_HIGH" \
+  --link-demand-high "$WX500_LINK_DEMAND_HIGH"
 
 echo "Nominal train datasets:"
 for seed in 0 1 2; do
