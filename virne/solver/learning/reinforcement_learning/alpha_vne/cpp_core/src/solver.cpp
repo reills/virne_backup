@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -26,6 +27,23 @@ std::unordered_map<std::string, CachedPolicyEntry> g_policy_cache;
 std::string policy_cache_key(const std::string& path, const torch::Device& device) {
     const char* device_key = (device.type() == torch::kCUDA) ? "cuda" : "cpu";
     return path + "|" + device_key;
+}
+
+bool env_flag_enabled(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+    return default_value;
 }
 
 float normalize_value_target(float raw_reward, const SearchConfig& search_config) {
@@ -1243,6 +1261,8 @@ SolveResult solve_vnr(
     bool do_replay = write_replay && !replay_dir.empty();
 
     auto start_ts = std::chrono::high_resolution_clock::now();
+    const bool use_persistent_tree = env_flag_enabled("AZSFC_CPP_PERSISTENT_TREE", true);
+    const bool mix_step_seed = env_flag_enabled("AZSFC_CPP_MIX_STEP_SEED", true);
 
     VNRState root_state(std::make_shared<Network>(physical), std::make_shared<Network>(virtual_net), vnr_config);
 
@@ -1509,7 +1529,7 @@ SolveResult solve_vnr(
     };
 
     for (int step = 0; step < virtual_net.num_nodes; ++step) {
-        if (!current_root) {
+        if (!use_persistent_tree || !current_root) {
             auto state_view = std::make_shared<StateView>();
             state_view->id = static_cast<std::int64_t>(step + 1);
             state_view->step_index = static_cast<std::int64_t>(current_state.selected_physical_nodes().size());
@@ -1523,7 +1543,11 @@ SolveResult solve_vnr(
         auto mcts_start = std::chrono::high_resolution_clock::now();
         std::optional<unsigned int> step_seed;
         if (seed) {
-            step_seed = derive_step_seed(static_cast<unsigned int>(*seed), step);
+            if (mix_step_seed) {
+                step_seed = derive_step_seed(static_cast<unsigned int>(*seed), step);
+            } else if (step == 0) {
+                step_seed = static_cast<unsigned int>(*seed);
+            }
         }
         auto search_result = engine.run_search(*current_root, step_seed);
         auto mcts_end = std::chrono::high_resolution_clock::now();
@@ -1595,7 +1619,10 @@ SolveResult solve_vnr(
         result.metrics.total_simulations += static_cast<int>(search_result.visit_counts.sum().item<float>());
 
         VNRState::PlacementInfo place_info;
-        std::unique_ptr<TreeNode> next_root = current_root->extract_child(action);
+        std::unique_ptr<TreeNode> next_root;
+        if (use_persistent_tree) {
+            next_root = current_root->extract_child(action);
+        }
         current_state = current_state.create_child_with_info(action, &place_info);
         if (current_state.last_physical_node() == -1) {
             result.place_result = false;

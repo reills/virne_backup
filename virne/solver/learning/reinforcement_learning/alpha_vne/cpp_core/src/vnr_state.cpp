@@ -1,6 +1,7 @@
 #include "vnr_state.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -57,6 +58,23 @@ double sum_attrs(
         total += safe_lookup(attrs, name);
     }
     return total;
+}
+
+bool env_flag_enabled(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+    return default_value;
 }
 }  // namespace
 
@@ -998,7 +1016,9 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
         }
     }
 
-    if (!have_selected_path && method != "available_shortest") {
+    const bool allow_available_shortest_fallback =
+        env_flag_enabled("AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK", true);
+    if (allow_available_shortest_fallback && !have_selected_path && method != "available_shortest") {
         auto fallback_paths = path_finder_.find_paths(
             *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
         for (const auto& candidate : fallback_paths) {

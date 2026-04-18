@@ -19,6 +19,18 @@ except ImportError:  # pragma: no cover - optional dependency
     cpp_core = None
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 class _LazyCppStateProxy:
     """Lightweight Python view over a C++ VNRState that materializes on demand."""
 
@@ -675,7 +687,9 @@ class CppMCTSAdapter:
                 edge_ids_to_links[edge_id] = (int(u), int(v))
         cpp_net.set_edges(edges, is_directed=directed)
         try:
-            cpp_net.reverse_edge_pairs_share_capacity = bool(preserve_link_orientation and not net_is_directed)
+            share_reverse_capacity = bool(preserve_link_orientation and not net_is_directed)
+            share_reverse_capacity = _env_flag("AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY", share_reverse_capacity)
+            cpp_net.reverse_edge_pairs_share_capacity = share_reverse_capacity
         except Exception:
             pass
         if len(edge_attrs) == len(edges):
@@ -905,6 +919,10 @@ class CppFullSolver:
                 directed = False
 
         reverse_edge_pairs_share_capacity = bool(preserve_link_orientation and not net_is_directed)
+        reverse_edge_pairs_share_capacity = _env_flag(
+            "AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY",
+            reverse_edge_pairs_share_capacity,
+        )
         return node_attrs, edges, edge_attrs, directed, reverse_edge_pairs_share_capacity
 
     def _build_search_config(self, training: bool | None = None) -> "cpp_core.SearchConfig":
@@ -1212,10 +1230,12 @@ class CppFullSolver:
                     p_edges,
                     p_edge_attrs,
                     p_directed,
+                    bool(p_reverse_edge_pairs_share_capacity),
                     v_node_attrs,
                     v_edges,
                     v_edge_attrs,
                     v_directed,
+                    bool(v_reverse_edge_pairs_share_capacity),
                     vnr_cfg,
                     search_cfg,
                     policy_ts_path,

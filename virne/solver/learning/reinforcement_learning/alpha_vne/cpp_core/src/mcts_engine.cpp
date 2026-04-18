@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace azsfc {
@@ -43,6 +44,23 @@ int64_t find_max_action_id(const Container& entries) {
 }
 
 std::atomic<std::int64_t> g_state_id_counter{1};
+
+bool env_flag_enabled(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+    return default_value;
+}
 
 std::vector<float> normalize_nonnegative(const std::vector<float>& values) {
     std::vector<float> probs(values.size(), 0.0f);
@@ -391,11 +409,14 @@ SearchResult MCTSEngine::run_search(TreeNode& root, std::optional<unsigned int> 
         }
     }
 
+    const bool use_mean_q_root_value = env_flag_enabled("AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE", true);
     float root_value = 0.0f;
-    if (root.visit_count() > 0) {
+    if (use_mean_q_root_value && root.visit_count() > 0) {
         root_value = static_cast<float>(root.value_sum() / static_cast<double>(root.visit_count()));
     } else if (root_state->value.defined()) {
         root_value = root_state->value.item<float>();
+    } else if (root.visit_count() > 0) {
+        root_value = static_cast<float>(root.value_sum() / static_cast<double>(root.visit_count()));
     }
 
     return {visit_counts, policy, root_priors, root_value};
