@@ -98,9 +98,10 @@ if [[ "$RUN_AGGREGATE" == "1" ]]; then
     --latest-per-cell
 fi
 
-echo
-echo "=== Brain matched-seed nominal k=10 latest evals ==="
-conda run -n virne python -c "
+if [[ " $STAGES " == *" eval "* ]]; then
+  echo
+  echo "=== Brain matched-seed nominal k=10 latest evals ==="
+  conda run -n virne python -c "
 from pathlib import Path
 import csv
 
@@ -123,3 +124,4 @@ for seed in seeds:
         f\"run={path.parent.name}\"
     )
 "
+fi
