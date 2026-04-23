@@ -252,7 +252,9 @@ bool MCTSEngine::advance_tree(std::int64_t action) {
     // `state.v_node_id + 1` through as an explicit v-node id for non-root tree
     // states. In this codebase that value is the stable-order position, not the
     // actual virtual-node id, so keep the legacy behavior for parity.
-    child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
+    if (env_flag_enabled("AZSFC_CPP_SET_V_NODE_OVERRIDE", true)) {
+        child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
+    }
     child_state->domain_state = std::move(child_domain);
     tree_root_ = std::make_unique<TreeNode>(nullptr, std::move(child_state), std::nullopt);
     return true;
@@ -495,7 +497,9 @@ float MCTSEngine::expand(TreeNode& node) {
             // Match Python ObservationBuilder.build(..., v_node_id=None), which
             // forwards `state.v_node_id + 1` as an explicit id for non-root
             // states. That value is the stable-order position.
-            child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
+            if (env_flag_enabled("AZSFC_CPP_SET_V_NODE_OVERRIDE", true)) {
+                child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
+            }
             child_state->domain_state = std::move(child_domain);
             options.emplace_back(action, std::move(child_state));
         }
@@ -503,7 +507,9 @@ float MCTSEngine::expand(TreeNode& node) {
             auto invalid_child = std::make_shared<VNRState>(state->domain_state->create_child(-1));
             auto child_state = std::make_shared<StateView>(g_state_id_counter.fetch_add(1));
             child_state->step_index = state->step_index + 1;
-            child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
+            if (env_flag_enabled("AZSFC_CPP_SET_V_NODE_OVERRIDE", true)) {
+                child_state->curr_v_node_override = static_cast<std::int64_t>(child_state->step_index);
+            }
             child_state->domain_state = std::move(invalid_child);
             options.emplace_back(-1, std::move(child_state));
         }

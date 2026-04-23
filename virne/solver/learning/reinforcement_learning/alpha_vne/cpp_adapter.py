@@ -119,6 +119,8 @@ class CppMCTSAdapter:
         self._engine_add_root_noise = True
         self._engine = self._make_engine(add_root_noise=self._engine_add_root_noise)
         self._tree_pending_reset = True
+        self._disable_advance_root = _env_flag("AZSFC_CPP_DISABLE_ADVANCE_ROOT", False)
+        self._force_tree_reset_each_step = _env_flag("AZSFC_CPP_FORCE_TREE_RESET_EACH_STEP", False)
         self._state_registry: Dict[int, State] = {}
         self._vnode_override: Dict[int, int] = {}
         self._cpp_p_network: cpp_core.Network | None = None
@@ -160,6 +162,9 @@ class CppMCTSAdapter:
 
     def advance_root(self, action: int) -> bool:
         """Advance the persistent C++ tree root after an action is selected."""
+        if self._disable_advance_root or self._force_tree_reset_each_step:
+            self._tree_pending_reset = True
+            return False
         try:
             if not hasattr(self._engine, "advance_tree"):
                 return False
@@ -260,6 +265,8 @@ class CppMCTSAdapter:
         self._ensure_cpp_networks(root_state)
 
         use_persistent = bool(hasattr(self._engine, "reset_tree") and hasattr(self._engine, "run_search_tree"))
+        if self._disable_advance_root or self._force_tree_reset_each_step:
+            use_persistent = False
         cpp_state = None
         state_view = None
         if use_persistent:

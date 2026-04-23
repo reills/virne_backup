@@ -53,6 +53,9 @@ class OptimizedAlphaZeroActor(Solver):
         super().__init__(controller, recorder, counter, logger, config, **kwargs)
         self.replay_dir = replay_dir
         self.disable_trajectory_writing = disable_trajectory_writing
+        self.force_root_noise_all_modes = str(
+            os.environ.get("AZSFC_FORCE_ROOT_NOISE_ALWAYS", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
         # Policy path should be in models directory, not replay buffer
         if models_dir:
@@ -63,6 +66,12 @@ class OptimizedAlphaZeroActor(Solver):
         os.makedirs(self.replay_dir, exist_ok=True)
         if models_dir:
             os.makedirs(models_dir, exist_ok=True)
+
+        if self.force_root_noise_all_modes:
+            self.logger.info(
+                "Forcing root Dirichlet noise in all actor modes via "
+                "AZSFC_FORCE_ROOT_NOISE_ALWAYS."
+            )
 
         # Initialize trajectory writer
         self.trajectory_writer = TrajectoryWriter(
@@ -331,7 +340,11 @@ class OptimizedAlphaZeroActor(Solver):
             next_pos = current_node.state.v_node_id + 1
             curr_v_id = current_node.state.v_order[next_pos]
             t_mcts = time.perf_counter()
-            self.search(current_node, curr_v_id, add_root_noise=training)
+            self.search(
+                current_node,
+                curr_v_id,
+                add_root_noise=(training or self.force_root_noise_all_modes),
+            )
             timers["mcts_ms"] += (time.perf_counter() - t_mcts) * 1000.0
             try:
                 timers["total_simulations"] += sum(child.visit_times for child in current_node.children)
@@ -1346,7 +1359,11 @@ class OptimizedAlphaZeroActor(Solver):
             # Use actual virtual node id under stable ordering
             next_pos = current_node.state.v_node_id + 1
             curr_v_id = current_node.state.v_order[next_pos]
-            self.search(current_node, curr_v_id, add_root_noise=training)
+            self.search(
+                current_node,
+                curr_v_id,
+                add_root_noise=(training or self.force_root_noise_all_modes),
+            )
 
             try:
                 best_child = self._select_best_child(current_node, temperature=temperature)
