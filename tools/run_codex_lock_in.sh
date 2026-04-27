@@ -56,12 +56,15 @@ NN_GNN_LAYERS="${NN_GNN_LAYERS:-2}"
 NN_HEADS="${NN_HEADS:-6}"
 NN_TRANSFORMER_LAYERS="${NN_TRANSFORMER_LAYERS:-2}"
 
-# 84453e5-equivalent env flags. Exported once here and used for both train and eval.
-export AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE=0
-export AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK=0
-export AZSFC_CPP_MIX_STEP_SEED=0
-export AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY=0
-export AZSFC_CPP_PERSISTENT_TREE=1
+# Exported once here and used for both train and eval. Defaults match the
+# 84453e5-style lock-in recipe, but remain overridable from the shell.
+export AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE="${AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE:-0}"
+export AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK="${AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK:-0}"
+export AZSFC_CPP_MIX_STEP_SEED="${AZSFC_CPP_MIX_STEP_SEED:-0}"
+export AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY="${AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY:-0}"
+export AZSFC_CPP_PERSISTENT_TREE="${AZSFC_CPP_PERSISTENT_TREE:-1}"
+export AZSFC_CPP_SET_V_NODE_OVERRIDE="${AZSFC_CPP_SET_V_NODE_OVERRIDE:-0}"
+export AZSFC_CPP_USE_CANDIDATE_FEATURES="${AZSFC_CPP_USE_CANDIDATE_FEATURES:-1}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -104,6 +107,8 @@ print_plan() {
   echo "  AZSFC_CPP_MIX_STEP_SEED=$AZSFC_CPP_MIX_STEP_SEED"
   echo "  AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY=$AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY"
   echo "  AZSFC_CPP_PERSISTENT_TREE=$AZSFC_CPP_PERSISTENT_TREE"
+  echo "  AZSFC_CPP_SET_V_NODE_OVERRIDE=$AZSFC_CPP_SET_V_NODE_OVERRIDE"
+  echo "  AZSFC_CPP_USE_CANDIDATE_FEATURES=$AZSFC_CPP_USE_CANDIDATE_FEATURES"
   echo
   echo "train: $TRAIN_NUM_EPOCHS epochs, max_steps=$TRAIN_MAX_STEPS, steps/epoch=$TRAIN_STEPS_PER_EPOCH, workers=$TRAIN_NUM_WORKERS"
   echo "brain sweep: stride=$BRAIN_SWEEP_STEP_STRIDE, include_guaranteed=$BRAIN_SWEEP_INCLUDE_GUARANTEED"
@@ -126,7 +131,8 @@ preflight() {
   local missing=0
   for flag in AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK \
               AZSFC_CPP_MIX_STEP_SEED AZSFC_CPP_PERSISTENT_TREE \
-              AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY; do
+              AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY AZSFC_CPP_SET_V_NODE_OVERRIDE \
+              AZSFC_CPP_USE_CANDIDATE_FEATURES; do
     if ! grep -q "$flag" virne/solver/learning/reinforcement_learning/alpha_vne/cpp_core/src/*.cpp \
                        virne/solver/learning/reinforcement_learning/alpha_vne/*.py 2>/dev/null; then
       echo "ERROR: $flag not found in C++/adapter sources. You are not on codex, or the branch doesn't support this flag." >&2

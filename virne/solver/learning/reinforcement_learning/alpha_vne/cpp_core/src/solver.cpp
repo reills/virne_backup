@@ -761,6 +761,18 @@ torch::Tensor build_zero_candidate_features(int num_actions, int candidate_featu
     );
 }
 
+torch::Tensor build_candidate_features(const VNRState& state, int num_actions, torch::Device device) {
+    if (!env_flag_enabled("AZSFC_CPP_USE_CANDIDATE_FEATURES", true)) {
+        return build_zero_candidate_features(num_actions, state.candidate_feature_dim(), device);
+    }
+
+    auto features = state.build_candidate_feature_tensor();
+    if (!features.defined() || features.numel() == 0 || features.size(1) != num_actions) {
+        return build_zero_candidate_features(num_actions, state.candidate_feature_dim(), device);
+    }
+    return features.to(device);
+}
+
 torch::Tensor build_history_features_single(
     const torch::Tensor& p_net_x,
     const std::vector<int>& selected,
@@ -838,7 +850,7 @@ StateView::TensorMap build_inputs_cached(
 
     auto candidates = state.get_candidate_nodes();
     inputs.emplace("action_mask", build_action_mask_device(candidates, num_actions, allow_rejection, reject_idx, device));
-    inputs.emplace("candidate_features", build_zero_candidate_features(num_actions, state.candidate_feature_dim(), device));
+    inputs.emplace("candidate_features", build_candidate_features(state, num_actions, device));
     return inputs;
 }
 
@@ -914,7 +926,7 @@ StateView::TensorMap build_inputs_batch(
 
         auto candidates = domain.get_candidate_nodes();
         masks.push_back(build_action_mask_device(candidates, num_actions, allow_rejection, reject_idx, device));
-        candidate_features.push_back(build_zero_candidate_features(num_actions, domain.candidate_feature_dim(), device));
+        candidate_features.push_back(build_candidate_features(domain, num_actions, device));
     }
 
     auto p_net_x_batch = torch::cat(p_net_x_list, 0);
@@ -1028,7 +1040,7 @@ Observation build_observation(
     int remaining = std::max(0, static_cast<int>(state.virtual_order().size()) - (step_idx + 1));
     obs.vnfs_remaining = torch::tensor({remaining}, torch::kInt64);
     obs.action_mask = build_action_mask(state, num_actions, allow_rejection, reject_idx);
-    obs.candidate_features = build_zero_candidate_features(num_actions, state.candidate_feature_dim(), torch::kCPU);
+    obs.candidate_features = build_candidate_features(state, num_actions, torch::kCPU);
     return obs;
 }
 
@@ -1613,9 +1625,9 @@ SolveResult solve_vnr(
 
         result.actions.push_back(action);
         result.policies.push_back(std::move(policy_vec));
-        result.visit_counts.push_back(std::move(visit_counts_vec));
         result.values.push_back(search_result.value);
         append_replay_step(current_state, action, candidates, visit_counts_vec, result.values.back());
+        result.visit_counts.push_back(std::move(visit_counts_vec));
         result.metrics.total_simulations += static_cast<int>(search_result.visit_counts.sum().item<float>());
 
         VNRState::PlacementInfo place_info;

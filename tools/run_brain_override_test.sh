@@ -23,12 +23,16 @@ EXTRACTED_MODELS_DIR="$ANALYSIS_ROOT/extracted_models"
 RUN_LOG="$ANALYSIS_ROOT/run.log"
 EVAL_SUMMARY_CSV="$ANALYSIS_ROOT/eval_summary.csv"
 REPORT_MD="$ANALYSIS_ROOT/report.md"
+INIT_MODEL_PATH="${INIT_MODEL_PATH:-}"
 
 RESUME_COMPLETED="${RESUME_COMPLETED:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+RUN_EVAL="${RUN_EVAL:-1}"
 SWEEP_BRAIN_CHECKPOINTS="${SWEEP_BRAIN_CHECKPOINTS:-1}"
 BRAIN_SWEEP_STEP_STRIDE="${BRAIN_SWEEP_STEP_STRIDE:-1024}"
 BRAIN_SWEEP_INCLUDE_GUARANTEED="${BRAIN_SWEEP_INCLUDE_GUARANTEED:-1}"
+SIGNAL_SAMPLE_FILES="${SIGNAL_SAMPLE_FILES:-300}"
+SIGNAL_POLICY_WINDOW="${SIGNAL_POLICY_WINDOW:-100}"
 
 NUM_V_NETS="${NUM_V_NETS:-1000}"
 COMPUTATION_BUDGET="${COMPUTATION_BUDGET:-96}"
@@ -57,6 +61,10 @@ export AZSFC_CPP_PERSISTENT_TREE="${AZSFC_CPP_PERSISTENT_TREE:-1}"
 export AZSFC_CPP_SET_V_NODE_OVERRIDE="${AZSFC_CPP_SET_V_NODE_OVERRIDE:-0}"
 export AZSFC_CPP_DISABLE_ADVANCE_ROOT="${AZSFC_CPP_DISABLE_ADVANCE_ROOT:-0}"
 export AZSFC_CPP_FORCE_TREE_RESET_EACH_STEP="${AZSFC_CPP_FORCE_TREE_RESET_EACH_STEP:-0}"
+export AZSFC_PY_LEGACY_BRIDGE_84453E5="${AZSFC_PY_LEGACY_BRIDGE_84453E5:-0}"
+export AZSFC_CPP_USE_CANDIDATE_FEATURES="${AZSFC_CPP_USE_CANDIDATE_FEATURES:-1}"
+export AZSFC_DISABLE_LEARNER_RNG_SEED="${AZSFC_DISABLE_LEARNER_RNG_SEED:-0}"
+export AZSFC_LEARNER_RNG_SEED="${AZSFC_LEARNER_RNG_SEED:-}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -79,6 +87,13 @@ run_cmd() {
 require_dir()  { [[ -d "$1" ]] || { echo "missing dir: $1"  >&2; exit 1; }; }
 require_file() { [[ -f "$1" ]] || { echo "missing file: $1" >&2; exit 1; }; }
 
+TRAIN_SAVE_INTERVAL="$BRAIN_SAVE_INTERVAL"
+TRAIN_GUARANTEED_SAVE_STEP="$GUARANTEED_SAVE_STEP"
+if [[ "$SWEEP_BRAIN_CHECKPOINTS" != "1" ]]; then
+  TRAIN_SAVE_INTERVAL="$((TRAIN_MAX_STEPS + TRAIN_STEPS_PER_EPOCH + 1024))"
+  TRAIN_GUARANTEED_SAVE_STEP="$((TRAIN_MAX_STEPS + TRAIN_STEPS_PER_EPOCH + 1024))"
+fi
+
 dataset_dir() { echo "$ROOT_DIR/datasets/generated/journal/nominal/brain/seed_$1/$2"; }
 train_run_id() { echo "journal_suite__alpha_zero_sfc__brain__${ARM}__seed$1__train__ktrain10__${STAMP}"; }
 eval_run_id()  { echo "journal_suite__alpha_zero_sfc__brain__${ARM}_$2__seed$1__eval__keval10__${STAMP}"; }
@@ -91,6 +106,7 @@ print_plan() {
   echo "seeds:                $SEEDS"
   echo "results_root:         $RESULTS_ROOT"
   echo "analysis_root:        $ANALYSIS_ROOT"
+  echo "init_model_path:      ${INIT_MODEL_PATH:-<none>}"
   echo
   echo "env flags (applied to both train and eval):"
   echo "  AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE=$AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE"
@@ -101,8 +117,14 @@ print_plan() {
   echo "  AZSFC_CPP_SET_V_NODE_OVERRIDE=$AZSFC_CPP_SET_V_NODE_OVERRIDE"
   echo "  AZSFC_CPP_DISABLE_ADVANCE_ROOT=$AZSFC_CPP_DISABLE_ADVANCE_ROOT"
   echo "  AZSFC_CPP_FORCE_TREE_RESET_EACH_STEP=$AZSFC_CPP_FORCE_TREE_RESET_EACH_STEP"
+  echo "  AZSFC_PY_LEGACY_BRIDGE_84453E5=$AZSFC_PY_LEGACY_BRIDGE_84453E5"
+  echo "  AZSFC_CPP_USE_CANDIDATE_FEATURES=$AZSFC_CPP_USE_CANDIDATE_FEATURES"
+  echo "  AZSFC_DISABLE_LEARNER_RNG_SEED=$AZSFC_DISABLE_LEARNER_RNG_SEED"
+  echo "  AZSFC_LEARNER_RNG_SEED=${AZSFC_LEARNER_RNG_SEED:-<config default>}"
   echo
   echo "train: $TRAIN_NUM_EPOCHS epochs, max_steps=$TRAIN_MAX_STEPS, steps/epoch=$TRAIN_STEPS_PER_EPOCH, workers=$TRAIN_NUM_WORKERS"
+  echo "run_eval=$RUN_EVAL"
+  echo "checkpoint_history=$SWEEP_BRAIN_CHECKPOINTS, save_interval=$TRAIN_SAVE_INTERVAL, guaranteed_save_step=$TRAIN_GUARANTEED_SAVE_STEP"
   echo "brain sweep: stride=$BRAIN_SWEEP_STEP_STRIDE, include_guaranteed=$BRAIN_SWEEP_INCLUDE_GUARANTEED"
   echo "num_v_nets=$NUM_V_NETS, computation_budget=$COMPUTATION_BUDGET"
   echo
@@ -120,19 +142,36 @@ preflight() {
   local src_dir="virne/solver/learning/reinforcement_learning/alpha_vne/cpp_core/src"
   local py_dir="virne/solver/learning/reinforcement_learning/alpha_vne"
   local flag missing=0
-  for flag in \
+  local required_flags=(
     AZSFC_CPP_USE_MEAN_Q_ROOT_VALUE \
     AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK \
     AZSFC_CPP_MIX_STEP_SEED \
     AZSFC_CPP_SHARE_REVERSE_EDGE_CAPACITY \
     AZSFC_CPP_PERSISTENT_TREE \
     AZSFC_CPP_SET_V_NODE_OVERRIDE \
-    AZSFC_CPP_DISABLE_ADVANCE_ROOT \
+    AZSFC_CPP_USE_CANDIDATE_FEATURES
+  )
+  local optional_flags=(
+    AZSFC_CPP_DISABLE_ADVANCE_ROOT
     AZSFC_CPP_FORCE_TREE_RESET_EACH_STEP
-  do
+    AZSFC_PY_LEGACY_BRIDGE_84453E5
+  )
+
+  for flag in "${required_flags[@]}"; do
     if ! grep -q "$flag" "$src_dir"/*.cpp "$py_dir"/*.py 2>/dev/null; then
-      echo "ERROR: $flag not found in C++/adapter sources." >&2
+      echo "ERROR: required flag $flag not found in C++/adapter sources." >&2
       missing=1
+    fi
+  done
+
+  for flag in "${optional_flags[@]}"; do
+    if ! grep -q "$flag" "$src_dir"/*.cpp "$py_dir"/*.py 2>/dev/null; then
+      if [[ "${!flag:-0}" == "1" ]]; then
+        echo "ERROR: optional flag $flag was enabled but is not present in C++/adapter sources." >&2
+        missing=1
+      else
+        echo "note: optional flag $flag not present; ignoring because it is disabled."
+      fi
     fi
   done
   (( missing == 0 )) || exit 1
@@ -140,6 +179,9 @@ preflight() {
   run_cmd conda run -n virne python -c "from virne.solver.learning.reinforcement_learning.alpha_vne import alpha_zero_cpp_core as m; print(m.__file__)"
 
   local seed
+  if [[ -n "$INIT_MODEL_PATH" ]]; then
+    require_file "$INIT_MODEL_PATH"
+  fi
   for seed in $SEEDS; do
     require_dir "$(dataset_dir "$seed" train)"
     require_dir "$(dataset_dir "$seed" test)"
@@ -210,11 +252,11 @@ run_train() {
     training.computation_budget="$COMPUTATION_BUDGET" \
     training.c_puct=1.4 \
     training.max_training_steps="$TRAIN_MAX_STEPS" \
-    training.guaranteed_save_step="$GUARANTEED_SAVE_STEP" \
+    training.guaranteed_save_step="$TRAIN_GUARANTEED_SAVE_STEP" \
     training.min_buffer_size="$TRAIN_MIN_BUFFER_SIZE" \
     training.num_train_steps_per_epoch="$TRAIN_STEPS_PER_EPOCH" \
     training.max_empty_batches="$TRAIN_MAX_EMPTY_BATCHES" \
-    training.save_interval="$BRAIN_SAVE_INTERVAL" \
+    training.save_interval="$TRAIN_SAVE_INTERVAL" \
     training.save_checkpoint_history="$SWEEP_BRAIN_CHECKPOINTS" \
     training.pure_cpp=true \
     training.use_cpp_mcts=true \
@@ -223,6 +265,7 @@ run_train() {
     training.distributed_training=true \
     training.resume_training=false \
     training.alpha_zero_backbone=transformer \
+    training.alphazero_model_path="$INIT_MODEL_PATH" \
     training.signal_stop_event_on_learner_complete=true \
     use_fixed_dataset=true \
     experiment.if_load_p_net=true \
@@ -335,12 +378,29 @@ run_eval() {
   [[ "$DRY_RUN" == "1" ]] || require_file "$run_dir/summary.csv"
 }
 
+analyze_train_signal() {
+  local train_id="$1"
+  local run_dir
+  run_dir="$(solver_run_dir "$train_id")"
+  section "Replay/Learner Signal train=$train_id"
+  run_cmd conda run -n virne python tools/analyze_alpha_replay_policy.py \
+    --sample-files "$SIGNAL_SAMPLE_FILES" \
+    --policy-window "$SIGNAL_POLICY_WINDOW" \
+    "$run_dir"
+}
+
 run_seed() {
   local seed="$1"
   run_train "$seed"
 
   local train_id models_dir latest_model
   train_id="$LAST_TRAIN_RUN_ID"
+  analyze_train_signal "$train_id"
+
+  if [[ "$RUN_EVAL" != "1" ]]; then
+    return 0
+  fi
+
   models_dir="$(solver_run_dir "$train_id")/models"
   latest_model="$models_dir/policy_latest.pt"
   [[ "$DRY_RUN" == "1" ]] || require_file "$latest_model"
@@ -451,21 +511,29 @@ print(f'wrote {report_md}')
 
 LAST_TRAIN_RUN_ID=""
 print_plan
-if [[ "$DRY_RUN" == "1" ]]; then
-  echo
-  echo "dry-run only. no commands executed."
-  exit 0
-fi
 
 preflight
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo
+  echo "dry-run only. preflight passed; no train/eval commands executed."
+  exit 0
+fi
 
 for seed in $SEEDS; do
   run_seed "$seed"
 done
 
-generate_report
+if [[ "$RUN_EVAL" == "1" ]]; then
+  generate_report
+else
+  section "Generate Report"
+  echo "RUN_EVAL=0; skipped acceptance report. Use the replay/learner signal above to decide whether to continue."
+fi
 
 section "Done"
 echo "analysis_root:  $ANALYSIS_ROOT"
-echo "eval summary:   $EVAL_SUMMARY_CSV"
-echo "report:         $REPORT_MD"
+if [[ "$RUN_EVAL" == "1" ]]; then
+  echo "eval summary:   $EVAL_SUMMARY_CSV"
+  echo "report:         $REPORT_MD"
+fi
