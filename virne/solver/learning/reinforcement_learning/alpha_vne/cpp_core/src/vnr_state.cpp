@@ -1017,7 +1017,7 @@ bool VNRState::reserve_path_for_virtual_edge(int v_src,
     }
 
     const bool allow_available_shortest_fallback =
-        env_flag_enabled("AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK", true);
+        env_flag_enabled("AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK", false);
     if (allow_available_shortest_fallback && !have_selected_path && method != "available_shortest") {
         auto fallback_paths = path_finder_.find_paths(
             *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
@@ -1305,8 +1305,9 @@ VNRState::LinkMappingResult VNRState::link_mapping(const std::vector<int>& node_
             break;
         }
 
-        // Fallback: if k-shortest produced no feasible path, try capacity-aware search
-        if (!selected && method != "available_shortest") {
+        const bool allow_available_shortest_fallback =
+            env_flag_enabled("AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK", false);
+        if (allow_available_shortest_fallback && !selected && method != "available_shortest") {
             auto fallback_paths = path_finder_.find_paths(
                 *p_net_, p_src, p_dst, 1, demands, "available_shortest", capacity_fn);
             for (const auto& candidate : fallback_paths) {

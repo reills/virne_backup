@@ -43,6 +43,9 @@ NEW_ALPHA_SOURCES = {
     },
 }
 
+EXTRA_ALPHA_SUMMARY = ROOT / "results/journal_insurance/20260426T232029Z/alpha_extra/eval_summary.csv"
+GENERALIZATION_ALPHA_SUMMARY = ROOT / "results/journal_insurance/20260426T232029Z/generalization_alpha_vne/eval_summary.csv"
+
 
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
@@ -124,6 +127,21 @@ def load_new_alpha_runs() -> list[EvalRun]:
                         source_path=path,
                     )
                 )
+    if EXTRA_ALPHA_SUMMARY.exists():
+        for row in read_csv(EXTRA_ALPHA_SUMMARY):
+            if row.get("status") != "ok":
+                continue
+            runs.append(
+                EvalRun(
+                    topology=row["topology"],
+                    seed=int(row["seed"]),
+                    acceptance_rate=float(row["acceptance_rate"]),
+                    long_term_r2c_ratio=float(row["long_term_r2c_ratio"]),
+                    clock_running_time=float(row["clock_running_time"]),
+                    run_id=row["run_id"],
+                    source_path=EXTRA_ALPHA_SUMMARY,
+                )
+            )
     return sorted(runs, key=lambda r: (r.topology, r.seed))
 
 
@@ -135,7 +153,7 @@ def aggregate_new_alpha(runs: list[EvalRun]) -> list[dict[str, object]]:
             raise RuntimeError(f"No new AlphaZero runs found for {topology}")
         rows.append(
             {
-                "method": "alpha_zero_sfc_repaired",
+                "method": "alpha_vne",
                 "topology": topology,
                 "scenario": "nominal",
                 "k_eval": 10,
@@ -178,17 +196,48 @@ def load_baseline_k10_nominal() -> list[dict[str, object]]:
             "training_cost",
         ]}
         if out["method"] == "alpha_zero_sfc":
-            out["method"] = "alpha_zero_sfc_legacy"
+            continue
         rows.append(out)
     return rows
+
+
+def load_generalization_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for row in read_csv(MAIN_METRICS):
+        if row["topology"] != "brain":
+            continue
+        if row["k_eval"] and float(row["k_eval"]) != 10.0:
+            continue
+        scenario = row["scenario"]
+        if scenario == "final_alpha_vne_nominal_to_generalization":
+            method = "alpha_vne"
+        elif scenario == "nominal_to_generalization" and row["method"] != "alpha_zero_sfc":
+            method = row["method"]
+        else:
+            continue
+        rows.append({
+            "method": method,
+            "topology": "brain",
+            "scenario": "nominal_to_generalization",
+            "k_eval": 10,
+            "seeds_n": row["seeds_n"],
+            "runs_n": row["runs_n"],
+            "rac_mean": row["rac_mean"],
+            "rac_std": row["rac_std"],
+            "lrc_mean": row["lrc_mean"],
+            "lrc_std": row["lrc_std"],
+            "ast_run_mean": row["ast_run_mean"],
+            "training_cost": row["training_cost"],
+        })
+    return sorted(rows, key=lambda r: (0 if r["method"] == "alpha_vne" else 1, str(r["method"])))
 
 
 def add_improvements(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     output = []
     for topology in ["brain", "geant", "wx100"]:
         subset = [r for r in rows if r["topology"] == topology]
-        repaired = next(r for r in subset if r["method"] == "alpha_zero_sfc_repaired")
-        benchmarks = [r for r in subset if r["method"] != "alpha_zero_sfc_repaired"]
+        repaired = next(r for r in subset if r["method"] == "alpha_vne")
+        benchmarks = [r for r in subset if r["method"] != "alpha_vne"]
         best = max(benchmarks, key=lambda r: float(r["rac_mean"]))
         gain_abs = float(repaired["rac_mean"]) - float(best["rac_mean"])
         gain_rel = gain_abs / float(best["rac_mean"]) if float(best["rac_mean"]) else 0.0
@@ -208,8 +257,7 @@ def add_improvements(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 def build_results_draft(comparison_rows: list[dict[str, object]], improvement_rows: list[dict[str, object]]) -> str:
     compact = []
     preferred_methods = {
-        "alpha_zero_sfc_repaired",
-        "alpha_zero_sfc_legacy",
+        "alpha_vne",
         "ppo_mlp+",
         "ppo_dual_gcn+",
         "mcts",
@@ -244,7 +292,7 @@ def build_results_draft(comparison_rows: list[dict[str, object]], improvement_ro
     lines = [
         "# Journal Results Draft",
         "",
-        "This folder compiles the existing journal-suite benchmark outputs and the repaired AlphaZero-SFC runs after the replay-policy corruption fix.",
+        "This folder compiles the existing journal-suite benchmark outputs and the repaired AlphaVNE runs after the replay-policy corruption fix.",
         "",
         "## Headline Result",
         "",
@@ -269,23 +317,23 @@ def build_results_draft(comparison_rows: list[dict[str, object]], improvement_ro
         "",
         "## Draft Text",
         "",
-        "Across the three nominal topologies, the repaired AlphaZero-SFC model improves request acceptance over the strongest prior benchmark. The largest non-saturated gains occur on Brain and Geant, where the repaired model reaches 0.583 and 0.680 mean acceptance, respectively. On Waxman100, the environment is close to saturated for several methods, but the repaired model remains at the top of the comparison with 0.999 mean acceptance.",
+        "Across the three nominal topologies, AlphaVNE improves request acceptance over the strongest prior benchmark. The largest non-saturated gains occur on Brain and Geant. On Waxman100, the environment is close to saturated for several methods, but AlphaVNE remains at the top of the comparison.",
         "",
-        "The Brain result is the key evidence that the transformer-guided MCTS policy is learning a substantially stronger placement policy than the previous learned and heuristic baselines. The earlier AlphaZero-SFC row in the benchmark table is retained as `alpha_zero_sfc_legacy`; the new row is `alpha_zero_sfc_repaired`.",
+        "The Brain result is the key evidence that the transformer-guided MCTS policy is learning a substantially stronger placement policy than the previous learned and heuristic baselines. The paper-facing final method row is `alpha_vne`; raw internal folders may still use the historical solver key `alpha_zero_sfc`.",
         "",
         "## Files",
         "",
-        "- `main_comparison_k10_nominal.csv`: benchmark rows plus repaired AlphaZero-SFC rows.",
+        "- `main_comparison_k10_nominal.csv`: benchmark rows plus final AlphaVNE rows.",
         "- `main_comparison_k10_nominal.md`: Markdown version of the main comparison.",
-        "- `new_alpha_per_seed.csv`: per-seed repaired AlphaZero-SFC results and source run IDs.",
+        "- `new_alpha_per_seed.csv`: per-seed final AlphaVNE results and source run IDs.",
         "- `headline_improvements.csv`: best-prior comparison by topology.",
         "- `source_manifest.md`: source files used to build these tables.",
         "",
         "## Caveats",
         "",
         "- `wx100` is near saturation; use it as a sanity-check topology rather than the headline claim.",
-        "- These tables use the existing 3-seed benchmark suite. A journal submission is stronger with more seeds or confidence intervals if runtime permits.",
-        "- The ongoing Brain k-sweep should be added as a separate sensitivity table after it finishes.",
+        "- Brain and Geant now use five seeds for AlphaVNE and the listed baselines; Wx100 remains a saturated three-seed sanity check.",
+        "- The Brain/Geant k-sweeps should be reported as sensitivity/runtime tradeoff experiments.",
         "",
     ]
     return "\n".join(lines)
@@ -298,8 +346,9 @@ def main() -> None:
     new_rows = aggregate_new_alpha(new_runs)
     baseline_rows = load_baseline_k10_nominal()
     comparison_rows = baseline_rows + new_rows
-    comparison_rows.sort(key=lambda r: (str(r["topology"]), 0 if r["method"] == "alpha_zero_sfc_repaired" else 1, str(r["method"])))
+    comparison_rows.sort(key=lambda r: (str(r["topology"]), 0 if r["method"] == "alpha_vne" else 1, str(r["method"])))
     improvement_rows = add_improvements(comparison_rows)
+    generalization_rows = load_generalization_rows()
 
     comparison_fields = [
         "method", "topology", "scenario", "k_eval", "seeds_n", "runs_n",
@@ -309,9 +358,10 @@ def main() -> None:
     write_csv(OUT / "headline_improvements.csv", improvement_rows, [
         "topology", "new_alpha_rac", "best_prior_method", "best_prior_rac", "absolute_gain", "relative_gain_pct",
     ])
+    write_csv(OUT / "brain_generalization_comparison.csv", generalization_rows, comparison_fields)
     write_csv(OUT / "new_alpha_per_seed.csv", [
         {
-            "method": "alpha_zero_sfc_repaired",
+            "method": "alpha_vne",
             "topology": r.topology,
             "seed": r.seed,
             "k_eval": 10,
@@ -351,27 +401,55 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    gen_md_rows = [
+        {
+            "method": r["method"],
+            "rac": f"{fmt(r['rac_mean'])} +/- {fmt(r['rac_std'])}",
+            "lrc": fmt(r["lrc_mean"]),
+            "eval_time": fmt(r["ast_run_mean"], 1),
+        }
+        for r in generalization_rows
+    ]
+    (OUT / "brain_generalization_comparison.md").write_text(
+        "# Brain Nominal-to-Generalization Comparison\n\n"
+        + markdown_table(gen_md_rows, [
+            ("method", "Method"),
+            ("rac", "Acceptance rate"),
+            ("lrc", "Long-term R/C"),
+            ("eval_time", "Eval time (s)"),
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+
     source_lines = [
         "# Source Manifest",
         "",
         f"- Baseline benchmark table: `{MAIN_METRICS.relative_to(ROOT)}`",
-        "- Repaired AlphaZero-SFC source runs:",
+        "- Final AlphaVNE nominal source runs:",
     ]
     for r in new_runs:
         source_lines.append(f"- `{r.topology}` seed `{r.seed}`: `{r.source_path.relative_to(ROOT)}` (`{r.run_id}`)")
+    if GENERALIZATION_ALPHA_SUMMARY.exists():
+        source_lines.extend([
+            "",
+            f"- Final AlphaVNE Brain generalization summary: `{GENERALIZATION_ALPHA_SUMMARY.relative_to(ROOT)}`",
+        ])
     (OUT / "source_manifest.md").write_text("\n".join(source_lines) + "\n", encoding="utf-8")
     (OUT / "results_section_draft.md").write_text(build_results_draft(comparison_rows, improvement_rows), encoding="utf-8")
     (OUT / "README.md").write_text(
         "# Paper Journal Results\n\n"
-        "This folder contains the paper-facing result bundle for the repaired AlphaZero-SFC journal comparison.\n\n"
-        "Start with `results_section_draft.md` for prose and headline tables.\n\n"
+        "This folder contains the paper-facing result bundle for the repaired AlphaVNE journal comparison.\n\n"
+        "Start with `results.md` for the source map, then `results_section_draft.md` for prose and headline tables.\n\n"
         "Core tables:\n"
-        "- `main_comparison_k10_nominal.csv`: nominal k=10 benchmark table with repaired AlphaZero-SFC added.\n"
+        "- `results.md`: canonical index of final model checkpoints, eval outputs, k-sweeps, and benchmark folders.\n"
+        "- `main_comparison_k10_nominal.csv`: nominal k=10 benchmark table with final AlphaVNE added.\n"
         "- `main_comparison_k10_nominal.md`: Markdown rendering of the same table.\n"
+        "- `brain_generalization_comparison.csv`: Brain nominal-to-generalization comparison.\n"
         "- `headline_improvements.csv`: acceptance-rate gain over the strongest prior row per topology.\n"
-        "- `new_alpha_per_seed.csv`: repaired AlphaZero-SFC per-seed source results.\n"
+        "- `new_alpha_per_seed.csv`: final AlphaVNE per-seed source results.\n"
         "- `baseline_reference_main_metrics.csv`: raw existing benchmark aggregate copied from `results/journal_suite/tables/main_metrics.csv`.\n"
-        "- `source_manifest.md`: exact result files used for the repaired AlphaZero-SFC rows.\n\n"
+        "- `source_manifest.md`: exact result files used for the AlphaVNE rows.\n\n"
         "Regenerate with:\n\n"
         "```bash\n"
         "conda run -n virne python tools/build_paperjournal_results.py\n"
