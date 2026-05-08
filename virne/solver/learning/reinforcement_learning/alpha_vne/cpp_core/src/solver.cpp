@@ -1313,7 +1313,15 @@ SolveResult solve_vnr(
     double policy_eval_ms = 0.0;
     double mcts_ms = 0.0;
     double postprocess_ms = 0.0;
-    torch::Tensor start_embedding = policy->start_embedding().to(torch_device);
+    torch::Tensor start_embedding;
+    if (policy) {
+        start_embedding = policy->start_embedding().to(torch_device);
+    } else {
+        start_embedding = torch::zeros(
+            {compute_p_net_feature_dim(vnr_config)},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch_device)
+        );
+    }
 
     std::unordered_map<int, torch::Tensor> edge_index_batch_cache;
     std::unordered_map<int, torch::Tensor> p_batch_cache;
