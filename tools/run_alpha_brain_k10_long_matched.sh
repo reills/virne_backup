@@ -4,12 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CONFIG_PATH="results/journal_suite/alpha_brain_k10_long_matched.yaml"
-PROFILE="alpha_brain_k10_long_matched"
+CONFIG_PATH="${CONFIG_PATH:-results/journal_suite/alpha_brain_k10_long_matched.yaml}"
+PROFILE="${PROFILE:-alpha_brain_k10_long_matched}"
 
 STAGES="${STAGES:-preflight generate-datasets train eval}"
 SEEDS_CSV="${SEEDS_CSV:-0,1,2}"
+MAX_TRAINING_STEPS="${MAX_TRAINING_STEPS:-3000}"
+STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 FORCE_DATASETS="${FORCE_DATASETS:-0}"
+RESUME="${RESUME:-1}"
 RUN_AGGREGATE="${RUN_AGGREGATE:-0}"
 BOOTSTRAP_SAMPLES="${BOOTSTRAP_SAMPLES:-200}"
 
@@ -21,7 +24,9 @@ from omegaconf import OmegaConf
 
 cfg = OmegaConf.load('$CONFIG_PATH')
 seeds = [int(item.strip()) for item in '$SEEDS_CSV'.split(',') if item.strip()]
+max_training_steps = int('$MAX_TRAINING_STEPS')
 
+cfg.journal_suite.name = f\"journal_suite__brain_k10_steps{max_training_steps}_$STAMP\"
 cfg.journal_suite.default_profile = '$PROFILE'
 cfg.journal_suite.profiles['$PROFILE'] = OmegaConf.create({
     'seeds': seeds,
@@ -53,7 +58,7 @@ cfg.journal_suite.profiles['$PROFILE'] = OmegaConf.create({
             'training.num_train_epochs=16',
             'experiment.num_simulations=0',
             'training.c_puct=1.4',
-            'training.max_training_steps=3000',
+            f'training.max_training_steps={max_training_steps}',
             'training.min_buffer_size=128',
             'training.num_train_steps_per_epoch=128',
             'training.max_empty_batches=5400',
@@ -69,16 +74,22 @@ OmegaConf.save(cfg, '$CONFIG_PATH')
 print('wrote $CONFIG_PATH')
 print('profile: $PROFILE')
 print('seeds:', seeds)
+print('max_training_steps:', max_training_steps)
 "
 
 run_stage() {
   local stage="$1"
   shift
   echo "=== profile=${PROFILE} stage=${stage} ==="
+  local resume_args=()
+  if [[ "$RESUME" == "1" && ( "$stage" == "train" || "$stage" == "eval" ) ]]; then
+    resume_args+=(--resume)
+  fi
   conda run -n virne python tools/journal_experiments.py \
     --config "$CONFIG_PATH" \
     --profile "$PROFILE" \
     --stage "$stage" \
+    "${resume_args[@]}" \
     "$@"
 }
 
@@ -110,7 +121,7 @@ seeds = [int(item.strip()) for item in '$SEEDS_CSV'.split(',') if item.strip()]
 
 for seed in seeds:
     matches = sorted(
-        root.glob(f'journal_suite__alpha_zero_sfc__brain__nominal__seed{seed}__eval__keval10__ckpt*/summary.csv'),
+        root.glob(f'*__alpha_zero_sfc__brain__nominal__seed{seed}__eval__keval10__ckpt*/summary.csv'),
         key=lambda p: p.stat().st_mtime,
     )
     if not matches:

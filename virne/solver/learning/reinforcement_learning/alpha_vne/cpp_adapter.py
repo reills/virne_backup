@@ -1123,10 +1123,20 @@ class CppFullSolver:
         search_cfg = self._build_search_config(training=training)
 
         policy_ts_path = None
-        try:
-            policy_ts_path = self.actor.policy_path.replace(".pt", ".ts")
-        except Exception:
-            policy_ts_path = None
+        explicit_model_path = getattr(self.actor, "alphazero_model_path", "") or ""
+        explicit_torchscript = (
+            isinstance(explicit_model_path, str)
+            and explicit_model_path.endswith(".ts")
+            and os.path.exists(explicit_model_path)
+            and not bool(training)
+        )
+        if explicit_torchscript:
+            policy_ts_path = explicit_model_path
+        else:
+            try:
+                policy_ts_path = self.actor.policy_path.replace(".pt", ".ts")
+            except Exception:
+                policy_ts_path = None
         if not policy_ts_path:
             raise RuntimeError("Could not resolve TorchScript policy path.")
 
@@ -1171,7 +1181,7 @@ class CppFullSolver:
         except Exception:
             seed = None
 
-        policy_meta_path = getattr(self.actor, "policy_path", "") or ""
+        policy_meta_path = explicit_model_path if explicit_torchscript else (getattr(self.actor, "policy_path", "") or "")
         write_replay = bool(pure_cpp and training and not getattr(self.actor, "disable_trajectory_writing", False))
         if replay_dir is None:
             replay_dir = getattr(self.actor, "replay_dir", "") or ""

@@ -49,6 +49,42 @@ def _make_vnr_state(physical, virtual_net, shortest_method: str, allow_rejection
     return cpp_core.VNRState(physical, virtual_net, cfg)
 
 
+def test_virtual_node_order_ablation_uses_fixed_ids(monkeypatch):
+    p_net = _build_network(num_nodes=3, edges=[], edge_bw=[], directed=False)
+    v_net = cpp_core.Network()
+    v_net.set_num_nodes(3)
+    v_net.set_edges([], is_directed=False)
+    v_net.set_node_attrs([{"cpu": 1.0}, {"cpu": 2.0}, {"cpu": 9.0}])
+    v_net.set_edge_attrs([])
+
+    monkeypatch.setenv("AZSFC_CPP_VIRTUAL_NODE_ORDER", "demand")
+    demand_order = _make_vnr_state(p_net, v_net, "bfs_shortest").virtual_order
+    monkeypatch.setenv("AZSFC_CPP_VIRTUAL_NODE_ORDER", "fixed")
+    fixed_order = _make_vnr_state(p_net, v_net, "bfs_shortest").virtual_order
+
+    assert list(demand_order) == [2, 1, 0]
+    assert list(fixed_order) == [0, 1, 2]
+
+
+def test_reachability_filter_ablation_retains_unreachable_candidates(monkeypatch):
+    p_net = _build_network(
+        num_nodes=3,
+        edges=[(0, 1)],
+        edge_bw=[1.0],
+        directed=False,
+    )
+    v_net = _build_two_node_vnr(demand=1.0)
+
+    monkeypatch.setenv("AZSFC_CPP_USE_REACHABILITY_FILTER", "1")
+    filtered = _make_vnr_state(p_net, v_net, "bfs_shortest", k=1).create_child(0)
+    filtered_candidates = list(filtered.get_candidate_nodes())
+    monkeypatch.setenv("AZSFC_CPP_USE_REACHABILITY_FILTER", "0")
+    unfiltered = _make_vnr_state(p_net, v_net, "bfs_shortest", k=1).create_child(0)
+
+    assert filtered_candidates == [1]
+    assert list(unfiltered.get_candidate_nodes()) == [1, 2]
+
+
 # Regression guard: path search must not mark a feasible directed link route as infeasible.
 def test_available_k_shortest_keeps_feasible_directed_route():
     p_net = _build_network(

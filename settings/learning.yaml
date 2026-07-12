@@ -37,7 +37,7 @@ training:
   # Model loading options
   resume_training: true     # If true, load policy_latest.pt if it exists
   alphazero_model_path: ""  # Specific path to load AlphaZero weights (overrides resume_training)
-  alpha_zero_backbone: gcn  # gcn | transformer
+  alpha_zero_backbone: gcn  # mlp | gcn | transformer
   # GPU batching optimizations
   use_batched_gpu: true     # Use batched GPU worker for MCTS evaluation
   gpu_batch_size: 32        # Batch size for GPU worker

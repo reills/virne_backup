@@ -76,6 +76,14 @@ bool env_flag_enabled(const char* name, bool default_value) {
     }
     return default_value;
 }
+
+std::string env_value_lower(const char* name, const char* default_value) {
+    const char* raw = std::getenv(name);
+    std::string value(raw == nullptr ? default_value : raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
 }  // namespace
 
 VNRState::VNRState(std::shared_ptr<const Network> physical,
@@ -106,35 +114,42 @@ VNRState::VNRState(std::shared_ptr<const Network> physical,
 
 void VNRState::initialise_virtual_order() {
     int v_nodes = v_net_->num_nodes;
-    std::vector<std::pair<int, double>> scores;
-    scores.reserve(v_nodes);
-
-    for (int v = 0; v < v_nodes; ++v) {
-        double node_sum = 0.0;
-        const auto& node_attrs = v_net_->node_attrs[v];
-        for (const auto& attr_name : config_.node_resource_names) {
-            node_sum += safe_lookup(node_attrs, attr_name);
-        }
-
-        double edge_sum = 0.0;
-        for (const auto& [neighbor, edge_id] : v_net_->adjacency[v]) {
-            const auto& edge_attrs = v_net_->edge_attrs[edge_id];
-            for (const auto& attr_name : config_.link_resource_names) {
-                edge_sum += safe_lookup(edge_attrs, attr_name);
-            }
-        }
-
-        scores.emplace_back(v, node_sum + edge_sum);
-    }
-
-    std::stable_sort(scores.begin(), scores.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
+    const std::string order_mode = env_value_lower("AZSFC_CPP_VIRTUAL_NODE_ORDER", "demand");
 
     v_order_.clear();
-    v_order_.reserve(scores.size());
-    for (const auto& [node_id, _] : scores) {
-        v_order_.push_back(node_id);
+    v_order_.reserve(v_nodes);
+    if (order_mode == "fixed" || order_mode == "id" || order_mode == "identity") {
+        v_order_.resize(v_nodes);
+        std::iota(v_order_.begin(), v_order_.end(), 0);
+    } else {
+        std::vector<std::pair<int, double>> scores;
+        scores.reserve(v_nodes);
+
+        for (int v = 0; v < v_nodes; ++v) {
+            double node_sum = 0.0;
+            const auto& node_attrs = v_net_->node_attrs[v];
+            for (const auto& attr_name : config_.node_resource_names) {
+                node_sum += safe_lookup(node_attrs, attr_name);
+            }
+
+            double edge_sum = 0.0;
+            for (const auto& [neighbor, edge_id] : v_net_->adjacency[v]) {
+                const auto& edge_attrs = v_net_->edge_attrs[edge_id];
+                for (const auto& attr_name : config_.link_resource_names) {
+                    edge_sum += safe_lookup(edge_attrs, attr_name);
+                }
+            }
+
+            scores.emplace_back(v, node_sum + edge_sum);
+        }
+
+        std::stable_sort(scores.begin(), scores.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+
+        for (const auto& [node_id, _] : scores) {
+            v_order_.push_back(node_id);
+        }
     }
 
     if (v_order_.empty()) {
@@ -373,7 +388,8 @@ std::vector<int> VNRState::get_candidate_nodes() const {
         }
     }
 
-    if (!link_requirements.empty() && !candidates.empty()) {
+    if (env_flag_enabled("AZSFC_CPP_USE_REACHABILITY_FILTER", true) &&
+        !link_requirements.empty() && !candidates.empty()) {
         std::vector<int> reachable_candidates;
         reachable_candidates.reserve(candidates.size());
         for (int candidate : candidates) {

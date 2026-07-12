@@ -12,6 +12,8 @@ def normalize_model_name(name: str | None) -> str:
         return "transformer"
     if key in {"gcn", "gcn_small", "ppo_gcn", "dual_gcn_like"}:
         return "gcn"
+    if key in {"mlp", "plain_mlp", "node_mlp"}:
+        return "mlp"
     raise ValueError(f"Unsupported alpha_zero_backbone={name}")
 
 
@@ -32,6 +34,8 @@ def _module_name_for_model(model_name: str) -> str:
         return ".net"
     if model_name == "gcn":
         return ".gcn_net"
+    if model_name == "mlp":
+        return ".mlp_net"
     raise ValueError(f"Unsupported alpha_zero model_name={model_name}")
 
 
@@ -47,4 +51,4 @@ def build_actor_critic(model_config: dict) -> nn.Module:
 
 
 def prefers_trace_torchscript(config_or_model_config: Any) -> bool:
-    return resolve_model_name(config_or_model_config) == "gcn"
+    return resolve_model_name(config_or_model_config) in {"gcn", "mlp"}

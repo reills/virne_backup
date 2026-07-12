@@ -12,7 +12,7 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "paperjournal"
+OUT = ROOT / "paperjournal/results_data"
 MAIN_METRICS = ROOT / "results/journal_suite/tables/main_metrics.csv"
 RESULTS_ROOT = ROOT / "results/journal_suite/results/alpha_zero_sfc"
 

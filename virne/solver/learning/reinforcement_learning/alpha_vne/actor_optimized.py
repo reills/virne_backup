@@ -56,6 +56,16 @@ class OptimizedAlphaZeroActor(Solver):
         self.force_root_noise_all_modes = str(
             os.environ.get("AZSFC_FORCE_ROOT_NOISE_ALWAYS", "0")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        training_cfg = getattr(config, "training", None)
+        use_cpp_flag = False
+        cfg_pure_cpp = False
+        if training_cfg is not None:
+            if isinstance(training_cfg, dict):
+                use_cpp_flag = bool(training_cfg.get("use_cpp_mcts", False))
+                cfg_pure_cpp = bool(training_cfg.get("pure_cpp", False))
+            else:
+                use_cpp_flag = bool(getattr(training_cfg, "use_cpp_mcts", False))
+                cfg_pure_cpp = bool(getattr(training_cfg, "pure_cpp", False))
 
         # Policy path should be in models directory, not replay buffer
         if models_dir:
@@ -148,8 +158,22 @@ class OptimizedAlphaZeroActor(Solver):
 
         # Load model weights
         alphazero_model_path = getattr(config.training, 'alphazero_model_path', '')
+        self.alphazero_model_path = alphazero_model_path
         resume_training = getattr(config.training, 'resume_training', True)
-        self.policy_network.load_weights(alphazero_model_path, resume_training)
+        python_load_path = alphazero_model_path
+        if (
+            isinstance(alphazero_model_path, str)
+            and alphazero_model_path.endswith(".ts")
+            and use_cpp_flag
+            and cfg_pure_cpp
+        ):
+            python_load_path = ""
+            resume_training = False
+            self.logger.info(
+                "Using TorchScript AlphaZero checkpoint for pure C++ inference; "
+                "skipping Python state-dict load."
+            )
+        self.policy_network.load_weights(python_load_path, resume_training)
 
         # Backward compatibility: expose model and gpu_manager
         self.policy = self.policy_network.model
@@ -220,8 +244,6 @@ class OptimizedAlphaZeroActor(Solver):
 
         self.cpp_adapter = None
         self.cpp_full_solver = None
-        training_cfg = getattr(config, "training", None)
-        use_cpp_flag = False
         self.pure_cpp = False
         if training_cfg is not None:
             if isinstance(training_cfg, dict):
