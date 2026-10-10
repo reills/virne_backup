@@ -230,9 +230,9 @@ class VirtualNetworkRequestSimulator(object):
         assert os.path.exists(events_file_path), f"events.yaml file does not exist in {dataset_dir}"
         assert os.path.exists(setting_file_path), f"setting.yaml file does not exist in {dataset_dir}"
         # Load the setting file
-        v_sim_setting = read_setting(setting_file_path, mode='r+')
+        v_sim_setting = read_setting(setting_file_path, mode='r')
         # Load the events file
-        event_info_list = read_setting(events_file_path, mode='r+')
+        event_info_list = read_setting(events_file_path, mode='r')
         events = []
         for e in event_info_list:
             v_net_event = VirtualNetworkEvent(v_net_id=int(e['v_net_id']), time=float(e['time']), type=int(e['type']), id=int(e['id']))
