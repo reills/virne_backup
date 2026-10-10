@@ -45,6 +45,11 @@ pretrained
 exp_flag_vne_data
 exp_srl_vne_data
 
+# Runtime checkout of the authors' FlagVNE repository.  It is pinned and
+# checksummed by tools/run_flagvne_compnet_campaign.sh, but is not vendored
+# because the upstream repository does not publish a license file.
+third_party/flag-vne/
+
 # docs
 docs/build/
 docs/source/_autosummary/
