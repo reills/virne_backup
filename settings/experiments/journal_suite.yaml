@@ -47,7 +47,7 @@ journal_suite:
 
   paired_matching_policy:
     enabled: true
-    method_keys: [alpha_zero_sfc, mcts, grc_rank, pso_meta]
+    method_keys: [alpha_zero_sfc, gpp_vne, gpp_vne_infocom, mcts, grc_rank, pso_meta]
     match_fields: [topology, scenario, seed, k_value]
 
   offline_slice:
@@ -128,6 +128,47 @@ journal_suite:
       solver_name: ppo_dual_gcn+
       trainable: true
       train_k_values: [10]
+    gpp_vne: &gpp_vne_method
+      solver_name: gpp_vne
+      trainable: true
+      train_k_values: [10]
+      # Paper-matched settings from Table 2 and the 25k-episode learning plot.
+      # The path head, dropout rate, PPO replay semantics, and reward lambda are
+      # not reproducibly specified in the paper; declared choices are documented
+      # in docs/benchmarks/gpp_vne_reproduction.md.
+      overrides:
+        common:
+          - solver.node_ranking_method=nrm
+          - training.distributed_training=false
+          - training.num_workers=1
+          - training.batch_size=64
+          - nn.embedding_dim=64
+          - nn.hidden_dim=64
+          - nn.num_layers=2
+          - nn.dropout_prob=0.1
+          - rl.gamma=0.99
+          - rl.learning_rate.actor=0.0001
+          - rl.learning_rate.critic=0.0001
+          - rl.gae_lambda=0.95
+          - rl.eps_clip=0.2
+          - rl.coef_critic_loss=0.5
+          - rl.coef_entropy_loss=0.01
+          - rl.coef_mask_loss=0.0
+          - rl.max_grad_norm=0.5
+          - rl.target_steps=500
+          - rl.repeat_times=10
+          - rl.gpp_vne.link_embedding_interval=3
+          - rl.gpp_vne.cost_weight=0.1
+          - rl.gpp_vne.failure_penalty=1.0
+          - rl.gpp_vne.reward_scale=1.0
+        train:
+          - training.num_train_epochs=25
+    # Keep the paper run in its own method namespace.  Journal-suite run IDs
+    # otherwise do not contain the selected profile, so a completed one-epoch
+    # gpp_vne_smoke checkpoint could be mistaken for a resumable main run.
+    gpp_vne_infocom:
+      <<: *gpp_vne_method
+      run_id_namespace: gpp_vne_infocom
 
   profiles:
     tiny:
@@ -161,20 +202,45 @@ journal_suite:
       seeds: [0, 1, 2]
       topologies: [wx100, geant, brain]
       scenarios: [nominal]
-      methods: [alpha_zero_sfc, mcts, grc_rank, pso_meta, ppo_mlp_plus, ppo_dual_gcn_plus]
+      methods: [alpha_zero_sfc, gpp_vne, mcts, grc_rank, pso_meta, ppo_mlp_plus, ppo_dual_gcn_plus]
       k_eval_values: [1, 3, 5, 10, 15]
       generalization_cells: []
     full:
       seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
       topologies: [wx100, geant, brain, wx500]
       scenarios: [nominal]
-      methods: [alpha_zero_sfc, mcts, grc_rank, pso_meta, ppo_mlp_plus, ppo_dual_gcn_plus]
+      methods: [alpha_zero_sfc, gpp_vne, mcts, grc_rank, pso_meta, ppo_mlp_plus, ppo_dual_gcn_plus]
       k_eval_values: [1, 3, 5, 10, 15]
       generalization_cells:
         - train_scenario: nominal
           eval_scenario: generalization
           topology: wx500
           seed: 0
+    gpp_vne_smoke:
+      seeds: [0]
+      topologies: [brain]
+      scenarios: [nominal]
+      methods: [gpp_vne]
+      k_eval_values: [10]
+      generalization_cells: []
+      offline_slice_enabled: false
+      overrides:
+        common:
+          - training.use_cuda=false
+        train:
+          - training.num_train_epochs=1
+          - rl.target_steps=64
+    gpp_vne_main:
+      seeds: [0, 1, 2, 3, 4]
+      topologies: [brain, geant]
+      scenarios: [nominal]
+      methods: [gpp_vne_infocom]
+      k_eval_values: [10]
+      generalization_cells: []
+      offline_slice_enabled: false
+      # Evaluate sequentially on the single GPU so runtime and memory use are
+      # not contaminated by two policies executing concurrently.
+      evaluation_parallelism: 1
 
   overrides:
     common:

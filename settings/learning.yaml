@@ -131,6 +131,14 @@ rl:
   target_kl: null
   gae_lambda: 0.98
   repeat_times: 10
+  # Independent reproduction settings for Ali and Ullah's GPPVNE benchmark.
+  # The paper does not report the reward trade-off lambda or failure penalty,
+  # so both remain explicit, sweepable experiment parameters.
+  gpp_vne:
+    link_embedding_interval: 3
+    cost_weight: 0.1
+    failure_penalty: 1.0
+    reward_scale: 1.0
   # DQN
   explore_rate: 0.9
   # Safe RL

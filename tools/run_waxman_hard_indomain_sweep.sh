@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 TOPOLOGY_KEY="${TOPOLOGY_KEY:-wx100}"
 HARD_SCENARIO_KEY="${HARD_SCENARIO_KEY:-${TOPOLOGY_KEY}_hard_compare}"
-METHODS="${METHODS:-alpha_zero_sfc grc_rank mcts ppo_dual_gcn_plus ppo_mlp_plus pso_meta}"
+METHODS="${METHODS:-alpha_zero_sfc gpp_vne grc_rank mcts ppo_dual_gcn_plus ppo_mlp_plus pso_meta}"
 SEEDS="${SEEDS:-0 1 2}"
 K_EVAL="${K_EVAL:-10}"
 COMPUTATION_BUDGET="${COMPUTATION_BUDGET:-96}"
@@ -60,7 +60,7 @@ method_slug() {
 
 is_trainable_method() {
   case "$1" in
-    alpha_zero_sfc|ppo_dual_gcn_plus|ppo_mlp_plus) return 0 ;;
+    alpha_zero_sfc|gpp_vne|ppo_dual_gcn_plus|ppo_mlp_plus) return 0 ;;
     *) return 1 ;;
   esac
 }

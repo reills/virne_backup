@@ -33,6 +33,27 @@ def _load_smoke_profile():
     return global_cfg, suite_cfg, profile_cfg
 
 
+def test_gpp_vne_main_uses_isolated_production_run_namespace() -> None:
+    config_path = REPO_ROOT / 'settings' / 'experiments' / 'journal_suite.yaml'
+    _global_cfg, suite_cfg = journal_experiments._load_suite_config(config_path)
+    _, profile_cfg = journal_experiments._profile_or_default(suite_cfg, 'gpp_vne_main')
+    jobs = journal_experiments._build_planned_jobs(
+        suite_cfg=suite_cfg,
+        profile_cfg=profile_cfg,
+        repo_root=REPO_ROOT,
+    )
+
+    assert len(jobs) == 20
+    assert sum(job.stage == 'train' for job in jobs) == 10
+    assert sum(job.stage == 'eval' for job in jobs) == 10
+    assert all(job.method_key == 'gpp_vne_infocom' for job in jobs)
+    assert all(job.solver_name == 'gpp_vne' for job in jobs)
+    assert all('__gpp_vne_infocom__' in job.run_id for job in jobs)
+    assert all('__gpp_vne__' not in job.run_id for job in jobs)
+    assert int(profile_cfg.evaluation_parallelism) == 1
+    assert int(suite_cfg.methods.gpp_vne_infocom.overrides.train[0].split('=')[1]) == 25
+
+
 def _make_train_job(
     *,
     run_id: str,

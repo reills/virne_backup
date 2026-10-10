@@ -70,6 +70,11 @@ rl:
   target_kl: null
   gae_lambda: 0.98
   repeat_times: 10
+  gpp_vne:
+    link_embedding_interval: 3
+    cost_weight: 0.1
+    failure_penalty: 1.0
+    reward_scale: 1.0
   # DQN
   explore_rate: 0.9
   # Safe RL

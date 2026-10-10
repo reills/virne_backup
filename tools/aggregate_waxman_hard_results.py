@@ -11,6 +11,7 @@ from pathlib import Path
 
 METHOD_DISPLAY = {
     "alpha_zero_sfc": "AlphaVNE",
+    "gpp_vne": "GPP-VNE (reproduction)",
     "grc_rank": "GRC-Rank",
     "mcts": "MCTS",
     "ppo_dual_gcn_plus": "PPO-Dual-GCN+",
@@ -20,6 +21,7 @@ METHOD_DISPLAY = {
 
 SOLVER_DIR_TO_METHOD = {
     "alpha_zero_sfc": "alpha_zero_sfc",
+    "gpp_vne": "gpp_vne",
     "grc_rank": "grc_rank",
     "mcts": "mcts",
     "ppo_dual_gcn+": "ppo_dual_gcn_plus",
@@ -363,7 +365,7 @@ def main() -> int:
         default="zero_shot",
     )
     parser.add_argument("--scenario-token", default="")
-    parser.add_argument("--methods", default="alpha_zero_sfc grc_rank mcts ppo_dual_gcn_plus ppo_mlp_plus pso_meta")
+    parser.add_argument("--methods", default="alpha_zero_sfc gpp_vne grc_rank mcts ppo_dual_gcn_plus ppo_mlp_plus pso_meta")
     parser.add_argument("--seeds", default="0 1 2")
     parser.add_argument("--k-eval", type=int, default=10)
     args = parser.parse_args()

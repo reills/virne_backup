@@ -553,7 +553,12 @@ def _resolve_offline_slice_plan(
     profile_cfg: DictConfig,
 ) -> OfflineSlicePlan:
     offline_cfg = suite_cfg.get('offline_slice')
-    if offline_cfg is None or not bool(offline_cfg.get('enabled', False)):
+    profile_offline_enabled = bool(profile_cfg.get('offline_slice_enabled', True))
+    if (
+        offline_cfg is None
+        or not bool(offline_cfg.get('enabled', False))
+        or not profile_offline_enabled
+    ):
         return OfflineSlicePlan(
             enabled=False,
             method_keys=tuple(),
@@ -720,6 +725,10 @@ def _build_planned_jobs(
             raise ValueError(f"Method '{method_key}' missing from journal_suite.methods")
         method_cfg = methods_cfg[method_key]
         solver_name = str(method_cfg.solver_name)
+        # A method may share an implementation while retaining an isolated run
+        # namespace.  This prevents short validation profiles from satisfying
+        # the resume checks of a paper-scale profile that uses the same solver.
+        run_id_namespace = str(method_cfg.get('run_id_namespace', solver_name))
         trainable = bool(method_cfg.get('trainable', False))
         train_k_values = [int(v) for v in _as_list(method_cfg.get('train_k_values', []))]
 
@@ -739,7 +748,7 @@ def _build_planned_jobs(
                         for k_train in train_k_values:
                             run_id = _build_run_id(
                                 suite_name=suite_name,
-                                solver_name=solver_name,
+                                solver_name=run_id_namespace,
                                 topology_key=topology_key,
                                 scenario_key=scenario_key,
                                 seed=seed,
@@ -795,7 +804,7 @@ def _build_planned_jobs(
                     for k_eval in k_eval_values:
                         run_id = _build_run_id(
                             suite_name=suite_name,
-                            solver_name=solver_name,
+                            solver_name=run_id_namespace,
                             topology_key=topology_key,
                             scenario_key=scenario_key,
                             seed=seed,
@@ -863,7 +872,7 @@ def _build_planned_jobs(
             for k_eval in k_eval_values:
                 run_id = _build_run_id(
                     suite_name=suite_name,
-                    solver_name=solver_name,
+                    solver_name=run_id_namespace,
                     topology_key=cell.topology_key,
                     scenario_key=scenario_key,
                     seed=cell.seed,
@@ -920,6 +929,7 @@ def _build_planned_jobs(
         for method_key in offline_plan.method_keys:
             method_cfg = methods_cfg[method_key]
             solver_name = str(method_cfg.solver_name)
+            run_id_namespace = str(method_cfg.get('run_id_namespace', solver_name))
             for topology_key in offline_plan.topology_keys:
                 topology_cfg = topologies_cfg[topology_key]
                 topology_file = _resolve_path(str(topology_cfg.file_path), repo_root)
@@ -941,7 +951,7 @@ def _build_planned_jobs(
                         for k_eval in offline_plan.k_eval_values:
                             run_id = _build_run_id(
                                 suite_name=suite_name,
-                                solver_name=solver_name,
+                                solver_name=run_id_namespace,
                                 topology_key=topology_key,
                                 scenario_key=scenario_key,
                                 seed=seed,
@@ -3233,7 +3243,9 @@ def run_eval(
     registry_path, shard_dir = _resolve_train_registry_paths(suite_cfg)
     eval_cfg = suite_cfg.get('evaluation', OmegaConf.create({}))
     watchdog_timeout_sec = max(0.0, float(eval_cfg.get('run_watchdog_timeout_sec', 0.0)))
-    parallelism = int(eval_cfg.get('parallelism', 1))
+    parallelism = int(
+        profile_cfg.get('evaluation_parallelism', eval_cfg.get('parallelism', 1))
+    )
     if parallelism < 1:
         parallelism = 1
 
