@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Matched evaluation of AlphaVNE neural-guided MCTS against the same
-# feasibility-aware MCTS transition with neural policy/value guidance disabled.
+# Matched evaluation of AlphaVNE with neither neural head, each trained head
+# used alone at inference, and joint policy/value guidance.
 #
-# Both arms use identical test files, seeds, k, MCTS simulation budget, PUCT
+# All arms use identical test files, seeds, k, MCTS simulation budget, PUCT
 # constant, constraints, and C++ search implementation. The defaults evaluate
 # the five final paper checkpoints for BRAIN and GEANT at k=1 and 96 MCTS
 # simulations per placement decision.
@@ -21,7 +21,7 @@ cd "$ROOT_DIR"
 STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 TOPOLOGIES="${TOPOLOGIES:-brain geant}"
 SEEDS="${SEEDS:-0 1 2 3 4}"
-ARMS="${ARMS:-no_nn nn}"
+ARMS="${ARMS:-no_nn policy_only value_only nn}"
 K_SHORT="${K_SHORT:-1}"
 COMPUTATION_BUDGET="${COMPUTATION_BUDGET:-96}"
 # Fixed journal datasets contain 1,000 requests and are not truncated by the
@@ -87,8 +87,8 @@ normalize_topology() {
 
 normalize_arm() {
   case "$1" in
-    nn|no_nn) echo "$1" ;;
-    *) echo "unsupported arm '$1'; expected nn or no_nn" >&2; exit 1 ;;
+    nn|policy_only|value_only|no_nn) echo "$1" ;;
+    *) echo "unsupported arm '$1'; expected nn, policy_only, value_only, or no_nn" >&2; exit 1 ;;
   esac
 }
 
@@ -150,7 +150,7 @@ preflight() {
   run_cmd conda run -n virne python -c \
     "from virne.solver.learning.reinforcement_learning.alpha_vne import alpha_zero_cpp_core as m; print(m.__file__)"
 
-  if [[ " $ARMS " == *" nn "* ]]; then
+  if [[ " $ARMS " == *" nn "* || " $ARMS " == *" policy_only "* || " $ARMS " == *" value_only "* ]]; then
     run_cmd conda run -n virne python -c \
       "import torch; assert torch.cuda.is_available(), 'CUDA is required for the NN arm'; print(torch.cuda.get_device_name(0))"
   fi
@@ -197,7 +197,7 @@ print(destination)
 
 run_eval() {
   local topology="$1" seed="$2" arm="$3"
-  local id run_dir test_dir source weights use_nn use_cuda model_arg
+  local id run_dir test_dir source weights use_nn use_policy use_value use_cuda model_arg
   id="$(run_id "$topology" "$seed" "$arm")"
   run_dir="$SOLVER_RESULTS_ROOT/$id"
   test_dir="$(dataset_dir "$topology" "$seed")"
@@ -208,7 +208,7 @@ run_eval() {
     return 0
   fi
 
-  if [[ "$arm" == "nn" ]]; then
+  if [[ "$arm" != "no_nn" ]]; then
     source="$(source_model "$topology" "$seed")"
     weights="$(weights_path "$topology" "$seed")"
     extract_weights "$source" "$weights"
@@ -220,6 +220,12 @@ run_eval() {
     use_cuda=false
     model_arg=""
   fi
+  case "$arm" in
+    nn) use_policy=true; use_value=true ;;
+    policy_only) use_policy=true; use_value=false ;;
+    value_only) use_policy=false; use_value=true ;;
+    no_nn) use_policy=false; use_value=false ;;
+  esac
 
   section "Eval $topology seed=$seed arm=$arm k=$K_SHORT budget=$COMPUTATION_BUDGET"
   local command=(
@@ -241,8 +247,8 @@ run_eval() {
     training.pure_cpp=true
     training.use_cpp_mcts=true
     training.use_neural_network="$use_nn"
-    training.use_nn_policy="$use_nn"
-    training.use_nn_value="$use_nn"
+    training.use_nn_policy="$use_policy"
+    training.use_nn_value="$use_value"
     +training.rollout_depth_limit="$ROLLOUT_DEPTH_LIMIT"
     training.use_cuda="$use_cuda"
     training.use_batched_gpu=false

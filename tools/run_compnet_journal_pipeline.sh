@@ -29,6 +29,7 @@ RUN_LOG="$STATE_ROOT/pipeline.log"
 HARD_STRESS_ROOT="$STATE_ROOT/hard_waxman"
 GENERALIZATION_ROOT="$STATE_ROOT/generalization"
 EXTERNAL_MCTS_ROOT="$STATE_ROOT/matched_external_mcts"
+VALUE_HEAD_ROOT="$STATE_ROOT/value_head_ablation"
 
 PAPER_DIR="${PAPER_DIR:-$ROOT_DIR/paperjournal/compnet}"
 GENERATED_DIR="${GENERATED_DIR:-$PAPER_DIR/generated}"
@@ -136,6 +137,7 @@ preflight() {
   require_file tools/run_gpp_vne_benchmark.sh
   require_file tools/run_alpha_matched_nn_vs_no_nn_k1.sh
   require_file tools/summarize_compnet_matched_external_mcts.py
+  require_file tools/summarize_compnet_value_head_ablation.py
   require_file tools/run_alpha_vne_generalization_eval.py
   require_file tools/aggregate_waxman_hard_results.py
   require_file tools/aggregate_journal_results.py
@@ -193,15 +195,15 @@ benchmark_additions() {
 }
 
 matched_search() {
-  # Same test trace, transition model, k=1, and 96 MCTS simulations for both
-  # arms. This addresses the compute-budget fairness issue at equal simulation
-  # count. It does not claim equal wall-clock cost.
+  # Same test trace, checkpoint, transition model, k=1, and 96 MCTS simulations
+  # for all four head configurations. This isolates inference-time policy and
+  # value guidance without claiming retrained single-head models.
   run_cmd env \
     STAMP="$MATCHED_STAMP" \
     STAGES="preflight eval summarize" \
     TOPOLOGIES="brain geant" \
     SEEDS="0 1 2 3 4" \
-    ARMS="no_nn nn" \
+    ARMS="no_nn policy_only value_only nn" \
     K_SHORT=1 \
     COMPUTATION_BUDGET=96 \
     RESUME_COMPLETED=1 \
@@ -209,9 +211,21 @@ matched_search() {
     DRY_RUN="$PLAN_ONLY" \
     bash tools/run_alpha_matched_nn_vs_no_nn_k1.sh
 
+  run_cmd conda run -n virne python tools/summarize_compnet_value_head_ablation.py \
+    --solver-results-root results/journal_suite/results/alpha_zero_sfc \
+    --output-root "$VALUE_HEAD_ROOT" \
+    --stamp "$MATCHED_STAMP" \
+    --topologies brain geant \
+    --seeds 0 1 2 3 4 \
+    --k 1 \
+    --budget 96
+
   if [[ "$PLAN_ONLY" != "1" ]]; then
     require_csv_rows "$MATCHED_ANALYSIS/eval_summary.csv" 20
     require_csv_rows "$MATCHED_ANALYSIS/paired_summary.csv" 2
+    require_csv_rows "$VALUE_HEAD_ROOT/per_seed.csv" 40
+    require_csv_rows "$VALUE_HEAD_ROOT/aggregate.csv" 16
+    require_file "$VALUE_HEAD_ROOT/manuscript_fragment.tex"
   fi
 }
 
@@ -315,6 +329,7 @@ write_evidence_status() {
 - Independent GPPVNE reproduction on matched BRAIN and GEANT traces: five seeds per topology, `k=10`.
 - Reachability-filter ablation on BRAIN and GEANT: five matched seeds, `k=1`, 96 MCTS simulations.
 - Neural-guided AlphaVNE versus the same feasibility-aware MCTS with neural policy/value guidance disabled: five matched seeds, `k=1`, 96 MCTS simulations.
+- Inference-time policy/value isolation on the same checkpoints: neither head, policy only, value only, and both heads over five matched seeds per topology.
 - AlphaVNE versus the registered classical MCTS baseline at the same 96 simulations per placement decision: five matched seeds per topology, `k=1`.
 - Hard Waxman-100 in-domain stress study: five seeds and six methods. Node and link pressure are increased together.
 - Nominal-trained AlphaVNE under shifted request distributions on BRAIN, GEANT, and Waxman-100: three seeds per topology.
@@ -324,7 +339,7 @@ write_evidence_status() {
 - Equal wall-clock-budget comparison between neural-guided search and classical MCTS. The implemented external comparison fixes the simulation count, while neural inference changes elapsed time.
 - Faithful PACT or VNE-NNMCTS reproduction. No production runner exists in this repository.
 - Separate node-constrained and link-constrained regimes. The implemented hard Waxman regime increases both pressures together.
-- Policy-only versus policy-plus-value-head ablation, value calibration, or feasibility-prediction analysis. Existing runners only compare both neural heads enabled against both disabled.
+- Retrained single-head models, held-out value calibration, and feasibility-prediction analysis. The implemented head isolation toggles trained inference heads without retraining.
 - Unseen-substrate-topology transfer. The implemented generalization stage shifts request distributions on known substrate families.
 
 The paper should scope claims to the implemented rows and state these limitations directly.
@@ -336,6 +351,7 @@ publish() {
   run_cmd mkdir -p \
     "$target/benchmark_additions" \
     "$target/matched_search" \
+    "$target/value_head_ablation" \
     "$target/matched_external_mcts" \
     "$target/hard_stress" \
     "$target/generalization" \
@@ -360,6 +376,9 @@ publish() {
 
   for name in eval_summary.csv paired_summary.csv report.md matched_nn_vs_no_nn_table.tex; do
     copy_artifact "$MATCHED_ANALYSIS/$name" "$target/matched_search/$name"
+  done
+  for name in per_seed.csv aggregate.csv manuscript_fragment.tex; do
+    copy_artifact "$VALUE_HEAD_ROOT/$name" "$target/value_head_ablation/$name"
   done
   for name in per_seed.csv aggregate.csv report.md manuscript_fragment.tex; do
     copy_artifact "$EXTERNAL_MCTS_ROOT/$name" "$target/matched_external_mcts/$name"
@@ -387,6 +406,8 @@ validate() {
   require_csv_rows "$GENERATED_DIR/benchmark_additions/reachability_ablation_per_seed.csv" 20
   require_csv_rows "$GENERATED_DIR/matched_search/eval_summary.csv" 20
   require_csv_rows "$GENERATED_DIR/matched_search/paired_summary.csv" 2
+  require_csv_rows "$GENERATED_DIR/value_head_ablation/per_seed.csv" 40
+  require_csv_rows "$GENERATED_DIR/value_head_ablation/aggregate.csv" 16
   require_csv_rows "$GENERATED_DIR/matched_external_mcts/per_seed.csv" 10
   require_csv_rows "$GENERATED_DIR/matched_external_mcts/aggregate.csv" 2
   require_csv_rows "$GENERATED_DIR/hard_stress/eval_summary.csv" 30

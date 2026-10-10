@@ -64,7 +64,7 @@ generalization runners resume completed cells from their own output summaries.
 | --- | --- | --- |
 | `preflight` | Check required commands, manuscript sources, CUDA, and the AlphaVNE C++ import. | Stage marker. |
 | `benchmark_additions` | Run or reuse the five-seed GPPVNE and reachability-filter campaigns, then validate candidate tables. | Complete matrices go directly through provenance validation; otherwise GPPVNE uses `--resume` and AlphaVNE checks each cell. |
-| `matched_search` | Compare neural-guided and no-neural-network feasibility-aware MCTS with the same 96-simulation budget. | Reuses each existing `summary.csv`. |
+| `matched_search` | Compare neither, policy-only, value-only, and joint policy/value guidance on matched checkpoints at 96 simulations. | Reuses each existing `summary.csv`; the two new head-isolation arms run only when absent. |
 | `matched_external_mcts` | Evaluate the registered classical MCTS baseline at the same 96 simulations and pair it with AlphaVNE on identical traces. | Uses an isolated run namespace and resumes complete cells. |
 | `hard_stress` | Re-aggregate the completed five-seed hard Waxman in-domain study without retraining. | Aggregation only. |
 | `generalization` | Evaluate nominal-trained AlphaVNE on shifted request distributions for BRAIN, GEANT, and Waxman-100. | Reuses each existing `summary.csv`. |
@@ -81,7 +81,8 @@ does not silently label unsupported studies as complete. The generated
 
 Implemented evidence includes matched GPPVNE, reachability ablation,
 equal-simulation AlphaVNE comparisons against both its no-neural variant and
-the registered classical MCTS baseline, joint node-and-link hard Waxman stress,
+the registered classical MCTS baseline, inference-time policy/value isolation,
+joint node-and-link hard Waxman stress,
 and request-distribution generalization on three substrate families.
 
 No faithful production runner currently exists for:
@@ -89,7 +90,7 @@ No faithful production runner currently exists for:
 - equal wall-clock-budget MCTS comparisons;
 - PACT or VNE-NNMCTS reproduction;
 - isolated node-constrained versus link-constrained regimes;
-- policy-only versus policy-plus-value-head ablation and value calibration;
+- retrained single-head models and held-out value calibration;
 - transfer to a genuinely unseen substrate topology.
 
 Those items require new experiment code and should remain limitations in the
