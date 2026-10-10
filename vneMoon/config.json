@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "branch": "vnemoon/autoresearch",
+  "worktree_dir": "../virne-vneMoon-worktree",
+  "wall_clock_hours": 8.0,
+  "final_reserve_minutes": 35,
+  "codex_timeout_seconds": 900,
+  "codex_quota_reserve_percent": 10.0,
+  "quota_rpc_timeout_seconds": 20,
+  "quota_unknown_retry_seconds": 300,
+  "quota_reset_grace_seconds": 5,
+  "codex_rate_limit_max_retries": 3,
+  "codex_rate_limit_backoff_seconds": 30,
+  "codex_descendant_shutdown_seconds": 5,
+  "max_consecutive_pre_experiment_failures": 3,
+  "per_experiment_timeout_seconds": {
+    "smoke": 480,
+    "screen": 1500,
+    "heldout": 900
+  },
+  "request_timeout_seconds": 0.75,
+  "mcts_computation_budget": 16,
+  "codex_model": "gpt-6.1-sol",
+  "codex_reasoning_effort": "medium",
+  "max_history_items_for_codex": 8,
+  "promotion_acceptance_delta": -0.01,
+  "adoption_acceptance_delta": 0.005,
+  "runtime_ratio_limit": 1.25,
+  "allowed_edit_roots": [
+    "virne/solver/",
+    "settings/learning.yaml",
+    "tests/solver/"
+  ],
+  "dev_suites": {
+    "smoke": [
+      {"topology": "wx100", "seed": 0, "split": "train", "requests": 24}
+    ],
+    "screen": [
+      {"topology": "wx100", "seed": 0, "split": "train", "requests": 64},
+      {"topology": "geant", "seed": 1, "split": "train", "requests": 64},
+      {"topology": "brain", "seed": 2, "split": "train", "requests": 64}
+    ]
+  },
+  "heldout_suite": [
+    {"topology": "wx100", "seed": 2, "split": "test", "requests": 128},
+    {"topology": "geant", "seed": 2, "split": "test", "requests": 128},
+    {"topology": "brain", "seed": 4, "split": "test", "requests": 128}
+  ],
+  "checkpoint_candidates": {
+    "wx100": [
+      "results/journal_suite/results/alpha_zero_sfc/journal_suite__alpha_zero_sfc__wx100__topo_replay_move_fix_3k__seed0__train__ktrain10__20260424T063801Z/models/policy_latest.pt",
+      "results/journal_suite/results/alpha_zero_sfc/journal_suite__oneoff_seed0_ktrain10_keval10_steps5000_20260513T204447Z__alpha_zero_sfc__wx100__wx100_hard_compare__seed0__train__ktrain10/models/policy_latest.pt"
+    ],
+    "geant": [
+      "results/journal_suite/results/alpha_zero_sfc/journal_suite__alpha_zero_sfc__geant__topo_replay_move_fix_3k__seed0__train__ktrain10__20260423T225501Z/models/policy_latest.pt",
+      "results/journal_suite/results/alpha_zero_sfc/journal_suite__alpha_zero_sfc__geant__journal_insurance_replay_move_fix_3k__seed3__train__ktrain10__20260426T232029Z_alpha_extra/models/policy_latest.pt"
+    ],
+    "brain": [
+      "results/journal_suite/results/alpha_zero_sfc/journal_suite__brain_k10_steps5000_20260513T224921Z__alpha_zero_sfc__brain__nominal__seed0__train__ktrain10/models/policy_latest.pt",
+      "results/journal_suite/results/alpha_zero_sfc/journal_suite__alpha_zero_sfc__brain__nominal__seed0__train__ktrain10/models/policy_latest.pt"
+    ]
+  },
+  "topology_files": {
+    "wx100": "datasets/topology/Waxman100.gml",
+    "geant": "datasets/topology/Geant.gml",
+    "brain": "datasets/topology/Brain.gml"
+  }
+}
+

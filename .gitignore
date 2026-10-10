@@ -16,6 +16,7 @@ poisson_test/
 dataset/results*
 dataset/april15_results
 *.pth
+*.pt
 *.backup
 analysis.py
 pre-train
@@ -49,7 +50,8 @@ docs/build/
 docs/source/_autosummary/
 docs/source/generated/
 confrence_paper
-paperjournal
+# Manuscript sources and generated PDFs stay local.
+paperjournal/
 
 # cache
 *.log

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {"type": "string", "enum": ["experiment", "stop"]},
+    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+    "hypothesis": {"type": "string", "minLength": 1, "maxLength": 1200},
+    "mechanism": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "novelty_distinction": {"type": "string", "minLength": 1, "maxLength": 1600},
+    "literature_risk": {"type": "string", "minLength": 1, "maxLength": 1200},
+    "implementation_summary": {"type": "string", "minLength": 1, "maxLength": 1600},
+    "changed_files": {
+      "type": "array",
+      "items": {"type": "string"},
+      "maxItems": 40
+    },
+    "solver_name": {"type": "string", "pattern": "^[A-Za-z0-9_+.-]+$", "maxLength": 80},
+    "uses_checkpoint": {"type": "boolean"},
+    "training_mode": {"type": "string", "enum": ["none", "short"]},
+    "expected_signal": {"type": "string", "minLength": 1, "maxLength": 1200},
+    "failure_modes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "maxItems": 12
+    }
+  },
+  "required": [
+    "action",
+    "title",
+    "hypothesis",
+    "mechanism",
+    "novelty_distinction",
+    "literature_risk",
+    "implementation_summary",
+    "changed_files",
+    "solver_name",
+    "uses_checkpoint",
+    "training_mode",
+    "expected_signal",
+    "failure_modes"
+  ]
+}
+
