@@ -85,6 +85,50 @@ def test_reachability_filter_ablation_retains_unreachable_candidates(monkeypatch
     assert list(unfiltered.get_candidate_nodes()) == [1, 2]
 
 
+def test_default_transition_prunes_and_reserves_newly_exposed_link(monkeypatch):
+    p_net = _build_network(
+        num_nodes=3,
+        edges=[(0, 1)],
+        edge_bw=[1.0],
+        directed=False,
+    )
+    v_net = _build_two_node_vnr(demand=1.0)
+
+    monkeypatch.setenv("AZSFC_CPP_DEFER_LINK_ROUTING", "0")
+    state = _make_vnr_state(p_net, v_net, "bfs_shortest", k=1).create_child(0)
+    feasible_child = state.create_child(1)
+    pruned_child = state.create_child(2)
+
+    assert feasible_child.last_physical_node == 1
+    assert feasible_child.get_available_link_resource(0, "bw") == pytest.approx(0.0)
+    assert feasible_child.compute_final_reward() > 0.0
+    assert pruned_child.last_physical_node == -1
+
+
+def test_deferred_routing_places_nodes_without_link_pruning_or_reservation(monkeypatch):
+    p_net = _build_network(
+        num_nodes=3,
+        edges=[(0, 1)],
+        edge_bw=[1.0],
+        directed=False,
+    )
+    v_net = _build_two_node_vnr(demand=1.0)
+
+    monkeypatch.setenv("AZSFC_CPP_DEFER_LINK_ROUTING", "1")
+    state = _make_vnr_state(p_net, v_net, "bfs_shortest", k=1).create_child(0)
+
+    assert list(state.get_candidate_nodes()) == [1, 2]
+
+    feasible_child = state.create_child(1)
+    terminal_route_failure = state.create_child(2)
+
+    assert feasible_child.last_physical_node == 1
+    assert feasible_child.get_available_link_resource(0, "bw") == pytest.approx(1.0)
+    assert feasible_child.compute_final_reward() > 0.0
+    assert terminal_route_failure.last_physical_node == 2
+    assert terminal_route_failure.compute_final_reward() == pytest.approx(-1000.0)
+
+
 # Regression guard: path search must not mark a feasible directed link route as infeasible.
 def test_available_k_shortest_keeps_feasible_directed_route():
     p_net = _build_network(
@@ -105,7 +149,7 @@ def test_available_k_shortest_keeps_feasible_directed_route():
 # Regression guard: incremental C++ feasibility checks must mirror Python's
 # fallback from first_shortest to available_shortest instead of pruning a
 # feasible longer route.
-def test_first_shortest_falls_back_to_available_shortest_in_child_expansion():
+def test_first_shortest_falls_back_to_available_shortest_in_child_expansion(monkeypatch):
     p_net = _build_network(
         num_nodes=5,
         edges=[(0, 1), (1, 2), (0, 3), (3, 4), (4, 2)],
@@ -114,6 +158,7 @@ def test_first_shortest_falls_back_to_available_shortest_in_child_expansion():
     )
     v_net = _build_two_node_vnr(demand=1.0)
 
+    monkeypatch.setenv("AZSFC_CPP_AVAILABLE_SHORTEST_FALLBACK", "1")
     state = _make_vnr_state(p_net, v_net, shortest_method="first_shortest", allow_rejection=False, k=8)
     state_after_first = state.create_child(2)   # place first virtual node
     state_after_second = state_after_first.create_child(0)  # must use 0 -> 3 -> 2 fallback route

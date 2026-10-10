@@ -11,9 +11,16 @@
 #
 #   STAMP=YYYYMMDDTHHMMSSZ bash tools/run_alpha_journal_component_ablation_k1.sh
 #
-# Quick pipeline validation (one topology/seed and short training):
+# Run only the full solver and the reachability-filter ablation:
 #
-#   TOPOLOGIES=brain SEEDS=0 TRAIN_MAX_STEPS=50 \
+#   VARIANTS="full no_reachability" \
+#     bash tools/run_alpha_journal_component_ablation_k1.sh
+#
+# Quick full-pipeline validation (one topology/seed and short training):
+#
+#   TOPOLOGIES=brain SEEDS=0 NUM_V_NETS=200 COMPUTATION_BUDGET=2 \
+#     TRAIN_MAX_STEPS=50 \
+#     TRAIN_MIN_BUFFER_SIZE=32 TRAIN_STEPS_PER_EPOCH=16 \
 #     bash tools/run_alpha_journal_component_ablation_k1.sh
 
 set -euo pipefail
@@ -23,15 +30,15 @@ cd "$ROOT_DIR"
 
 STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 TOPOLOGIES="${TOPOLOGIES:-brain geant}"
-SEEDS="${SEEDS:-0 1 2}"
-VARIANTS="${VARIANTS:-full no_candidate_features no_reachability fixed_order no_nn}"
+SEEDS="${SEEDS:-0 1 2 3 4}"
+VARIANTS="${VARIANTS:-full deferred_routing no_candidate_features no_reachability no_nn}"
 STAGES="${STAGES:-build preflight train eval summarize}"
 
 # Deliberately fixed: larger k was found to increase runtime without improving
 # acceptance for this solver. Training and evaluation both use k=1.
 K_SHORT=1
 COMPUTATION_BUDGET="${COMPUTATION_BUDGET:-96}"
-NUM_V_NETS=1000
+NUM_V_NETS="${NUM_V_NETS:-1000}"
 ROLLOUT_DEPTH_LIMIT="${ROLLOUT_DEPTH_LIMIT:-100}"
 
 RESULTS_ROOT="${RESULTS_ROOT:-$ROOT_DIR/results/journal_suite/results}"
@@ -90,6 +97,31 @@ run_cmd() {
   "$@"
 }
 
+write_variant_provenance() {
+  local stage="$1" topology="$2" seed="$3" variant="$4"
+  local run_dir="$5" data_dir="$6" require_existing="${7:-0}"
+  local command=(
+    conda run -n virne python tools/write_alpha_ablation_provenance.py
+    --output "$run_dir/ablation_provenance.json"
+    --stage "$stage"
+    --run-id "$(basename "$run_dir")"
+    --topology "$topology"
+    --seed "$seed"
+    --variant "$variant"
+    --dataset-dir "$data_dir"
+    --k "$K_SHORT"
+    --budget "$COMPUTATION_BUDGET"
+    --num-v-nets "$NUM_V_NETS"
+    --candidate-features "$CANDIDATE_FEATURES"
+    --reachability-filter "$REACHABILITY_FILTER"
+    --defer-link-routing "$DEFER_LINK_ROUTING"
+    --virtual-node-order "$VIRTUAL_NODE_ORDER"
+    --use-neural-network "$USE_NN"
+  )
+  if [[ "$require_existing" == "1" ]]; then command+=(--require-existing); fi
+  run_cmd "${command[@]}"
+}
+
 normalize_topology() {
   case "$1" in
     brain|geant) echo "$1" ;;
@@ -99,9 +131,9 @@ normalize_topology() {
 
 normalize_variant() {
   case "$1" in
-    full|no_candidate_features|no_reachability|fixed_order|no_nn) echo "$1" ;;
+    full|deferred_routing|no_candidate_features|no_reachability|fixed_order|no_nn) echo "$1" ;;
     *)
-      echo "unsupported variant '$1'; expected full, no_candidate_features, no_reachability, fixed_order, or no_nn" >&2
+      echo "unsupported variant '$1'; expected full, deferred_routing, no_candidate_features, no_reachability, fixed_order, or no_nn" >&2
       exit 1
       ;;
   esac
@@ -112,10 +144,12 @@ configure_variant() {
   local variant="$1"
   CANDIDATE_FEATURES=1
   REACHABILITY_FILTER=1
+  DEFER_LINK_ROUTING=0
   VIRTUAL_NODE_ORDER=demand
   USE_NN=true
   case "$variant" in
     full) ;;
+    deferred_routing) DEFER_LINK_ROUTING=1 ;;
     no_candidate_features) CANDIDATE_FEATURES=0 ;;
     no_reachability) REACHABILITY_FILTER=0 ;;
     fixed_order) VIRTUAL_NODE_ORDER=fixed ;;
@@ -159,7 +193,7 @@ print_plan() {
   echo "HEAD:                   $(git rev-parse HEAD 2>/dev/null || echo unknown)"
   echo
   echo "Neural variants are trained and evaluated with the same component disabled."
-  echo "No-NN uses the same transition model and 96-search budget but requires no training."
+  echo "No-NN uses the same transition model and ${COMPUTATION_BUDGET}-search budget but requires no training."
 }
 
 build_cpp() {
@@ -213,6 +247,20 @@ print(destination)
   if [[ "$DRY_RUN" != "1" ]]; then require_file "$destination"; fi
 }
 
+train_is_complete() {
+  local run_dir="$1"
+  local checkpoint="$run_dir/models/policy_latest.pt"
+  local marker="$run_dir/.alpha_vne_training_complete"
+  local running_log="$run_dir/logs/running.log"
+
+  [[ -f "$checkpoint" ]] || return 1
+  [[ -f "$marker" ]] && return 0
+
+  # Migrate successful runs created before the explicit completion marker.
+  [[ -f "$running_log" ]] &&
+    grep -Fq "Training completed! Model saved to $checkpoint" "$running_log"
+}
+
 run_train() {
   local topology="$1" seed="$2" variant="$3"
   [[ "$variant" == "no_nn" ]] && return 0
@@ -223,13 +271,16 @@ run_train() {
   run_dir="$(solver_run_dir "$id")"
   train_dir="$(dataset_dir "$topology" "$seed" train)"
 
-  if [[ "$RESUME_COMPLETED" == "1" && -f "$run_dir/models/policy_latest.pt" && -f "$run_dir/summary.csv" ]]; then
+  if [[ "$RESUME_COMPLETED" == "1" ]] && train_is_complete "$run_dir"; then
+    write_variant_provenance train "$topology" "$seed" "$variant" "$run_dir" "$train_dir" 1
+    touch "$run_dir/.alpha_vne_training_complete"
     section "Reuse train $topology seed=$seed variant=$variant"
     echo "$run_dir/models/policy_latest.pt"
     return 0
   fi
 
   section "Train $topology seed=$seed variant=$variant k=$K_SHORT"
+  write_variant_provenance train "$topology" "$seed" "$variant" "$run_dir" "$train_dir"
   local command=(
     conda run -n virne python main.py
     solver.shortest_method=k_shortest
@@ -288,9 +339,13 @@ run_train() {
   run_cmd env \
     AZSFC_CPP_USE_CANDIDATE_FEATURES="$CANDIDATE_FEATURES" \
     AZSFC_CPP_USE_REACHABILITY_FILTER="$REACHABILITY_FILTER" \
+    AZSFC_CPP_DEFER_LINK_ROUTING="$DEFER_LINK_ROUTING" \
     AZSFC_CPP_VIRTUAL_NODE_ORDER="$VIRTUAL_NODE_ORDER" \
     "${command[@]}"
-  if [[ "$DRY_RUN" != "1" ]]; then require_file "$run_dir/models/policy_latest.pt"; fi
+  if [[ "$DRY_RUN" != "1" ]]; then
+    require_file "$run_dir/models/policy_latest.pt"
+    touch "$run_dir/.alpha_vne_training_complete"
+  fi
 }
 
 run_eval() {
@@ -303,10 +358,13 @@ run_eval() {
   test_dir="$(dataset_dir "$topology" "$seed" test)"
 
   if [[ "$RESUME_COMPLETED" == "1" && -f "$run_dir/summary.csv" ]]; then
+    write_variant_provenance eval "$topology" "$seed" "$variant" "$run_dir" "$test_dir" 1
     section "Reuse eval $topology seed=$seed variant=$variant"
     echo "$run_dir/summary.csv"
     return 0
   fi
+
+  write_variant_provenance eval "$topology" "$seed" "$variant" "$run_dir" "$test_dir"
 
   if [[ "$USE_NN" == "true" ]]; then
     train_id="$(train_run_id "$topology" "$seed" "$variant")"
@@ -378,6 +436,7 @@ run_eval() {
   run_cmd env \
     AZSFC_CPP_USE_CANDIDATE_FEATURES="$CANDIDATE_FEATURES" \
     AZSFC_CPP_USE_REACHABILITY_FILTER="$REACHABILITY_FILTER" \
+    AZSFC_CPP_DEFER_LINK_ROUTING="$DEFER_LINK_ROUTING" \
     AZSFC_CPP_VIRTUAL_NODE_ORDER="$VIRTUAL_NODE_ORDER" \
     "${command[@]}"
   if [[ "$DRY_RUN" != "1" ]]; then require_file "$run_dir/summary.csv"; fi

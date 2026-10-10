@@ -13,6 +13,7 @@ from pathlib import Path
 
 VARIANT_LABELS = {
     "full": "Full AlphaVNE",
+    "deferred_routing": "Deferred link routing",
     "no_candidate_features": "No candidate features",
     "no_reachability": "No reachability filter",
     "fixed_order": "Fixed virtual-node order",
@@ -201,6 +202,8 @@ def main() -> None:
         f"- MCTS simulations per placement decision: `{args.budget}`.",
         f"- Seeds: `{' '.join(map(str, args.seeds))}`.",
         "- Every neural ablation is disabled during both training and evaluation.",
+        "- Deferred routing retains route-conditioned neural inputs but postpones hard link filtering, routing, and reservation until the complete node mapping is evaluated.",
+        "- No reachability filter disables only the pre-expansion residual-bandwidth connectivity screen; incremental routing and reservation remain enabled.",
         "- Pairing uses identical topology, seed, substrate, request trace, constraints, and search budget.",
         "",
         "## Aggregate acceptance",
@@ -237,6 +240,7 @@ def main() -> None:
 
     headings = {
         "full": "Full",
+        "deferred_routing": "Deferred routing",
         "no_candidate_features": r"No cand. feat.",
         "no_reachability": r"No reach. filter",
         "fixed_order": "Fixed order",

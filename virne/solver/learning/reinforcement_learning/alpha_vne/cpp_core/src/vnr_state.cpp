@@ -388,7 +388,9 @@ std::vector<int> VNRState::get_candidate_nodes() const {
         }
     }
 
-    if (env_flag_enabled("AZSFC_CPP_USE_REACHABILITY_FILTER", true) &&
+    const bool defer_link_routing = env_flag_enabled("AZSFC_CPP_DEFER_LINK_ROUTING", false);
+    if (!defer_link_routing &&
+        env_flag_enabled("AZSFC_CPP_USE_REACHABILITY_FILTER", true) &&
         !link_requirements.empty() && !candidates.empty()) {
         std::vector<int> reachable_candidates;
         reachable_candidates.reserve(candidates.size());
@@ -829,7 +831,9 @@ VNRState VNRState::create_child_internal(int p_node_id, PlacementInfo* info) con
             child.p_node_id_ = -1;
             return child;
         }
-        if (!child.reserve_link_resources(v_target, p_node_id, child, *step_delta)) {
+        const bool defer_link_routing = env_flag_enabled("AZSFC_CPP_DEFER_LINK_ROUTING", false);
+        if (!defer_link_routing &&
+            !child.reserve_link_resources(v_target, p_node_id, child, *step_delta)) {
             child.p_node_id_ = -1;
             return child;
         }
