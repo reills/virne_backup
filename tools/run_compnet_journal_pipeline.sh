@@ -12,7 +12,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 RUN_TAG="${RUN_TAG:-compnet_journal_v1}"
-STAGES="${STAGES:-preflight benchmark_additions matched_search hard_stress generalization aggregate publish paper validate}"
+STAGES="${STAGES:-preflight benchmark_additions matched_search matched_external_mcts hard_stress generalization aggregate publish paper validate}"
 FORCE_STAGES="${FORCE_STAGES:-}"
 PLAN_ONLY="${PLAN_ONLY:-0}"
 BUILD_PAPER="${BUILD_PAPER:-1}"
@@ -28,6 +28,7 @@ STATE_DIR="$STATE_ROOT/stages"
 RUN_LOG="$STATE_ROOT/pipeline.log"
 HARD_STRESS_ROOT="$STATE_ROOT/hard_waxman"
 GENERALIZATION_ROOT="$STATE_ROOT/generalization"
+EXTERNAL_MCTS_ROOT="$STATE_ROOT/matched_external_mcts"
 
 PAPER_DIR="${PAPER_DIR:-$ROOT_DIR/paperjournal/compnet}"
 GENERATED_DIR="${GENERATED_DIR:-$PAPER_DIR/generated}"
@@ -132,7 +133,9 @@ preflight() {
   done
 
   require_file tools/run_infocom_benchmark_additions.sh
+  require_file tools/run_gpp_vne_benchmark.sh
   require_file tools/run_alpha_matched_nn_vs_no_nn_k1.sh
+  require_file tools/summarize_compnet_matched_external_mcts.py
   require_file tools/run_alpha_vne_generalization_eval.py
   require_file tools/aggregate_waxman_hard_results.py
   require_file tools/aggregate_journal_results.py
@@ -212,6 +215,37 @@ matched_search() {
   fi
 }
 
+matched_external_mcts() {
+  # Run the registered classical MCTS baseline with the same 96 simulations
+  # per placement decision used by the AlphaVNE NN arm above. The profile has
+  # an isolated run-ID namespace so it cannot reuse the original five-budget
+  # MCTS summaries.
+  run_cmd env \
+    PROFILE=mcts_matched_96 \
+    CONFIG=settings/experiments/journal_suite.yaml \
+    STAGES="preflight generate-datasets eval" \
+    RESUME=1 \
+    FORCE_DATASETS=0 \
+    DRY_RUN="$PLAN_ONLY" \
+    bash tools/run_gpp_vne_benchmark.sh
+
+  run_cmd conda run -n virne python tools/summarize_compnet_matched_external_mcts.py \
+    --alpha-eval-csv "$MATCHED_ANALYSIS/eval_summary.csv" \
+    --results-root results/journal_suite/results \
+    --output-root "$EXTERNAL_MCTS_ROOT" \
+    --topologies brain geant \
+    --seeds 0 1 2 3 4 \
+    --k 1 \
+    --budget 96
+
+  if [[ "$PLAN_ONLY" != "1" ]]; then
+    require_csv_rows "$EXTERNAL_MCTS_ROOT/per_seed.csv" 10
+    require_csv_rows "$EXTERNAL_MCTS_ROOT/aggregate.csv" 2
+    require_file "$EXTERNAL_MCTS_ROOT/report.md"
+    require_file "$EXTERNAL_MCTS_ROOT/manuscript_fragment.tex"
+  fi
+}
+
 hard_stress() {
   # A complete five-seed, in-domain hard Waxman campaign is already stored in
   # results. Re-aggregate and validate it without rerunning completed training.
@@ -257,7 +291,8 @@ aggregate() {
   run_cmd conda run -n virne python tools/aggregate_journal_results.py \
     --suite-root results/journal_suite \
     --bootstrap-samples 200 \
-    --latest-per-cell
+    --latest-per-cell \
+    --exclude-run-id-token mcts_budget96
   if [[ "$PLAN_ONLY" != "1" ]]; then
     require_file results/journal_suite/tables/main_metrics.csv
     require_file results/journal_suite/tables/runtime_metrics.csv
@@ -280,12 +315,13 @@ write_evidence_status() {
 - Independent GPPVNE reproduction on matched BRAIN and GEANT traces: five seeds per topology, `k=10`.
 - Reachability-filter ablation on BRAIN and GEANT: five matched seeds, `k=1`, 96 MCTS simulations.
 - Neural-guided AlphaVNE versus the same feasibility-aware MCTS with neural policy/value guidance disabled: five matched seeds, `k=1`, 96 MCTS simulations.
+- AlphaVNE versus the registered classical MCTS baseline at the same 96 simulations per placement decision: five matched seeds per topology, `k=1`.
 - Hard Waxman-100 in-domain stress study: five seeds and six methods. Node and link pressure are increased together.
 - Nominal-trained AlphaVNE under shifted request distributions on BRAIN, GEANT, and Waxman-100: three seeds per topology.
 
 ## Evidence gaps that must not be described as completed
 
-- Equal wall-clock-budget comparison between neural-guided search and classical MCTS. The implemented matched comparison fixes the MCTS simulation count, while neural inference changes elapsed time.
+- Equal wall-clock-budget comparison between neural-guided search and classical MCTS. The implemented external comparison fixes the simulation count, while neural inference changes elapsed time.
 - Faithful PACT or VNE-NNMCTS reproduction. No production runner exists in this repository.
 - Separate node-constrained and link-constrained regimes. The implemented hard Waxman regime increases both pressures together.
 - Policy-only versus policy-plus-value-head ablation, value calibration, or feasibility-prediction analysis. Existing runners only compare both neural heads enabled against both disabled.
@@ -300,6 +336,7 @@ publish() {
   run_cmd mkdir -p \
     "$target/benchmark_additions" \
     "$target/matched_search" \
+    "$target/matched_external_mcts" \
     "$target/hard_stress" \
     "$target/generalization" \
     "$target/journal_aggregate"
@@ -324,6 +361,9 @@ publish() {
   for name in eval_summary.csv paired_summary.csv report.md matched_nn_vs_no_nn_table.tex; do
     copy_artifact "$MATCHED_ANALYSIS/$name" "$target/matched_search/$name"
   done
+  for name in per_seed.csv aggregate.csv report.md manuscript_fragment.tex; do
+    copy_artifact "$EXTERNAL_MCTS_ROOT/$name" "$target/matched_external_mcts/$name"
+  done
   for name in eval_summary.csv report.md waxman_hard_indomain_comparison.tex; do
     copy_artifact "$HARD_STRESS_ROOT/$name" "$target/hard_stress/$name"
   done
@@ -347,6 +387,8 @@ validate() {
   require_csv_rows "$GENERATED_DIR/benchmark_additions/reachability_ablation_per_seed.csv" 20
   require_csv_rows "$GENERATED_DIR/matched_search/eval_summary.csv" 20
   require_csv_rows "$GENERATED_DIR/matched_search/paired_summary.csv" 2
+  require_csv_rows "$GENERATED_DIR/matched_external_mcts/per_seed.csv" 10
+  require_csv_rows "$GENERATED_DIR/matched_external_mcts/aggregate.csv" 2
   require_csv_rows "$GENERATED_DIR/hard_stress/eval_summary.csv" 30
   require_csv_rows "$GENERATED_DIR/generalization/brain_eval_summary.csv" 3
   require_csv_rows "$GENERATED_DIR/generalization/geant_eval_summary.csv" 3
@@ -421,6 +463,7 @@ main() {
   run_stage preflight preflight
   run_stage benchmark_additions benchmark_additions
   run_stage matched_search matched_search
+  run_stage matched_external_mcts matched_external_mcts
   run_stage hard_stress hard_stress
   run_stage generalization generalization
   run_stage aggregate aggregate

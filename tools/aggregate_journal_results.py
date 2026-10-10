@@ -973,6 +973,7 @@ def aggregate(
     confidence_level: float,
     bootstrap_samples: int,
     latest_per_cell: bool,
+    exclude_run_id_tokens: Sequence[str] = (),
 ) -> dict[str, pd.DataFrame]:
     resolved_results_root = results_root if results_root is not None else suite_root / 'results'
     resolved_tables_dir = tables_dir if tables_dir is not None else suite_root / 'tables'
@@ -982,6 +983,11 @@ def aggregate(
         raise FileNotFoundError(f'No summary.csv files found under {resolved_results_root}')
 
     run_metrics = build_run_metrics(summary_rows)
+    for token in exclude_run_id_tokens:
+        if token:
+            run_metrics = run_metrics[
+                ~run_metrics['run_id'].astype(str).str.contains(token, regex=False)
+            ].copy()
     if latest_per_cell:
         run_metrics = select_latest_runs_per_cell(run_metrics)
     train_runs = run_metrics[run_metrics['stage'] == 'train'].copy()
@@ -1050,6 +1056,12 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Keep only the latest train/eval run per (method, topology, scenario, seed, k) cell.',
     )
+    parser.add_argument(
+        '--exclude-run-id-token',
+        action='append',
+        default=[],
+        help='Exclude runs whose run_id contains this literal token. Repeat as needed.',
+    )
     return parser
 
 
@@ -1066,6 +1078,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         confidence_level=float(args.confidence_level),
         bootstrap_samples=int(args.bootstrap_samples),
         latest_per_cell=bool(args.latest_per_cell),
+        exclude_run_id_tokens=tuple(args.exclude_run_id_token),
     )
     return 0
 

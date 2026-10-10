@@ -47,7 +47,7 @@ journal_suite:
 
   paired_matching_policy:
     enabled: true
-    method_keys: [alpha_zero_sfc, gpp_vne, gpp_vne_infocom, mcts, grc_rank, pso_meta]
+    method_keys: [alpha_zero_sfc, gpp_vne, gpp_vne_infocom, mcts, mcts_budget96, grc_rank, pso_meta]
     match_fields: [topology, scenario, seed, k_value]
 
   offline_slice:
@@ -114,6 +114,15 @@ journal_suite:
     mcts:
       solver_name: mcts
       trainable: false
+    # Keep the compute-matched classical MCTS cells separate from the original
+    # five-simulation baseline. Both use the same solver implementation.
+    mcts_budget96:
+      solver_name: mcts
+      run_id_namespace: mcts_budget96
+      trainable: false
+      overrides:
+        eval:
+          - training.computation_budget=96
     grc_rank:
       solver_name: grc_rank
       trainable: false
@@ -240,6 +249,15 @@ journal_suite:
       offline_slice_enabled: false
       # Evaluate sequentially on the single GPU so runtime and memory use are
       # not contaminated by two policies executing concurrently.
+      evaluation_parallelism: 1
+    mcts_matched_96:
+      seeds: [0, 1, 2, 3, 4]
+      topologies: [brain, geant]
+      scenarios: [nominal]
+      methods: [mcts_budget96]
+      k_eval_values: [1]
+      generalization_cells: []
+      offline_slice_enabled: false
       evaluation_parallelism: 1
 
   overrides:

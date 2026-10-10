@@ -65,9 +65,10 @@ generalization runners resume completed cells from their own output summaries.
 | `preflight` | Check required commands, manuscript sources, CUDA, and the AlphaVNE C++ import. | Stage marker. |
 | `benchmark_additions` | Run or reuse the five-seed GPPVNE and reachability-filter campaigns, then validate candidate tables. | Complete matrices go directly through provenance validation; otherwise GPPVNE uses `--resume` and AlphaVNE checks each cell. |
 | `matched_search` | Compare neural-guided and no-neural-network feasibility-aware MCTS with the same 96-simulation budget. | Reuses each existing `summary.csv`. |
+| `matched_external_mcts` | Evaluate the registered classical MCTS baseline at the same 96 simulations and pair it with AlphaVNE on identical traces. | Uses an isolated run namespace and resumes complete cells. |
 | `hard_stress` | Re-aggregate the completed five-seed hard Waxman in-domain study without retraining. | Aggregation only. |
 | `generalization` | Evaluate nominal-trained AlphaVNE on shifted request distributions for BRAIN, GEANT, and Waxman-100. | Reuses each existing `summary.csv`. |
-| `aggregate` | Rebuild the general latest-per-cell journal summary tables. | Stage marker. |
+| `aggregate` | Rebuild the general latest-per-cell journal summary tables while excluding the separate 96-simulation MCTS campaign. | Stage marker. |
 | `publish` | Copy only paper-facing results into `paperjournal/compnet/generated/`. | Stage marker. |
 | `paper` | Build `paperjournal/compnet/main.tex` and reject undefined citations or references. | Stage marker; disable with `BUILD_PAPER=0`. |
 | `validate` | Enforce the expected result-matrix sizes and write SHA-256 checksums for the final artifact set. | Stage marker. |
@@ -78,8 +79,9 @@ The pipeline produces evidence for the closest available reviewer requests. It
 does not silently label unsupported studies as complete. The generated
 `evidence_status.md` records the exact boundary.
 
-Implemented evidence includes matched GPPVNE, reachability ablation, equal
-MCTS-simulation neural/no-neural search, joint node-and-link hard Waxman stress,
+Implemented evidence includes matched GPPVNE, reachability ablation,
+equal-simulation AlphaVNE comparisons against both its no-neural variant and
+the registered classical MCTS baseline, joint node-and-link hard Waxman stress,
 and request-distribution generalization on three substrate families.
 
 No faithful production runner currently exists for:
