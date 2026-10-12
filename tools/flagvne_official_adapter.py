@@ -733,19 +733,35 @@ def make_environment(
     p_net.link_attr_benchmarks = p_net.get_link_attr_benchmarks()
     p_net.link_sum_attr_benchmarks = p_net.get_link_sum_attr_benchmarks()
 
-    v_setting = load_yaml(legacy_dir / "v_sim_setting.yaml")
-    v_net_simulator = VirtualNetworkRequestSimulator.from_setting(v_setting)
-    for v_net_path in sorted((legacy_dir / "v_nets").glob("v_net-*.gml")):
-        v_graph = read_compatible_gml(v_net_path)
-        v_net = VirtualNetwork(incoming_graph_data=v_graph)
-        v_net.check_attrs_existence()
-        if graph_payload(v_net) != graph_payload(v_graph):
+    expected_legacy_dir = resolved(legacy_dir)
+
+    def load_compatible_vnet_dataset(dataset_dir: str) -> Any:
+        requested_dir = resolved(Path(dataset_dir))
+        if requested_dir != expected_legacy_dir:
             raise AdapterError(
-                f"author VirtualNetwork conversion changed fixed payloads: {v_net_path}"
+                f"author environment requested an unexpected virtual-network dataset: {requested_dir}"
             )
-        v_net_simulator.v_nets.append(v_net)
-    v_net_simulator.events = load_yaml(legacy_dir / str(v_setting["events_file_name"]))
-    v_net_simulator.construct_v2event_dict()
+        v_setting = load_yaml(requested_dir / "v_sim_setting.yaml")
+        simulator = CompatibleVirtualNetworkRequestSimulator(v_setting)
+        for v_net_path in sorted((requested_dir / "v_nets").glob("v_net-*.gml")):
+            v_graph = read_compatible_gml(v_net_path)
+            v_net = VirtualNetwork(incoming_graph_data=v_graph)
+            v_net.check_attrs_existence()
+            if graph_payload(v_net) != graph_payload(v_graph):
+                raise AdapterError(
+                    f"author VirtualNetwork conversion changed fixed payloads: {v_net_path}"
+                )
+            simulator.v_nets.append(v_net)
+        simulator.events = load_yaml(requested_dir / str(v_setting["events_file_name"]))
+        simulator.construct_v2event_dict()
+        return simulator
+
+    class CompatibleVirtualNetworkRequestSimulator(VirtualNetworkRequestSimulator):
+        """Author simulator with the adapter's type-safe fixed-data reload."""
+
+        load_dataset = staticmethod(load_compatible_vnet_dataset)
+
+    v_net_simulator = load_compatible_vnet_dataset(str(expected_legacy_dir))
     if int(v_net_simulator.num_v_nets) != int(config.v_sim_setting["num_v_nets"]):
         raise AdapterError("author loader returned a different number of virtual networks")
     env = Env(p_net, v_net_simulator, controller, recorder, counter, **vars(config))
