@@ -2,10 +2,10 @@
 """Run the official FlagVNE implementation on fixed Virne datasets.
 
 This adapter deliberately imports FlagVNE from a separately checked out, pinned
-author repository.  It does not vendor or alter the author code.  The only data
-conversion is a legacy metadata view: payload GML and event files are symlinked
-unchanged, while the newer nested ``output`` mapping in ``v_sim_setting.yaml``
-is flattened for the older FlagVNE loader.
+author repository.  It does not vendor or alter the author code.  It creates a
+legacy metadata view for the newer nested ``output`` mapping and normalizes one
+GML metadata type in memory (``"True"``/``"False"`` to Boolean) for the older
+author classes.  Source payload files are never modified.
 
 One invocation trains and evaluates one cell in one Python process.  The same
 trained solver object is used for evaluation, and an explicit checkpoint is
@@ -31,6 +31,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+import networkx as nx
 import yaml
 
 
@@ -192,6 +193,89 @@ def graph_node_count(path: Path) -> int:
     return count
 
 
+def normalize_gml_attribute_settings(graph: nx.Graph, path: Path) -> None:
+    """Normalize Boolean metadata emitted as strings by newer NetworkX."""
+    for key in ("node_attrs_setting", "link_attrs_setting"):
+        value = graph.graph.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+            raise AdapterError(f"network {path} has invalid {key!r} metadata")
+        normalized = []
+        for source_item in value:
+            item = dict(source_item)
+            generative = item.get("generative")
+            if isinstance(generative, str):
+                if generative not in ("True", "False"):
+                    raise AdapterError(
+                        f"network {path} has invalid generative metadata {generative!r}"
+                    )
+                item["generative"] = generative == "True"
+            normalized.append(item)
+        graph.graph[key] = normalized
+
+
+def read_compatible_gml(path: Path) -> nx.Graph:
+    """Read fixed GML using the author's integer conversion plus Boolean repair."""
+    try:
+        graph = nx.read_gml(path, destringizer=int)
+    except Exception as exc:
+        raise AdapterError(f"cannot read fixed network {path}: {exc}") from exc
+    normalize_gml_attribute_settings(graph, path)
+    return graph
+
+
+def graph_payload(graph: nx.Graph) -> dict[str, Any]:
+    """Canonical node/edge payload used to verify in-memory author conversion."""
+    def attrs(value: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted((str(key), repr(item)) for key, item in value.items()))
+
+    nodes = sorted((repr(node), attrs(data)) for node, data in graph.nodes(data=True))
+    edges = []
+    for left, right, data in graph.edges(data=True):
+        pair = sorted((repr(left), repr(right))) if not graph.is_directed() else [repr(left), repr(right)]
+        edges.append((pair[0], pair[1], attrs(data)))
+    return {"nodes": nodes, "edges": sorted(edges)}
+
+
+def graph_structure_digest(path: Path) -> str:
+    """Hash node identities and adjacency while ignoring generated capacities."""
+    try:
+        graph = nx.read_gml(path, label="id")
+    except Exception as exc:
+        raise AdapterError(f"cannot read physical-network structure from {path}: {exc}") from exc
+
+    def key(value: Any) -> str:
+        return f"{type(value).__name__}:{value}"
+
+    nodes = sorted(key(node) for node in graph.nodes)
+    edges: list[tuple[str, str]] = []
+    for left, right in graph.edges:
+        pair = (key(left), key(right))
+        if not graph.is_directed() and pair[1] < pair[0]:
+            pair = (pair[1], pair[0])
+        edges.append(pair)
+    payload = {
+        "directed": graph.is_directed(),
+        "multigraph": graph.is_multigraph(),
+        "nodes": nodes,
+        "edges": sorted(edges),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def physical_resource_settings(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read the physical resource schema embedded in the fixed GML payload."""
+    graph = read_compatible_gml(path)
+    settings: list[list[dict[str, Any]]] = []
+    for key in ("node_attrs_setting", "link_attrs_setting"):
+        value = graph.graph.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+            raise AdapterError(f"physical network {path} has invalid {key!r} metadata")
+        settings.append([dict(item) for item in value])
+    return settings[0], settings[1]
+
+
 def normalized_output(setting: Mapping[str, Any]) -> dict[str, Any]:
     output = setting.get("output", {})
     if output is None:
@@ -258,6 +342,19 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
             f"found nodes={node_resource_names!r}, links={link_resource_names!r}"
         )
 
+    p_node_settings, p_link_settings = physical_resource_settings(required["p_net.gml"])
+    p_node_resource_names = [
+        item.get("name") for item in p_node_settings if item.get("type") == "resource"
+    ]
+    p_link_resource_names = [
+        item.get("name") for item in p_link_settings if item.get("type") == "resource"
+    ]
+    if p_node_resource_names != ["cpu"] or p_link_resource_names != ["bw"]:
+        raise AdapterError(
+            f"{dataset_dir}: expected physical CPU/bandwidth resources, "
+            f"found nodes={p_node_resource_names!r}, links={p_link_resource_names!r}"
+        )
+
     try:
         generation_metadata = json.loads(
             required["generation_metadata.json"].read_text(encoding="utf-8")
@@ -321,10 +418,13 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         "num_v_nets": expected_count,
         "node_attrs_setting": setting["node_attrs_setting"],
         "link_attrs_setting": setting["link_attrs_setting"],
+        "p_net_node_attrs_setting": p_node_settings,
+        "p_net_link_attrs_setting": p_link_settings,
         "experimental_setting": experimental_setting(setting),
         "output_metadata": normalized_output(setting),
         "generation_metadata": dict(generation_metadata),
         "p_net_sha256": sha256_file(required["p_net.gml"]),
+        "p_net_structure_sha256": graph_structure_digest(required["p_net.gml"]),
         "tree_sha256": tree_digest(files),
         "files": files,
     }
@@ -341,8 +441,11 @@ def validate_dataset_pair(train_dir: Path, eval_dir: Path) -> dict[str, Any]:
     for key in ("node_attrs_setting", "link_attrs_setting"):
         if train[key] != evaluation[key]:
             raise AdapterError(f"train/eval {key} differ; one FlagVNE policy cannot represent both")
-    if train["p_net_sha256"] != evaluation["p_net_sha256"]:
-        raise AdapterError("train/eval physical-network payloads differ")
+    for key in ("p_net_node_attrs_setting", "p_net_link_attrs_setting"):
+        if train[key] != evaluation[key]:
+            raise AdapterError(f"train/eval physical-network {key} differ")
+    if train["p_net_structure_sha256"] != evaluation["p_net_structure_sha256"]:
+        raise AdapterError("train/eval physical-network topologies differ")
     if train["experimental_setting"] != evaluation["experimental_setting"]:
         raise AdapterError("train/eval request-generation settings differ")
     return {"train": train, "eval": evaluation}
@@ -417,6 +520,8 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "constraints": {
             "payload_files_are_never_rewritten": True,
             "legacy_view_changes_storage_metadata_only": True,
+            "gml_boolean_metadata_is_normalized_in_memory": True,
+            "node_and_edge_payloads_are_verified_after_conversion": True,
             "train_and_eval_share_one_process": True,
             "policy_requires_equal_train_eval_p_net_node_count": True,
             "policy_requires_equal_train_eval_resource_schema": True,
@@ -440,23 +545,12 @@ def legacy_vsim_setting(source_setting: Mapping[str, Any], save_dir: Path) -> di
     return legacy
 
 
-def pnet_setting(source_setting: Mapping[str, Any], p_net_path: Path, save_dir: Path) -> dict[str, Any]:
-    node_resources = [dict(item) for item in source_setting["node_attrs_setting"]]
-    link_resources = [dict(item) for item in source_setting["link_attrs_setting"]]
-    node_extrema = [
-        {"name": f"max_{item['name']}", "type": "extrema", "owner": "node", "originator": item["name"]}
-        for item in node_resources
-        if item.get("type") == "resource"
-    ]
-    link_extrema = [
-        {"name": f"max_{item['name']}", "type": "extrema", "owner": "link", "originator": item["name"]}
-        for item in link_resources
-        if item.get("type") == "resource"
-    ]
+def pnet_setting(p_net_path: Path, save_dir: Path) -> dict[str, Any]:
+    node_settings, link_settings = physical_resource_settings(p_net_path)
     return {
         "num_nodes": graph_node_count(p_net_path),
-        "node_attrs_setting": node_resources + node_extrema,
-        "link_attrs_setting": link_resources + link_extrema,
+        "node_attrs_setting": node_settings,
+        "link_attrs_setting": link_settings,
         "topology": {"type": "file", "file_path": str(resolved(p_net_path))},
         "save_dir": str(resolved(save_dir)),
         "file_name": "p_net.gml",
@@ -519,6 +613,7 @@ def import_author_api(flagvne_root: Path) -> dict[str, Any]:
             "Counter": getattr(base, "Counter"),
             "Recorder": getattr(base, "Recorder"),
             "PhysicalNetwork": getattr(data, "PhysicalNetwork"),
+            "VirtualNetwork": getattr(data, "VirtualNetwork"),
             "VirtualNetworkRequestSimulator": getattr(data, "VirtualNetworkRequestSimulator"),
             "get_v_nets_dataset_dir_from_setting": getattr(utils, "get_v_nets_dataset_dir_from_setting"),
         }
@@ -544,7 +639,7 @@ def make_config(
     catalog_dir.mkdir(parents=True, exist_ok=True)
     source_vsim = load_yaml(source_dir / "v_sim_setting.yaml")
     vsim_setting = legacy_vsim_setting(source_vsim, catalog_dir / "v_nets")
-    p_setting = pnet_setting(source_vsim, source_dir / "p_net.gml", catalog_dir / "p_net")
+    p_setting = pnet_setting(source_dir / "p_net.gml", catalog_dir / "p_net")
     vsim_path = settings_dir / "v_sim_setting.yaml"
     pnet_path = settings_dir / "p_net_setting.yaml"
     write_yaml(vsim_path, vsim_setting)
@@ -615,6 +710,7 @@ def make_environment(
     Controller = api["Controller"]
     Recorder = api["Recorder"]
     PhysicalNetwork = api["PhysicalNetwork"]
+    VirtualNetwork = api["VirtualNetwork"]
     VirtualNetworkRequestSimulator = api["VirtualNetworkRequestSimulator"]
     counter = Counter(
         config.v_sim_setting["node_attrs_setting"],
@@ -627,8 +723,29 @@ def make_environment(
         **vars(config),
     )
     recorder = Recorder(counter, **vars(config))
-    p_net = PhysicalNetwork.load_dataset(str(source_dir))
-    v_net_simulator = VirtualNetworkRequestSimulator.load_dataset(str(legacy_dir))
+    p_graph = read_compatible_gml(source_dir / "p_net.gml")
+    p_net = PhysicalNetwork(incoming_graph_data=p_graph)
+    p_net.check_attrs_existence()
+    if graph_payload(p_net) != graph_payload(p_graph):
+        raise AdapterError("author PhysicalNetwork conversion changed fixed node/edge payloads")
+    p_net.degree_benchmark = p_net.get_degree_benchmark()
+    p_net.node_attr_benchmarks = p_net.get_node_attr_benchmarks()
+    p_net.link_attr_benchmarks = p_net.get_link_attr_benchmarks()
+    p_net.link_sum_attr_benchmarks = p_net.get_link_sum_attr_benchmarks()
+
+    v_setting = load_yaml(legacy_dir / "v_sim_setting.yaml")
+    v_net_simulator = VirtualNetworkRequestSimulator.from_setting(v_setting)
+    for v_net_path in sorted((legacy_dir / "v_nets").glob("v_net-*.gml")):
+        v_graph = read_compatible_gml(v_net_path)
+        v_net = VirtualNetwork(incoming_graph_data=v_graph)
+        v_net.check_attrs_existence()
+        if graph_payload(v_net) != graph_payload(v_graph):
+            raise AdapterError(
+                f"author VirtualNetwork conversion changed fixed payloads: {v_net_path}"
+            )
+        v_net_simulator.v_nets.append(v_net)
+    v_net_simulator.events = load_yaml(legacy_dir / str(v_setting["events_file_name"]))
+    v_net_simulator.construct_v2event_dict()
     if int(v_net_simulator.num_v_nets) != int(config.v_sim_setting["num_v_nets"]):
         raise AdapterError("author loader returned a different number of virtual networks")
     env = Env(p_net, v_net_simulator, controller, recorder, counter, **vars(config))
@@ -909,7 +1026,7 @@ def run_cell(args: argparse.Namespace) -> int:
                     "The upstream tree has no stated license; this adapter references a local checkout and does not vendor it.",
                     "The authors publish no pretrained FlagVNE checkpoint, so every cell trains before evaluation.",
                     "The official policy fixes the physical-node count; train and evaluation datasets must have equal counts.",
-                    "The legacy loader requires a metadata view; GML and event payloads remain byte-identical symlinks.",
+                    "The legacy loader requires a storage-metadata view. GML and event payloads remain byte-identical symlinks; quoted GML Boolean metadata is normalized in memory and node/edge payload equality is checked.",
                     "Official wall-clock time includes evaluation only and remains hardware dependent.",
                 ],
             }

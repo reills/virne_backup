@@ -37,6 +37,13 @@ existing fixed physical and virtual network datasets explicitly. It also
 converts the author output into a validated per-cell schema for aggregation.
 The author checkout itself is not patched.
 
+The newer dataset writer quotes the GML `generative` Boolean metadata, while
+the pinned author classes require a native Boolean. The adapter normalizes only
+that metadata value in memory. It verifies that every node, edge, and resource
+value is unchanged after constructing the author network objects. The source
+GML files remain byte-identical, hash-checked symlinks in the compatibility
+view.
+
 ## Matched experiment matrix
 
 The campaign contains ten train/evaluation cells:
@@ -129,6 +136,9 @@ For every cell, validation must establish:
 
 - the author checkout is clean and has the pinned commit;
 - the train and test dataset payloads match their recorded source hashes;
+- the train and test physical networks have identical node identities and
+  adjacency; their independently generated CPU and bandwidth capacities are
+  retained as part of the fixed train/test split;
 - each request ID has one arrival and one departure in chronological order;
 - CPU and bandwidth resources are preserved without adding author-default GPU
   or RAM resources;
